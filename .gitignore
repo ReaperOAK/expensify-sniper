@@ -1,0 +1,27 @@
+# --- credentials: NEVER commit these -----------------------------------------
+# NOTE: .gitignore has no inline comments -- a trailing "# ..." becomes part of
+# the pattern and the rule silently matches nothing. Keep comments on own lines.
+.env
+# cached Playwright session cookies
+.auth-state.json
+# contains .credentials.json (Claude OAuth credentials)
+.claude-clean/
+# temp POST body written by verify.py's gh() helper
+.gh-body.json
+
+# --- state and generated output ----------------------------------------------
+*.sqlite
+*.sqlite-journal
+*.jsonl
+*.log
+corpus/
+runs/
+evidence/
+verify-runs/
+bt/
+.impeccable/
+
+# --- python -------------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
