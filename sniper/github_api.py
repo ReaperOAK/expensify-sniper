@@ -276,3 +276,41 @@ def get_repo(repo: str, etag: str | None = None) -> tuple[dict[str, Any] | None,
         return None, etag, False
     resp.raise_for_status()
     return resp.json(), resp.headers.get("ETag"), True
+
+
+def iter_timeline(repo: str, number: int) -> Iterator[dict[str, Any]]:
+    """Yield timeline events for an issue, oldest first.
+
+    Core quota (5000/hr), not search quota (30/min). That choice is the whole
+    reason this uses /timeline rather than a `linked:pr` search.
+    """
+    page = 1
+    while True:
+        resp = _get(
+            f"/repos/{repo}/issues/{number}/timeline",
+            params={"per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            return
+        yield from batch
+        if len(batch) < 100:
+            return
+        page += 1
+
+
+def has_open_linked_pr(repo: str, number: int) -> bool:
+    """True if an OPEN pull request cross-references this issue.
+
+    Someone is mid-flight; the bounty is effectively taken even though no one is
+    assigned. Cross-references from plain issues (including issues in unrelated
+    repos, which do occur) are ignored -- only a `pull_request` source counts.
+    """
+    for event in iter_timeline(repo, number):
+        if event.get("event") != "cross-referenced":
+            continue
+        source = (event.get("source") or {}).get("issue") or {}
+        if source.get("pull_request") and source.get("state") == "open":
+            return True
+    return False
