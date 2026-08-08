@@ -32,6 +32,11 @@ HEADERS = {
 
 BOUNTY_QUERY = 'label:"💎 Bounty" state:open is:issue no:assignee -label:"💰 Rewarded"'
 
+# Each target is independent -- consumed by exactly one test of one function. In
+# particular repo_healthy and timeline_with_open_pr are NOT a matched pair and
+# deliberately name different repos: repo_healthy backs the get_repo() test,
+# timeline_with_open_pr backs the has_open_linked_pr() test, and no test uses both.
+# Swapping one target never requires swapping another.
 TARGETS = [
     # name, path, params
     ("search_bounty_page1", "/search/issues",
