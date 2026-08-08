@@ -44,7 +44,10 @@ TARGETS = [
     ("repo_healthy", "/repos/ClankerNation/OpenAgents", {}),
     ("repo_fork", "/repos/WillSmithTE/qdrant-qdrant", {}),
     ("repo_spam_farm", "/repos/SecureBananaLabs/bug-bounty", {}),
-    ("timeline_with_open_pr", "/repos/ClankerNation/OpenAgents/issues/100/timeline",
+    # Confirmed 2026-08-08 to carry 6 open pull-request cross-references. Cross-refs
+    # churn fast -- if the Step 6 check reports False, re-run the finder in Step 6's
+    # troubleshooting note and swap this target rather than weakening the assertion.
+    ("timeline_with_open_pr", "/repos/arakoodev/EdgeChains/issues/279/timeline",
      {"per_page": 100}),
     ("events_expensify", f"/repos/{config.REPO}/issues/events", {"per_page": 100}),
 ]
