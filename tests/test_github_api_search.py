@@ -185,3 +185,28 @@ def test_a_single_page_search_never_pauses(fake_get):
     slept = []
     github_api.search_issues("q", pause_s=3, sleep=slept.append)
     assert slept == []
+
+
+def test_a_throttle_midway_keeps_the_pages_already_paid_for(fake_get):
+    """Measured live: three good pages were discarded by a 403 on page four.
+
+    The digest then said "top 0 by score" -- an empty world reported because of a
+    throttle, which is the exact confusion this module exists to prevent.
+    """
+    fake_get.queue(200, _page(100, 500, start=0))
+    fake_get.queue(200, _page(100, 500, start=100))
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"X-RateLimit-Remaining": "27", "X-RateLimit-Limit": "30"})
+    result = github_api.search_issues("q", per_page=100)
+    assert len(result.items) == 200
+    assert result.pages_fetched == 2
+    # The caller must still be able to tell this apart from a complete answer.
+    assert result.incomplete is True
+
+
+def test_a_throttle_on_the_very_first_page_still_raises(fake_get):
+    # Nothing to salvage, and silently returning an empty SearchResult would be
+    # indistinguishable from "no bounties matched".
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."})
+    with pytest.raises(github_api.RateLimited):
+        github_api.search_issues("q")

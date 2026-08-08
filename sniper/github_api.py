@@ -279,11 +279,26 @@ def search_issues(
         # the secondary limit is about rate, not volume.
         if page > 1 and pause:
             sleep(pause)
-        resp = _get(
-            "/search/issues",
-            params={"q": query, "sort": sort, "order": order,
-                    "per_page": per_page, "page": page},
-        )
+        try:
+            resp = _get(
+                "/search/issues",
+                params={"q": query, "sort": sort, "order": order,
+                        "per_page": per_page, "page": page},
+            )
+        except RateLimited:
+            # Keep the pages we already paid for. Letting this propagate threw
+            # away every completed page -- measured live, three pages of real
+            # candidates were collected and then binned, and the digest said
+            # "top 0 by score", i.e. reported an empty world because of a
+            # throttle on page four. That is the precise failure this module is
+            # written to prevent, one level deeper than it was being applied.
+            #
+            # With nothing in hand there is nothing to salvage, so re-raise and
+            # let the caller warn.
+            if not items:
+                raise
+            incomplete = True
+            break
         resp.raise_for_status()
         payload = resp.json()
         pages_fetched += 1
