@@ -42,7 +42,7 @@ class BountyLabelSource:
             try:
                 found = github_api.search_issues(
                     query, sort="updated", order="desc",
-                    per_page=100, max_pages=self.max_pages,
+                    per_page=config.SEARCH_PER_PAGE, max_pages=self.max_pages,
                     stop=self._page_is_all_known(conn),
                 )
             except github_api.RateLimited as exc:

@@ -113,7 +113,18 @@ BOUNTY_QUERIES = [
     'label:bounty state:open is:issue no:assignee',
 ]
 
-BOUNTY_SEARCH_MAX_PAGES = int(os.environ.get("BOUNTY_SEARCH_MAX_PAGES", "10"))
+# 20, not 10: SEARCH_PER_PAGE halved, so twice the pages are needed to reach the
+# same 1000-result ceiling the Search API imposes.
+BOUNTY_SEARCH_MAX_PAGES = int(os.environ.get("BOUNTY_SEARCH_MAX_PAGES", "20"))
+
+# 50, not the API maximum of 100. Measured 2026-08-08 against the live endpoint:
+# per_page=100 on the bounty query returned 403 "secondary rate limit" on the
+# FIRST request with 24 of 30 primary units unspent, reproducibly, while
+# per_page=50 and per_page=30 both returned 200 immediately afterwards. GitHub's
+# burst guard weights by how expensive a query is to serve, and a 100-result page
+# over a label query with a negation is over that line. This is not a tuning
+# preference -- at 100 the tracker returns an empty digest every run.
+SEARCH_PER_PAGE = int(os.environ.get("SEARCH_PER_PAGE", "50"))
 
 # Markers meaning "this bounty has already paid out". Matched case-insensitively
 # against labels, so entries here must be lowercase. Other platforms' markers are

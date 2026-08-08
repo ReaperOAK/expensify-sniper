@@ -52,7 +52,10 @@ def test_sorts_by_updated_not_created(tmp_path, fake_get):
 def test_runs_every_configured_query(tmp_path, fake_get):
     fake_get.queue(200, _page([1]))
     fake_get.queue(200, _page([2]))
-    result = BountyLabelSource(queries=["a", "b"]).discover(_conn(tmp_path))
+    # max_pages=2: BOUNTY_SEARCH_MAX_PAGES is 20, and two queries reserving 20
+    # each exceed the 30/min search window. That is real, and the budget guard
+    # is tested separately -- this test is about running every query.
+    result = BountyLabelSource(queries=["a", "b"], max_pages=2).discover(_conn(tmp_path))
     assert [q for _, p in fake_get.calls for q in [p["q"]]] == ["a", "b"]
     assert {c.number for c in result.candidates} == {1, 2}
 
@@ -60,7 +63,7 @@ def test_runs_every_configured_query(tmp_path, fake_get):
 def test_deduplicates_a_candidate_matched_by_two_queries(tmp_path, fake_get):
     fake_get.queue(200, _page([1, 2]))
     fake_get.queue(200, _page([2, 3]))
-    result = BountyLabelSource(queries=["a", "b"]).discover(_conn(tmp_path))
+    result = BountyLabelSource(queries=["a", "b"], max_pages=2).discover(_conn(tmp_path))
     assert sorted(c.number for c in result.candidates) == [1, 2, 3]
 
 
@@ -76,7 +79,7 @@ def test_a_throttled_query_warns_and_the_other_queries_still_run(tmp_path, fake_
     fake_get.queue(403, {"message": "API rate limit exceeded"},
                    {"X-RateLimit-Reset": "1"})
     fake_get.queue(200, _page([9]))
-    result = BountyLabelSource(queries=["a", "b"]).discover(_conn(tmp_path))
+    result = BountyLabelSource(queries=["a", "b"], max_pages=2).discover(_conn(tmp_path))
     assert [c.number for c in result.candidates] == [9]
     assert any("rate limited" in w and "'a'" in w for w in result.warnings)
 
