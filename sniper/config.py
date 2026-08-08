@@ -98,6 +98,62 @@ BOT_AUTHORS = {
 
 HELP_WANTED = "Help Wanted"
 
+# --- bounty tracker ----------------------------------------------------------
+# Discovery queries. `sort`/`order` are NOT baked in here -- search_issues()
+# always sorts by `updated`, because bounty labels land on issues that already
+# exist (measured 2026-08-05: 1 of 521 live candidates was created in the
+# previous 30 days, so `created` ordering misses essentially everything).
+#
+# `💎 Bounty` (563 open) is Algora's label applied to the real GitHub issue,
+# which is how Algora's inventory is reachable for free. `bounty` (3825) is
+# noisy and carries the floor and spam filters' weight. Tune this list against
+# real digest output; it is here so that needs no code change.
+BOUNTY_QUERIES = [
+    'label:"💎 Bounty" state:open is:issue no:assignee -label:"💰 Rewarded"',
+    'label:bounty state:open is:issue no:assignee',
+]
+
+BOUNTY_SEARCH_MAX_PAGES = int(os.environ.get("BOUNTY_SEARCH_MAX_PAGES", "10"))
+
+# Markers meaning "this bounty has already paid out". Matched case-insensitively
+# against labels, so entries here must be lowercase. Other platforms' markers are
+# unknown; add them as they are observed.
+PAID_LABELS = {
+    label.strip().lower()
+    for label in os.environ.get("PAID_LABELS", "💰 Rewarded").split(",")
+    if label.strip()
+}
+
+# A bounty below this is not worth a working day. A MISSING amount does not
+# reject -- it sorts last, because expected value cannot be computed without one.
+AMOUNT_FLOOR_USD = int(os.environ.get("AMOUNT_FLOOR_USD", "50"))
+
+# Expensify Help Wanted issues pay a flat rate; there is no $-label to parse.
+EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
+
+DIGEST_TOP_N = int(os.environ.get("DIGEST_TOP_N", "25"))
+DIGEST_STANDING_N = int(os.environ.get("DIGEST_STANDING_N", "5"))
+
+# Two quota classes, shared with the Expensify watcher through one token. The
+# budget guard in store.py refuses to start a run it cannot finish rather than
+# reporting an empty world -- a throttled search is indistinguishable from "no
+# results" (HANDOFF.md trap #3).
+SEARCH_QUOTA_PER_MIN = int(os.environ.get("SEARCH_QUOTA_PER_MIN", "30"))
+CORE_QUOTA_PER_HOUR = int(os.environ.get("CORE_QUOTA_PER_HOUR", "5000"))
+CORE_BUDGET_PER_RUN = int(os.environ.get("CORE_BUDGET_PER_RUN", "1500"))
+
+# How long a caller will block waiting for an exhausted quota window to roll
+# over. Just over a minute, so a run that starts near the end of a search-quota
+# window does not fail for a reason that resolves itself in seconds. The test
+# suite zeroes this via an autouse fixture -- a suite that can sleep is a trap.
+BUDGET_WAIT_S = float(os.environ.get("BUDGET_WAIT_S", "65"))
+
+HUNT_ENABLED_SOURCES = [
+    name.strip()
+    for name in os.environ.get("HUNT_SOURCES", "github-labels,expensify").split(",")
+    if name.strip()
+]
+
 
 def is_proposal(body: str | None) -> bool:
     """Exact reimplementation of getIsProposal() from proposalPoliceComment.ts:38."""
