@@ -41,6 +41,18 @@ def test_query_and_sort_are_sent_as_params(fake_get):
     assert params["page"] == 1
 
 
+def test_no_extra_page_when_total_count_is_an_exact_multiple_of_per_page(fake_get):
+    # A full page that already accounts for every result must not cost a second
+    # request. total_count % per_page == 0 is a common shape for a label query, and
+    # the wasted call comes out of the 30/min search pool.
+    fake_get.queue(200, _page(100, 100))
+    result = github_api.search_issues("q", per_page=100)
+    assert len(fake_get.calls) == 1
+    assert result.pages_fetched == 1
+    assert len(result.items) == 100
+    assert result.total_count == 100
+
+
 def test_pages_until_a_short_page(fake_get):
     fake_get.queue(200, _page(100, 150, start=0))
     fake_get.queue(200, _page(50, 150, start=100))

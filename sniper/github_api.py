@@ -218,8 +218,9 @@ def search_issues(
     already exist -- measured 2026-08-05, only 1 of 521 live candidates was created
     in the previous 30 days -- so `created` ordering misses essentially everything.
 
-    `stop` is called with each page's items after it is accumulated; returning True
-    ends paging. Discovery uses it to stop once a page is entirely already-known.
+    `stop` is called with each full, under-cap page's items; returning True ends
+    paging. Discovery uses it to stop once a page is entirely already-known. It is
+    not called on a page that already ended the loop by another route.
     """
     items: list[dict[str, Any]] = []
     total_count = 0
@@ -243,6 +244,11 @@ def search_issues(
 
         if len(items) >= SEARCH_RESULT_CAP:
             del items[SEARCH_RESULT_CAP:]
+            break
+        # Without this, a total_count that is an exact multiple of per_page (100,
+        # 200, ...) costs one extra request for a guaranteed-empty page -- a wasted
+        # unit of the 30/min search pool, and not a rare shape for a label query.
+        if len(items) >= total_count:
             break
         if len(batch) < per_page:
             break
