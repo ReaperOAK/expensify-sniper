@@ -94,11 +94,16 @@ def test_stops_paging_once_a_whole_page_is_already_known(tmp_path, fake_get):
     from sniper.models import Candidate
 
     conn = _conn(tmp_path)
-    known = _page(list(range(100)))
+    # total=200 (not the default 100): with the default, search_issues' own
+    # `len(items) >= total_count` guard ends paging after page 1 no matter what
+    # the `stop` callback says, and this test passes without ever exercising the
+    # incremental-discovery mechanism it exists to cover. Verified by mutation:
+    # with total=100 the test still passes when `stop` is replaced by None.
+    known = _page(list(range(100)), total=200)
     for item in known["items"]:
         store.upsert_candidate(conn, Candidate.from_search_item("github-labels", item))
     fake_get.queue(200, known)
-    fake_get.queue(200, _page(list(range(100, 200))))
+    fake_get.queue(200, _page(list(range(100, 200)), total=200))
     result = BountyLabelSource(queries=["label:bounty"]).discover(conn)
     assert len(fake_get.calls) == 1
     assert len(result.candidates) == 100
