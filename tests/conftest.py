@@ -93,3 +93,4 @@ def no_budget_waiting(monkeypatch):
     # Same reason: search_issues paces its pages to dodge GitHub's burst guard.
     # Real seconds in a unit test buy nothing.
     monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 0, raising=False)
+    monkeypatch.setattr(config, "CORE_CALL_PAUSE_S", 0, raising=False)

@@ -167,6 +167,12 @@ BUDGET_WAIT_S = float(os.environ.get("BUDGET_WAIT_S", "65"))
 # seconds a page is free; tripping the burst guard costs the entire run.
 SEARCH_PAGE_PAUSE_S = float(os.environ.get("SEARCH_PAGE_PAUSE_S", "3"))
 
+# Same burst guard, core side. Run 1 is a backlog dump: one repo-detail call per
+# unique repo plus one timeline call per survivor, which is hundreds of requests
+# back to back. The 5000/hr pool has room for that; the burst guard does not.
+# Smaller than the search pause because core requests are individually cheap.
+CORE_CALL_PAUSE_S = float(os.environ.get("CORE_CALL_PAUSE_S", "0.5"))
+
 HUNT_ENABLED_SOURCES = [
     name.strip()
     for name in os.environ.get("HUNT_SOURCES", "github-labels,expensify").split(",")

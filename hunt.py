@@ -72,6 +72,10 @@ def enrich(
         if not store.reserve_or_wait(conn, "core", 1):
             warnings.append(f"core budget exhausted -- {repo} not enriched")
             continue
+        if details and config.CORE_CALL_PAUSE_S:
+            # Burst guard, not quota: run 1 enriches every unique repo in the
+            # backlog back to back, which is hundreds of requests in seconds.
+            time.sleep(config.CORE_CALL_PAUSE_S)
         etag, cached = store.get_cache(conn, _repo_cache_key(repo))
         try:
             payload, new_etag, changed = github_api.get_repo(repo, etag)
@@ -159,6 +163,8 @@ def run(
             warnings.append(
                 f"core budget exhausted -- {cand.repo}#{cand.number} timeline not checked")
             break
+        if config.CORE_CALL_PAUSE_S:
+            time.sleep(config.CORE_CALL_PAUSE_S)
         try:
             taken = github_api.has_open_linked_pr(cand.repo, cand.number)
         except Exception as exc:  # noqa: BLE001
