@@ -44,15 +44,10 @@ def test_budget_wait_covers_a_whole_search_window():
     # The autouse no_budget_waiting fixture (tests/conftest.py) zeroes the live
     # config.BUDGET_WAIT_S attribute for every test so the suite never sleeps.
     # That means this test cannot read the configured default off the live
-    # module; reload re-derives it fresh from the environment, same pattern as
-    # test_env_overrides_the_amount_floor below.
+    # module; reload re-derives it fresh from the environment.
     import importlib
 
-    reloaded = importlib.reload(config)
-    try:
-        assert reloaded.BUDGET_WAIT_S > 60
-    finally:
-        importlib.reload(config)
+    assert importlib.reload(config).BUDGET_WAIT_S > 60
 
 
 def test_env_overrides_the_amount_floor(monkeypatch):

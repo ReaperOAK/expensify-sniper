@@ -23,7 +23,15 @@ from typing import Any
 
 # "$780", "$1k", "$1.2k", "$1,200", "$ 50". Anchored: a label merely CONTAINING a
 # dollar sign (e.g. "sponsored $$$") is not an amount.
-_AMOUNT_LABEL = re.compile(r"^\$\s*(\d+(?:[.,]\d+)*)\s*([kK])?$")
+#
+# The whole part is EITHER properly-grouped thousands (1,200 / 12,345) OR a plain
+# run of digits, followed by AT MOST ONE decimal group. Being this strict is the
+# point: a looser `(\d+(?:[.,]\d+)*)` matches "$1.2.3" and then float() raises
+# mid-parse, and matches "$1,2,3" and silently yields 123. Every label on every
+# issue goes through here unattended, so an unparseable label has to come back as
+# None -- not as an exception, and not as a plausible wrong number that would
+# propagate straight into the ranking.
+_AMOUNT_LABEL = re.compile(r"^\$\s*(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s*([kK])?$")
 
 
 def parse_amount_label(label: str) -> int | None:
@@ -31,12 +39,10 @@ def parse_amount_label(label: str) -> int | None:
     match = _AMOUNT_LABEL.match((label or "").strip())
     if not match:
         return None
-    digits, suffix = match.group(1), match.group(2)
-    # "1,200" is thousands separators; "1.2" with a k suffix is a decimal.
-    if suffix:
-        value = float(digits.replace(",", ""))
-        return int(value * 1000)
-    return int(float(digits.replace(",", "")))
+    whole, fraction, suffix = match.group(1), match.group(2) or "", match.group(3)
+    # The regex guarantees this is float()-able, so there is no failure path here.
+    value = float(whole.replace(",", "") + fraction)
+    return int(value * 1000) if suffix else int(value)
 
 
 def amounts_in(labels: Iterable[str]) -> tuple[int, ...]:
@@ -99,7 +105,11 @@ class Candidate:
         amount_usd: int | None = None,
     ) -> Candidate:
         labels = tuple(label["name"] for label in payload.get("labels") or [])
-        seen = () if amount_usd is not None else amounts_in(labels)
+        # amounts_seen always records what the LABELS said, even when the caller
+        # overrides the amount. Suppressing it would hide a disagreement between
+        # an override and the issue's own labels -- and it is what the spam rule
+        # (more than one distinct amount) reads.
+        seen = amounts_in(labels)
         amount = amount_usd
         if amount is None and len(seen) == 1:
             amount = seen[0]

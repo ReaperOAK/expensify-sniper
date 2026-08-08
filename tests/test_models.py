@@ -26,6 +26,13 @@ from tests.conftest import load_fixture
     ("", None),
     ("100", None),
     ("$abc", None),
+    ("$12,345", 12345),
+    # Malformed. These must come back None -- never an exception, and never a
+    # plausible wrong number. A looser regex raised on the first and silently
+    # returned 123 for the second.
+    ("$1.2.3", None),
+    ("$1,2,3", None),
+    ("$1,2345", None),
 ])
 def test_parse_amount_label(label, expected):
     assert parse_amount_label(label) == expected
@@ -37,6 +44,12 @@ def test_amounts_in_is_distinct_and_ascending():
 
 def test_amounts_in_empty_when_no_amount_labels():
     assert amounts_in(["💎 Bounty", "help wanted"]) == ()
+
+
+def test_a_malformed_label_never_crashes_candidate_construction():
+    # Every label on every issue goes through here unattended. One bad label must
+    # not take down the run.
+    assert amounts_in(["$1.2.3", "$1,2,3", "$780", "bounty"]) == (780,)
 
 
 def test_repo_from_url():
@@ -118,6 +131,16 @@ def test_from_issue_honours_an_amount_override():
     payload.pop("repository_url")
     cand = Candidate.from_issue("expensify", "Expensify/App", payload, amount_usd=250)
     assert cand.repo == "Expensify/App"
+    assert cand.amount_usd == 250
+    # The override decides amount_usd; it does not erase what the labels said.
+    # Suppressing this would hide an override that disagrees with the issue.
+    assert cand.amounts_seen == (780,)
+
+
+def test_an_override_on_a_label_free_issue_records_no_amounts():
+    payload = _item(labels=[{"name": "Help Wanted"}])
+    payload.pop("repository_url")
+    cand = Candidate.from_issue("expensify", "Expensify/App", payload, amount_usd=250)
     assert cand.amount_usd == 250
     assert cand.amounts_seen == ()
 

@@ -51,6 +51,15 @@ def test_paid_labels_are_configurable():
     assert reason == "already rewarded"
 
 
+def test_a_mixed_case_paid_labels_override_still_matches():
+    # The contract is case-insensitive. Normalising only config's set and not the
+    # caller's would make this silently match nothing.
+    reason = filters.free_reject(
+        _cand(labels=[{"name": "$780"}, {"name": "paid out"}]),
+        paid_labels={"Paid Out"})
+    assert reason == "already rewarded"
+
+
 def test_multiple_distinct_amounts_is_rejected_as_spam():
     reason = filters.free_reject(
         _cand(labels=[{"name": "$780"}, {"name": "$1k"}, {"name": "$1.2k"}]))

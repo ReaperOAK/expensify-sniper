@@ -24,7 +24,11 @@ def free_reject(
     floor: int | None = None,
 ) -> str | None:
     """Reason to drop this candidate, from the search payload alone. None = keep."""
-    paid = config.PAID_LABELS if paid_labels is None else paid_labels
+    # Normalise the override too, not just config's. The contract is
+    # case-insensitive matching, and a caller passing {"Paid Out"} would
+    # otherwise silently match nothing.
+    paid = {label.strip().lower()
+            for label in (config.PAID_LABELS if paid_labels is None else paid_labels)}
     minimum = config.AMOUNT_FLOOR_USD if floor is None else floor
 
     if cand.state != "open":
