@@ -9,6 +9,8 @@ Search is 30/min; core is 5000/hr. Different windows, so they are tracked
 separately and the caller says which it is spending.
 """
 
+import pytest
+
 from sniper import store
 
 MINUTE = 60.0
@@ -97,13 +99,25 @@ def test_reserve_or_wait_gives_up_rather_than_sleeping_forever(tmp_path):
         clock=lambda: clock["t"], sleep=sleep) is False
 
 
-def test_reserve_or_wait_never_waits_for_an_impossible_request(tmp_path):
+def test_an_impossible_request_raises_rather_than_looking_like_throttling(tmp_path):
+    # A whole search window holds 30. Asking for 31 can NEVER succeed, so it is a
+    # caller bug, not congestion. Returning False would render it in the digest as
+    # a routine "rate limited" warning forever -- the exact "error looks like
+    # absent" trap the budget guard exists to prevent.
     conn = _conn(tmp_path)
     slept = []
-    assert store.reserve_or_wait(
-        conn, "search", 31, max_wait_s=180,
-        clock=lambda: 0.0, sleep=slept.append) is False
+    with pytest.raises(ValueError, match="never succeed"):
+        store.reserve_or_wait(conn, "search", 31, max_wait_s=180,
+                              clock=lambda: 0.0, sleep=slept.append)
     assert slept == []
+
+
+def test_an_unknown_quota_raises_on_both_entry_points(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match="unknown quota"):
+        store.reserve(conn, "nonsense", 1, now=0.0)
+    with pytest.raises(ValueError, match="unknown quota"):
+        store.reserve_or_wait(conn, "nonsense", 1, clock=lambda: 0.0)
 
 
 def test_max_wait_s_defaults_to_the_configured_budget_wait(tmp_path, monkeypatch):

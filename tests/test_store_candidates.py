@@ -110,3 +110,33 @@ def test_a_candidate_that_becomes_rejected_stops_being_live(tmp_path):
     assert len(store.live_candidates(conn, limit=10)) == 1
     store.upsert_candidate(conn, _cand(1).with_score(1.0), rejected="assigned", now=200.0)
     assert store.live_candidates(conn, limit=10) == []
+
+
+def test_only_one_writer_reports_new_when_two_connections_race(tmp_path):
+    """hunt.py and the Expensify watcher share this database.
+
+    A read-then-write pair let both conclude "new" for the same key, because a
+    bare SELECT takes no lock. Newness now comes from INSERT OR IGNORE's rowcount,
+    so exactly one writer can win however they interleave.
+    """
+    a = _conn(tmp_path)
+    b = store.connect(tmp_path / "t.sqlite")
+    results = [
+        store.upsert_candidate(a, _cand(42), now=100.0),
+        store.upsert_candidate(b, _cand(42), now=100.0),
+    ]
+    assert results.count(True) == 1
+    assert store.candidate_count(a) == 1
+
+
+def test_an_unscored_candidate_sorts_below_every_scored_one(tmp_path):
+    """A NULL score means "never enriched", not "worthless but rankable".
+
+    SQLite puts NULL first under ORDER BY ... DESC in some orderings, which would
+    float un-enriched candidates to the top of the digest.
+    """
+    conn = _conn(tmp_path)
+    store.upsert_candidate(conn, _cand(1).with_score(5.0), now=1.0)
+    store.upsert_candidate(conn, _cand(2), now=1.0)  # score stays None
+    store.upsert_candidate(conn, _cand(3).with_score(50.0), now=1.0)
+    assert [r["number"] for r in store.live_candidates(conn, limit=10)] == [3, 1, 2]

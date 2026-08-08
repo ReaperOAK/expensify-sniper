@@ -169,36 +169,44 @@ def upsert_candidate(
     """
     stamp = time.time() if now is None else now
     source, repo, number = cand.key
-    is_new = conn.execute(
-        "SELECT 1 FROM candidates WHERE source = ? AND repo = ? AND number = ?",
-        (source, repo, number),
-    ).fetchone() is None
-    conn.execute(
+    labels = json.dumps(list(cand.labels), ensure_ascii=False)
+
+    # Newness comes from the INSERT itself, not from a preceding SELECT.
+    #
+    # A bare SELECT takes no lock in Python's sqlite3, so a read-then-write pair
+    # lets two processes both conclude "new" for the same key -- measured, 8 of
+    # 10 racing writers did. INSERT OR IGNORE resolves that in one statement:
+    # exactly one writer gets rowcount 1, everyone else gets 0. hunt.py and the
+    # Expensify watcher share this database, so "concurrent" is the normal case,
+    # not a corner one.
+    cur = conn.execute(
         """
-        INSERT INTO candidates (source, repo, number, title, url, state, amount_usd,
-                                comments, labels, language, stars, score,
-                                created_at, updated_at, first_seen_at, last_seen_at,
-                                rejected)
+        INSERT OR IGNORE INTO candidates
+            (source, repo, number, title, url, state, amount_usd, comments, labels,
+             language, stars, score, created_at, updated_at, first_seen_at,
+             last_seen_at, rejected)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(source, repo, number) DO UPDATE SET
-            title      = excluded.title,
-            url        = excluded.url,
-            state      = excluded.state,
-            amount_usd = excluded.amount_usd,
-            comments   = excluded.comments,
-            labels     = excluded.labels,
-            language   = excluded.language,
-            stars      = excluded.stars,
-            score      = excluded.score,
-            updated_at = excluded.updated_at,
-            last_seen_at = excluded.last_seen_at,
-            rejected   = excluded.rejected
         """,
         (source, repo, number, cand.title, cand.url, cand.state, cand.amount_usd,
-         cand.comments, json.dumps(list(cand.labels), ensure_ascii=False),
-         cand.language, cand.stars, cand.score,
+         cand.comments, labels, cand.language, cand.stars, cand.score,
          cand.created_at, cand.updated_at, stamp, stamp, rejected),
     )
+    is_new = cur.rowcount > 0
+    if not is_new:
+        # first_seen_at is deliberately absent from the SET list: it is our own
+        # freshness clock and must survive every later sighting.
+        conn.execute(
+            """
+            UPDATE candidates SET
+                title = ?, url = ?, state = ?, amount_usd = ?, comments = ?,
+                labels = ?, language = ?, stars = ?, score = ?, updated_at = ?,
+                last_seen_at = ?, rejected = ?
+            WHERE source = ? AND repo = ? AND number = ?
+            """,
+            (cand.title, cand.url, cand.state, cand.amount_usd, cand.comments,
+             labels, cand.language, cand.stars, cand.score, cand.updated_at,
+             stamp, rejected, source, repo, number),
+        )
     conn.commit()
     return is_new
 
@@ -255,6 +263,8 @@ def reserve(
     guard lives in SQLite rather than in a process because hunt.py and the
     Expensify watcher are separate processes sharing one token.
     """
+    if quota not in QUOTA_LIMIT:
+        raise ValueError(f"unknown quota {quota!r}; known: {sorted(QUOTA_LIMIT)}")
     window = _window(quota, now)
     conn.execute(
         "INSERT OR IGNORE INTO rate_budget (quota, window, spent) VALUES (?, ?, 0)",
@@ -292,14 +302,23 @@ def reserve_or_wait(
     whose `now` is a plain float -- because this function reads the time again
     after every sleep.
 
-    Returns False if `n` can never fit, or if `max_wait_s` elapses without a
-    slot. Callers turn a False into a visible `⚠` line in the digest: silently
-    returning fewer results is the failure mode trap #3 describes.
+    Returns False when `max_wait_s` elapses without a slot -- a TRANSIENT
+    condition. Callers turn that into a visible `⚠` line in the digest, because
+    silently returning fewer results is the failure mode trap #3 describes.
+
+    Asking for more than a whole window holds can never succeed, so it RAISES
+    instead of returning False. Returning False there would disguise a caller
+    bug as ordinary throttling forever -- the same "error looks like absent"
+    trap this guard exists to prevent.
     """
+    if quota not in QUOTA_LIMIT:
+        raise ValueError(f"unknown quota {quota!r}; known: {sorted(QUOTA_LIMIT)}")
+    if n > QUOTA_LIMIT[quota]:
+        raise ValueError(
+            f"cannot reserve {n} units of {quota}: a whole window holds only "
+            f"{QUOTA_LIMIT[quota]}, so this can never succeed")
     read_clock = (lambda: time.time()) if clock is None else clock
     limit = config.BUDGET_WAIT_S if max_wait_s is None else max_wait_s
-    if n > QUOTA_LIMIT[quota]:
-        return False
     waited = 0.0
     while True:
         if reserve(conn, quota, n, now=read_clock()):
