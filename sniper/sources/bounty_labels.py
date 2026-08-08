@@ -58,7 +58,15 @@ class BountyLabelSource:
                     f"({len(found.items)} of {found.total_count}) -- GitHub timed out")
 
             for item in found.items:
-                cand = Candidate.from_search_item(self.name, item)
+                try:
+                    cand = Candidate.from_search_item(self.name, item)
+                except Exception as exc:  # noqa: BLE001 -- one malformed item
+                    # must not discard every candidate already collected. Only
+                    # the network call was guarded before, so a missing
+                    # repository_url took the whole run down with no warning.
+                    result.warnings.append(
+                        f"query {query!r}: skipped an unusable result item: {exc}")
+                    continue
                 by_key[cand.key] = cand
 
         result.candidates = list(by_key.values())
@@ -74,7 +82,13 @@ class BountyLabelSource:
 
         def stop(items: list[dict]) -> bool:
             for item in items:
-                cand = Candidate.from_search_item(self.name, item)
+                try:
+                    cand = Candidate.from_search_item(self.name, item)
+                except Exception:  # noqa: BLE001 -- an item we cannot even key is
+                    # by definition not one we have already recorded, so keep
+                    # paging. Raising here would abort discovery from inside a
+                    # callback, where there is no warnings list to report into.
+                    return False
                 if store.known_updated_at(conn, *cand.key) != cand.updated_at:
                     return False
             return True

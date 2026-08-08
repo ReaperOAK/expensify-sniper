@@ -96,3 +96,50 @@ def test_an_exhausted_core_budget_warns_and_makes_no_call(tmp_path, fake_get):
     assert result.candidates == []
     assert any("core budget" in w for w in result.warnings)
     assert fake_get.calls == []
+
+
+def test_a_fetch_failure_leaves_the_event_unseen_so_it_is_retried(tmp_path, fake_get):
+    """Marking before the work burns the event forever.
+
+    mark_event_seen() commits, so an event marked before a failed fetch is
+    skipped as "already handled" on every later run. A warning would make that
+    visible but not recoverable -- a $250 bounty silently dropped.
+    """
+    conn = _conn(tmp_path)
+    fake_get.queue(200, [_event(1, 96348)], {"ETag": 'W/"a"'})
+    fake_get.queue(500, {"message": "boom"})
+    first = ExpensifySource().discover(conn)
+    assert first.candidates == []
+    assert any("96348" in w for w in first.warnings)
+    assert store.event_seen(conn, 1) is False
+
+    # Next run: same event, this time the fetch works.
+    fake_get.queue(200, [_event(1, 96348)], {"ETag": 'W/"b"'})
+    fake_get.queue(200, _issue(96348))
+    second = ExpensifySource().discover(conn)
+    assert [c.number for c in second.candidates] == [96348]
+    assert store.event_seen(conn, 1) is True
+
+
+def test_budget_exhausted_mid_loop_leaves_the_event_unseen(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    fake_get.queue(200, [_event(1, 1), _event(2, 2)], {"ETag": 'W/"a"'})
+    fake_get.queue(200, _issue(1))
+    # One core unit for the poll, one for issue #1 -- then nothing left for #2.
+    store.reserve(conn, "core", store.QUOTA_LIMIT["core"] - 2)
+    result = ExpensifySource().discover(conn)
+    assert [c.number for c in result.candidates] == [1]
+    assert any("core budget" in w and "retried next run" in w for w in result.warnings)
+    assert store.event_seen(conn, 1) is True
+    assert store.event_seen(conn, 2) is False
+
+
+def test_a_malformed_issue_payload_warns_without_discarding_the_others(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    fake_get.queue(200, [_event(1, 1), _event(2, 2)], {"ETag": 'W/"a"'})
+    fake_get.queue(200, {"title": "no number key"})  # Candidate.from_issue will raise
+    fake_get.queue(200, _issue(2))
+    result = ExpensifySource().discover(conn)
+    assert [c.number for c in result.candidates] == [2]
+    assert any("unusable" in w for w in result.warnings)
+    assert store.event_seen(conn, 1) is False

@@ -48,12 +48,19 @@ class ExpensifySource:
         store.set_cache(conn, self.CACHE_KEY, new_etag, "")
 
         for event in events:
-            if not store.mark_event_seen(conn, event["event_id"], event["issue"],
-                                         event["labeled_at"]):
+            # Check-then-mark, deliberately not mark-then-work. mark_event_seen()
+            # commits, so marking before the fetch burns an event we never managed
+            # to fetch: the next run skips it as "already handled". A warning
+            # makes that visible but not recoverable. Marking only once a
+            # candidate exists costs at most one repeated core call per run for a
+            # persistently broken issue, against a 5000/hr budget -- far cheaper
+            # than silently dropping a $250 bounty.
+            if store.event_seen(conn, event["event_id"]):
                 continue  # already handled on an earlier run
             if not store.reserve_or_wait(conn, "core", 1):
                 result.warnings.append(
-                    f"core budget exhausted -- Expensify #{event['issue']} not fetched")
+                    f"core budget exhausted -- Expensify #{event['issue']} not "
+                    f"fetched; it stays unseen and will be retried next run")
                 break
             try:
                 issue = github_api.get_issue(self.repo, event["issue"])
@@ -61,7 +68,17 @@ class ExpensifySource:
                 result.warnings.append(
                     f"Expensify #{event['issue']} fetch failed: {exc}")
                 continue
-            result.candidates.append(Candidate.from_issue(
-                self.name, self.repo, issue, amount_usd=config.EXPENSIFY_BOUNTY_USD))
+            try:
+                candidate = Candidate.from_issue(
+                    self.name, self.repo, issue,
+                    amount_usd=config.EXPENSIFY_BOUNTY_USD)
+            except Exception as exc:  # noqa: BLE001 -- a malformed payload must
+                # not discard candidates already collected in this run.
+                result.warnings.append(
+                    f"Expensify #{event['issue']} payload unusable: {exc}")
+                continue
+            store.mark_event_seen(conn, event["event_id"], event["issue"],
+                                  event["labeled_at"])
+            result.candidates.append(candidate)
 
         return result

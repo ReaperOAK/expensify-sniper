@@ -85,6 +85,19 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def event_seen(conn: sqlite3.Connection, event_id: int) -> bool:
+    """Have we already handled this label event? Read-only -- records nothing.
+
+    mark_event_seen() both checks and commits, which is wrong for a caller that
+    might fail after the check: the event would be burnt without ever being
+    processed. This lets a source look first and mark only once the work landed.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM seen_events WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    return row is not None
+
+
 def mark_event_seen(conn: sqlite3.Connection, event_id: int, issue: int, labeled_at: str) -> bool:
     """Record a label event. Returns True if this is the first time we've seen it."""
     cur = conn.execute(

@@ -135,3 +135,18 @@ def test_the_real_recorded_payload_yields_candidates(tmp_path, fake_get):
     result = BountyLabelSource(queries=["label:bounty"], max_pages=1).discover(_conn(tmp_path))
     assert len(result.candidates) == 100
     assert result.warnings == []
+
+
+def test_a_malformed_search_item_warns_without_discarding_the_rest(tmp_path, fake_get):
+    """Only the network call used to be guarded.
+
+    A result item missing repository_url raised out of discover() and took every
+    candidate already collected with it -- silently, which is the exact failure
+    the warnings-as-value contract exists to prevent.
+    """
+    page = _page([1, 2])
+    del page["items"][0]["repository_url"]
+    fake_get.queue(200, page)
+    result = BountyLabelSource(queries=["label:bounty"]).discover(_conn(tmp_path))
+    assert [c.number for c in result.candidates] == [2]
+    assert any("unusable result item" in w for w in result.warnings)
