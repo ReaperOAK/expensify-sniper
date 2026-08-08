@@ -257,3 +257,22 @@ def search_issues(
 
     return SearchResult(items=items, total_count=total_count,
                         incomplete=incomplete, pages_fetched=pages_fetched)
+
+
+def get_repo(repo: str, etag: str | None = None) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Return (repo detail, etag, changed) for "owner/name".
+
+    Supplies fork / archived / stargazers_count / pushed_at / language -- none of
+    which appear in a search result item (measured 2026-08-05), so this call is
+    what turns a search hit into something scoreable.
+
+    Core quota, and a 304 costs nothing: verified 2026-08-05 that revalidating with
+    If-None-Match left X-RateLimit-Remaining unchanged. `changed=False` means "use
+    your cached body", which is a different thing from "no such repo" -- the latter
+    raises.
+    """
+    resp = _get(f"/repos/{repo}", etag=etag)
+    if resp.status_code == 304:
+        return None, etag, False
+    resp.raise_for_status()
+    return resp.json(), resp.headers.get("ETag"), True
