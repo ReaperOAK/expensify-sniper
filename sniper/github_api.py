@@ -27,6 +27,8 @@ Two quota classes, and they are NOT interchangeable:
 
 import json
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import requests
@@ -35,6 +37,10 @@ from . import config
 
 API = "https://api.github.com"
 UA = "expensify-sniper/1.0"
+
+# The Search API hard-caps at 1000 results regardless of total_count. Paging past
+# page 10 at per_page=100 returns a 422, so we stop ourselves first.
+SEARCH_RESULT_CAP = 1000
 
 
 class RateLimited(Exception):
@@ -175,3 +181,73 @@ def rate_limit() -> dict[str, Any]:
 
 def wait_for_reset(reset_epoch: int) -> None:
     time.sleep(max(0, reset_epoch - time.time()) + 1)
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """Outcome of a paged search.
+
+    `incomplete` mirrors GitHub's `incomplete_results`: the query timed out
+    server-side and the items are a partial answer. It is a field rather than a
+    log line because the digest has to SAY it could not see everything -- a
+    silently short result set is exactly HANDOFF.md trap #3.
+    """
+
+    items: list[dict[str, Any]]
+    total_count: int
+    incomplete: bool
+    pages_fetched: int
+
+
+def search_issues(
+    query: str,
+    *,
+    sort: str = "updated",
+    order: str = "desc",
+    per_page: int = 100,
+    max_pages: int = 10,
+    stop: Callable[[list[dict[str, Any]]], bool] | None = None,
+) -> SearchResult:
+    """Page /search/issues for `query`, newest-updated first.
+
+    Costs one unit of the 30/min search quota per page: search responses carry no
+    ETag (measured 2026-08-05), so unlike the core API there is nothing to
+    revalidate against.
+
+    `sort="updated"` is not a preference. Bounty labels are applied to issues that
+    already exist -- measured 2026-08-05, only 1 of 521 live candidates was created
+    in the previous 30 days -- so `created` ordering misses essentially everything.
+
+    `stop` is called with each page's items after it is accumulated; returning True
+    ends paging. Discovery uses it to stop once a page is entirely already-known.
+    """
+    items: list[dict[str, Any]] = []
+    total_count = 0
+    incomplete = False
+    pages_fetched = 0
+
+    for page in range(1, max_pages + 1):
+        resp = _get(
+            "/search/issues",
+            params={"q": query, "sort": sort, "order": order,
+                    "per_page": per_page, "page": page},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        pages_fetched += 1
+
+        total_count = payload.get("total_count", 0)
+        incomplete = incomplete or bool(payload.get("incomplete_results"))
+        batch = payload.get("items", [])
+        items.extend(batch)
+
+        if len(items) >= SEARCH_RESULT_CAP:
+            del items[SEARCH_RESULT_CAP:]
+            break
+        if len(batch) < per_page:
+            break
+        if stop is not None and stop(batch):
+            break
+
+    return SearchResult(items=items, total_count=total_count,
+                        incomplete=incomplete, pages_fetched=pages_fetched)
