@@ -43,7 +43,7 @@ def test_get_does_not_raise_on_403_that_is_not_a_rate_limit(fake_get):
 
 def test_poll_returns_unchanged_and_costs_nothing_on_304(fake_get):
     fake_get.queue(304, None)
-    events, etag, changed = github_api.poll_help_wanted_events(etag='W/"old"')
+    events, etag, changed = github_api.poll_help_wanted_events("owner/repo", etag='W/"old"')
     assert events == []
     assert etag == 'W/"old"'
     assert changed is False
@@ -66,7 +66,7 @@ def test_poll_keeps_only_help_wanted_label_events_on_issues(fake_get):
                    "labels": [], "pull_request": {"url": "x"}}},
     ]
     fake_get.queue(200, payload, {"ETag": 'W/"new"'})
-    events, etag, changed = github_api.poll_help_wanted_events(etag=None)
+    events, etag, changed = github_api.poll_help_wanted_events("owner/repo", etag=None)
     assert changed is True
     assert etag == 'W/"new"'
     assert events == [{
@@ -81,9 +81,10 @@ def test_poll_keeps_only_help_wanted_label_events_on_issues(fake_get):
 
 def test_poll_survives_the_real_recorded_events_payload(fake_get):
     fake_get.queue(200, load_fixture("events_expensify"), {"ETag": 'W/"real"'})
-    events, etag, changed = github_api.poll_help_wanted_events(etag=None)
+    events, etag, changed = github_api.poll_help_wanted_events("Expensify/App", etag=None)
     assert changed is True
     assert etag == 'W/"real"'
+    assert fake_get.calls[0][0] == "https://api.github.com/repos/Expensify/App/issues/events"
     assert all(set(e) == {"event_id", "issue", "title", "state", "labeled_at", "labels"}
                for e in events)
     assert all(isinstance(e["issue"], int) for e in events)
@@ -91,14 +92,14 @@ def test_poll_survives_the_real_recorded_events_payload(fake_get):
 
 def test_iter_comments_stops_on_a_short_page(fake_get):
     fake_get.queue(200, [{"id": 1}, {"id": 2}])
-    assert [c["id"] for c in github_api.iter_comments(1)] == [1, 2]
+    assert [c["id"] for c in github_api.iter_comments("owner/repo", 1)] == [1, 2]
     assert len(fake_get.calls) == 1
 
 
 def test_iter_comments_pages_while_pages_are_full(fake_get):
     fake_get.queue(200, [{"id": i} for i in range(100)])
     fake_get.queue(200, [{"id": 100}])
-    ids = [c["id"] for c in github_api.iter_comments(1)]
+    ids = [c["id"] for c in github_api.iter_comments("owner/repo", 1)]
     assert ids == list(range(101))
     assert [params["page"] for _, params in fake_get.calls] == [1, 2]
 
@@ -119,7 +120,7 @@ def test_existing_proposals_skips_bots_and_non_proposals_and_sorts_oldest_first(
         {"id": 4, "body": "just a comment", "created_at": "2026-08-01T00:00:00Z",
          "html_url": "uc", "user": {"login": "third", "type": "User"}},
     ])
-    got = github_api.existing_proposals(1)
+    got = github_api.existing_proposals("owner/repo", 1)
     assert [p["author"] for p in got] == ["first", "second"]
     assert set(got[0]) == {"author", "created_at", "url", "body"}
 
@@ -129,15 +130,30 @@ def test_melvin_analysis_returns_the_root_cause_comment(fake_get):
         {"id": 1, "body": "hello", "user": {"login": "someone"}},
         {"id": 2, "body": "The ROOT CAUSE is X", "user": {"login": "melvin-bot[bot]"}},
     ])
-    assert github_api.melvin_analysis(1) == "The ROOT CAUSE is X"
+    assert github_api.melvin_analysis("owner/repo", 1) == "The ROOT CAUSE is X"
 
 
 def test_melvin_analysis_returns_none_when_absent(fake_get):
     fake_get.queue(200, [{"id": 1, "body": "hello", "user": {"login": "someone"}}])
-    assert github_api.melvin_analysis(1) is None
+    assert github_api.melvin_analysis("owner/repo", 1) is None
 
 
 def test_rate_limit_returns_the_core_resource(fake_get):
     fake_get.queue(200, {"resources": {"core": {"limit": 5000, "remaining": 4999},
                                        "search": {"limit": 30}}})
     assert github_api.rate_limit() == {"limit": 5000, "remaining": 4999}
+
+
+def test_every_endpoint_uses_the_repo_it_was_given(fake_get):
+    fake_get.queue(304, None)
+    github_api.poll_help_wanted_events("acme/widgets", etag='W/"x"')
+    fake_get.queue(200, {"number": 7})
+    github_api.get_issue("acme/widgets", 7)
+    fake_get.queue(200, [])
+    list(github_api.iter_comments("acme/widgets", 7))
+    urls = [url for url, _ in fake_get.calls]
+    assert urls == [
+        "https://api.github.com/repos/acme/widgets/issues/events",
+        "https://api.github.com/repos/acme/widgets/issues/7",
+        "https://api.github.com/repos/acme/widgets/issues/7/comments",
+    ]
