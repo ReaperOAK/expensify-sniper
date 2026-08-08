@@ -90,3 +90,6 @@ def no_budget_waiting(monkeypatch):
     from sniper import config
 
     monkeypatch.setattr(config, "BUDGET_WAIT_S", 0, raising=False)
+    # Same reason: search_issues paces its pages to dodge GitHub's burst guard.
+    # Real seconds in a unit test buy nothing.
+    monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 0, raising=False)

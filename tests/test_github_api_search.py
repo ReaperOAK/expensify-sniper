@@ -130,3 +130,58 @@ def test_real_recorded_payload_parses(fake_get):
     # Corrects the spec: search items carry no repo metadata, so fork/archived
     # are NOT free rejects. Plan 2's pipeline depends on this.
     assert "repository" not in item
+
+
+def test_a_secondary_rate_limit_is_reported_as_such_not_as_the_primary_pool(fake_get):
+    """GitHub's burst guard fires with primary quota still unspent.
+
+    Measured 2026-08-08: a 403 carrying "secondary rate limit" arrived with
+    X-RateLimit-Remaining 23 of 30. The X-RateLimit-Reset on that response
+    describes the PRIMARY window, so reporting "rate limited until <epoch>" from
+    it is a confident lie a caller cannot act on.
+    """
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"X-RateLimit-Remaining": "23", "X-RateLimit-Limit": "30",
+                    "X-RateLimit-Reset": "1786205456"})
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q")
+    assert excinfo.value.secondary is True
+    assert excinfo.value.retry_after is None
+    assert "23 of 30" in str(excinfo.value)
+
+
+def test_a_primary_rate_limit_still_reports_its_reset(fake_get):
+    fake_get.queue(403, {"message": "API rate limit exceeded"},
+                   {"X-RateLimit-Reset": "1786205456"})
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q")
+    assert excinfo.value.secondary is False
+    assert "1786205456" in str(excinfo.value)
+
+
+def test_retry_after_is_honoured_when_github_supplies_it(fake_get):
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"Retry-After": "42"})
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q")
+    assert excinfo.value.retry_after == 42.0
+    assert excinfo.value.secondary is True
+
+
+def test_pages_are_paced_to_avoid_the_burst_guard(fake_get):
+    # Ten back-to-back pages is exactly the shape that tripped the secondary
+    # limit live. The pause goes BETWEEN pages, never before the first.
+    fake_get.queue(200, _page(100, 300, start=0))
+    fake_get.queue(200, _page(100, 300, start=100))
+    fake_get.queue(200, _page(100, 300, start=200))
+    slept = []
+    result = github_api.search_issues("q", per_page=100, pause_s=3, sleep=slept.append)
+    assert result.pages_fetched == 3
+    assert slept == [3, 3]
+
+
+def test_a_single_page_search_never_pauses(fake_get):
+    fake_get.queue(200, _page(3, 3))
+    slept = []
+    github_api.search_issues("q", pause_s=3, sleep=slept.append)
+    assert slept == []

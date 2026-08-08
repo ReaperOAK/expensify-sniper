@@ -148,6 +148,14 @@ CORE_BUDGET_PER_RUN = int(os.environ.get("CORE_BUDGET_PER_RUN", "1500"))
 # suite zeroes this via an autouse fixture -- a suite that can sleep is a trap.
 BUDGET_WAIT_S = float(os.environ.get("BUDGET_WAIT_S", "65"))
 
+# Pause between consecutive search PAGES. Not about the documented 30/min pool --
+# that is what the budget guard is for. This defends against GitHub's secondary
+# (burst) rate limit, which fires on request rate regardless of remaining quota:
+# measured 2026-08-08, ten back-to-back pages got a 403 with 23 of 30 primary
+# units still unspent. At <=20 pages a run and a 3-hourly cadence, a couple of
+# seconds a page is free; tripping the burst guard costs the entire run.
+SEARCH_PAGE_PAUSE_S = float(os.environ.get("SEARCH_PAGE_PAUSE_S", "3"))
+
 HUNT_ENABLED_SOURCES = [
     name.strip()
     for name in os.environ.get("HUNT_SOURCES", "github-labels,expensify").split(",")

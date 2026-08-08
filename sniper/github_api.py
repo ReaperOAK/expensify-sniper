@@ -44,7 +44,28 @@ SEARCH_RESULT_CAP = 1000
 
 
 class RateLimited(Exception):
-    pass
+    """A 403 that means "slow down", with WHICH limit it was.
+
+    GitHub has two, and they behave nothing alike:
+
+    * primary -- the documented pools (search 30/min, core 5000/hr). Depletion is
+      visible in X-RateLimit-Remaining and the reset epoch is meaningful.
+    * secondary -- an undocumented burst/abuse guard. It fires regardless of
+      primary quota (measured 2026-08-08: a 403 with X-RateLimit-Remaining 23 of
+      30 still left) and its reply says only "wait a few minutes". The
+      X-RateLimit-Reset header on that response describes the PRIMARY window and
+      is therefore meaningless for deciding when to retry.
+
+    Conflating them produces a confident, wrong "rate limited until <epoch>" that
+    a caller cannot act on -- so `secondary` and `retry_after` are carried
+    explicitly. `retry_after` is None when GitHub declined to say.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None,
+                 secondary: bool = False):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.secondary = secondary
 
 
 def _headers(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -64,8 +85,26 @@ def _get(path: str, params: dict[str, Any] | None = None, etag: str | None = Non
     extra = {"If-None-Match": etag} if etag else None
     resp = requests.get(url, headers=_headers(extra), params=params, timeout=30)
     if resp.status_code == 403 and "rate limit" in resp.text.lower():
+        secondary = "secondary rate limit" in resp.text.lower()
+        header = resp.headers.get("Retry-After")
+        if header is not None:
+            retry_after: float | None = float(header)
+        elif secondary:
+            # No Retry-After and no usable reset: GitHub says only "a few
+            # minutes". Reporting the primary reset epoch here would be a
+            # confident lie, so say nothing rather than something wrong.
+            retry_after = None
+        else:
+            reset = int(resp.headers.get("X-RateLimit-Reset", "0"))
+            retry_after = max(0.0, reset - time.time())
+        if secondary:
+            raise RateLimited(
+                "secondary rate limit (burst guard) -- primary quota was not "
+                f"exhausted ({resp.headers.get('X-RateLimit-Remaining', '?')} of "
+                f"{resp.headers.get('X-RateLimit-Limit', '?')} left); slow down",
+                retry_after=retry_after, secondary=True)
         reset = int(resp.headers.get("X-RateLimit-Reset", "0"))
-        raise RateLimited(f"rate limited until {reset}")
+        raise RateLimited(f"rate limited until {reset}", retry_after=retry_after)
     return resp
 
 
@@ -207,6 +246,8 @@ def search_issues(
     per_page: int = 100,
     max_pages: int = 10,
     stop: Callable[[list[dict[str, Any]]], bool] | None = None,
+    pause_s: float | None = None,
+    sleep=time.sleep,
 ) -> SearchResult:
     """Page /search/issues for `query`, newest-updated first.
 
@@ -227,7 +268,17 @@ def search_issues(
     incomplete = False
     pages_fetched = 0
 
+    pause = config.SEARCH_PAGE_PAUSE_S if pause_s is None else pause_s
+
     for page in range(1, max_pages + 1):
+        # Pace the pages. The primary 30/min pool is not the binding constraint
+        # here -- measured 2026-08-08, ten back-to-back pages tripped GitHub's
+        # SECONDARY (burst) limit with 23 of 30 primary units still unspent, and
+        # a 3-hourly cron would have hit it on every single run. The budget guard
+        # in store.py cannot prevent this: it models the documented pools, and
+        # the secondary limit is about rate, not volume.
+        if page > 1 and pause:
+            sleep(pause)
         resp = _get(
             "/search/issues",
             params={"q": query, "sort": sort, "order": order,
