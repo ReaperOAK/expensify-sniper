@@ -1,7 +1,14 @@
 """Repo-agnostic GitHub access layer.
 
-Every function takes an explicit `repo` ("owner/name"). Nothing here knows about
-Expensify; that lives in sniper/sources/expensify.py.
+Every function takes an explicit `repo` ("owner/name"), so no URL in this module
+is tied to one project.
+
+"Repo-agnostic" is a claim about URLs, not about filtering, and the difference
+matters: poll_help_wanted_events() still filters on config.HELP_WANTED, and
+existing_proposals() still uses config.is_proposal() and config.is_bot_author().
+Those are Expensify's business rules rather than GitHub's, and they move out to a
+dedicated source module later. Until they do, do not read this module as free of
+Expensify.
 
 The watcher polls /issues/events rather than /issues, because `Help Wanted` is
 applied to issues that already exist. Sorting /issues by `created` (as the old
