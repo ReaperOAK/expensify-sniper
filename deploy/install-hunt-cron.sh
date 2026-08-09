@@ -10,7 +10,10 @@
 set -euo pipefail
 
 HOST="${OCI_HOST:-openclaw}"
-REMOTE="${OCI_PATH:-\$HOME/expensify-sniper}"
+# Home-relative on purpose. rsync resolves a remote path against the login
+# home and does NOT run a shell over it, so a literal "$HOME/..." here arrives
+# unexpanded and rsync tries to create a directory called '$HOME'.
+REMOTE="${OCI_PATH:-expensify-sniper}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # NEVER ship these. .env holds live credentials and the box has its own copy;
@@ -64,8 +67,23 @@ if [[ -n "$DRY" ]]; then
     exit 0
 fi
 
-echo "==> smoke test (dry run: nothing is sent)"
-ssh "$HOST" "cd $REMOTE && timeout 1800 /usr/bin/python3 hunt.py --dry-run 2>&1 | head -12"
+echo "==> smoke test: wiring only, deliberately NOT a full run"
+# A full backlog run takes tens of minutes (paced pages, waited-out throttles)
+# and would spend the same token the cron is about to use. This proves the
+# modules import, config loads, the DB opens and the CLI is wired -- everything
+# a deploy can break. Whether GitHub is cooperating is the cron's business, and
+# it reports that itself, in the digest, by design.
+ssh "$HOST" "cd $REMOTE && /usr/bin/python3 - <<'PY'
+import hunt
+from sniper import config, store
+conn = store.connect()
+print('  imports ok; sources:', ','.join(config.HUNT_ENABLED_SOURCES))
+print('  db ok; candidates already stored:', store.candidate_count(conn))
+print('  delivery:', 'discord' if config.DISCORD_WEBHOOK
+      else ('telegram' if config.TELEGRAM_BOT_TOKEN else 'NONE CONFIGURED'))
+hunt.build_sources(config.HUNT_ENABLED_SOURCES)
+print('  sources build ok')
+PY"
 
 echo "==> installing crontab entry"
 ssh "$HOST" "crontab -l 2>/dev/null | grep -v 'hunt.py' > /tmp/ct.\$\$ || true
