@@ -33,11 +33,13 @@ from sniper import score as scoring, store  # noqa: E402
 from sniper.models import Candidate  # noqa: E402
 from sniper.sources.base import Source, SourceResult  # noqa: E402
 from sniper.sources.bounty_labels import BountyLabelSource  # noqa: E402
-from sniper.sources.expensify import ExpensifySource  # noqa: E402
+from sniper.sources.expensify import ExpensifySource
+from sniper.sources.payer_watch import PayerWatchSource  # noqa: E402
 
 SOURCE_CLASSES = {
     BountyLabelSource.name: BountyLabelSource,
     ExpensifySource.name: ExpensifySource,
+    PayerWatchSource.name: PayerWatchSource,
 }
 
 
@@ -260,6 +262,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Rank open unclaimed bounties.")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the digest instead of sending it")
+    parser.add_argument("--watch", action="store_true",
+                        help="fast sweep of proven-payer repos only "
+                             "(cheap: core quota, and a 304 costs nothing)")
     parser.add_argument("--dismiss", metavar="REPO#NUMBER", default=None,
                         help="never show this issue again (e.g. commaai/opendbc#3426)")
     parser.add_argument("--undismiss", metavar="REPO#NUMBER", default=None,
@@ -297,7 +302,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'restored' if found else 'was not dismissed'}: {repo}#{num}")
         return 0
 
-    names = (args.sources.split(",") if args.sources else config.HUNT_ENABLED_SOURCES)
+    if args.watch:
+        names = [PayerWatchSource.name]
+    else:
+        names = (args.sources.split(",") if args.sources
+                 else config.HUNT_ENABLED_SOURCES)
     text = run(conn, sources=build_sources(names), dry_run=args.dry_run)
     print(text)
     return 0

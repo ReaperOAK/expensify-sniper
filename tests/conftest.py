@@ -55,12 +55,18 @@ class FakeGet:
     def __init__(self):
         self._queue: list[FakeResponse] = []
         self.calls: list[tuple[str, dict]] = []
+        # Headers are recorded separately so `calls` keeps its (url, params)
+        # shape. Without them nothing could assert that a conditional request
+        # actually carried If-None-Match -- and a test that cannot see the ETag
+        # cannot tell revalidation from a plain refetch.
+        self.sent_headers: list[dict] = []
 
     def queue(self, status: int, body, headers: dict[str, str] | None = None) -> None:
         self._queue.append(FakeResponse(status, body, headers))
 
     def __call__(self, url, headers=None, params=None, timeout=None):
         self.calls.append((url, dict(params or {})))
+        self.sent_headers.append(dict(headers or {}))
         if not self._queue:
             raise AssertionError(f"unqueued request to {url} params={params}")
         return self._queue.pop(0)

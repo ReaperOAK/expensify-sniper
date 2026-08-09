@@ -112,10 +112,23 @@ def _get(path: str, params: dict[str, Any] | None = None, etag: str | None = Non
     return resp
 
 
-def poll_help_wanted_events(repo: str, etag: str | None) -> tuple[list[dict[str, Any]], str | None, bool]:
-    """Return (help-wanted label events newest-first, new etag, changed).
+def poll_label_events(
+    repo: str,
+    etag: str | None,
+    matches: Callable[[str], bool],
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """Return (label events whose label `matches`, newest-first, new etag, changed).
 
-    A 304 costs no rate-limit quota, which is why the ETag is threaded through.
+    Polls /issues/events rather than /issues because a label lands on an issue
+    that already exists, so `created` ordering never surfaces it.
+
+    This is the cheapest watch GitHub offers. Measured 2026-08-09 across four
+    payer repos, revalidating with If-None-Match returned 304 and left
+    X-RateLimit-Remaining completely unchanged -- so watching a repo that has not
+    changed is free, and the core pool is 5000/hr rather than search's 30/min.
+
+    One page of 100 events covered only a SINGLE DAY on go-gitea/gitea. Poll
+    faster than a repo's event velocity or labels will roll off the page unseen.
     """
     resp = _get(f"/repos/{repo}/issues/events", params={"per_page": 100}, etag=etag)
     if resp.status_code == 304:
@@ -126,7 +139,8 @@ def poll_help_wanted_events(repo: str, etag: str | None) -> tuple[list[dict[str,
     for event in resp.json():
         if event.get("event") != "labeled":
             continue
-        if (event.get("label") or {}).get("name") != config.HELP_WANTED:
+        label_name = (event.get("label") or {}).get("name")
+        if not label_name or not matches(label_name):
             continue
         issue = event.get("issue") or {}
         # Pull requests come through this endpoint too; they are never bounties.
@@ -143,6 +157,11 @@ def poll_help_wanted_events(repo: str, etag: str | None) -> tuple[list[dict[str,
             }
         )
     return events, resp.headers.get("ETag"), True
+
+
+def poll_help_wanted_events(repo: str, etag: str | None) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """Expensify's Help Wanted watch. Unchanged contract; now one case of many."""
+    return poll_label_events(repo, etag, lambda name: name == config.HELP_WANTED)
 
 
 def get_issue(repo: str, number: int) -> dict[str, Any]:

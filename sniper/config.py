@@ -162,6 +162,18 @@ PAYER_SEARCH_MAX_PAGES = int(os.environ.get("PAYER_SEARCH_MAX_PAGES", "6"))
 # paid one counts against it. A new project with two bounties is not a farm.
 UNPAID_REPO_THRESHOLD = int(os.environ.get("UNPAID_REPO_THRESHOLD", "10"))
 
+# --- payer watch --------------------------------------------------------------
+# How many proven-payer repos to watch. Each costs one core request per sweep,
+# and nothing at all when the repo is unchanged (a 304 leaves the quota
+# untouched, measured 2026-08-09). 38 distinct payers appeared in the 100 most
+# recent payouts, so this covers the live set with room to grow.
+WATCH_MAX_REPOS = int(os.environ.get("WATCH_MAX_REPOS", "60"))
+# Sweep cadence, minutes. Not a preference: a single events page holds 100
+# entries and covered only ONE DAY on go-gitea/gitea, so polling slower than a
+# repo's event velocity loses labels silently. Ten minutes is far inside that
+# for every payer measured.
+WATCH_EVERY_MINUTES = int(os.environ.get("WATCH_EVERY_MINUTES", "10"))
+
 # Two quota classes, shared with the Expensify watcher through one token. The
 # budget guard in store.py refuses to start a run it cannot finish rather than
 # reporting an empty world -- a throttled search is indistinguishable from "no
