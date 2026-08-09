@@ -339,7 +339,12 @@ def reserve_or_wait(
         if waited >= limit:
             return False
         window_s = WINDOW_SECONDS[quota]
-        remaining = window_s - (read_clock() % window_s)
+        # Cap the sleep at the remaining patience. Without this the FIRST sleep is
+        # always "time to the next window boundary" regardless of max_wait_s --
+        # harmless for search (60s windows, close to the 65s default) but for core
+        # the window is 3600s, so a single call could block for up to an hour with
+        # no signal, flatly contradicting this function's own docstring.
+        remaining = min(window_s - (read_clock() % window_s), limit - waited)
         sleep(remaining)
         waited += remaining
 

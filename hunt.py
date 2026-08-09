@@ -173,8 +173,16 @@ def run(
         if taken:
             store.upsert_candidate(conn, cand, rejected="open linked PR", now=stamp)
             continue
-        store.upsert_candidate(conn, cand.with_score(scoring.score(cand, now=stamp)),
-                               now=stamp)
+        try:
+            scored = cand.with_score(scoring.score(cand, now=stamp))
+        except Exception as exc:  # noqa: BLE001 -- score() raises by contract on an
+            # unenriched candidate. Unreachable today (with_repo_detail sets every
+            # field from one payload, and repo_reject already passed), but a 200
+            # response missing one of those keys would otherwise kill the whole
+            # run: no digest, and every other warning in it lost too.
+            warnings.append(f"scoring {cand.repo}#{cand.number} failed: {exc}")
+            continue
+        store.upsert_candidate(conn, scored, now=stamp)
 
     # Stage 4 -- digest.
     if first_run:
@@ -187,7 +195,22 @@ def run(
     text = notify.format_digest(new_rows, standing_rows, warnings,
                                 first_run=first_run, now=stamp)
     if not dry_run:
-        notify.send(text)
+        # Delivery is the one stage whose failure a human would never see, which
+        # makes it the one that most needs saying out loud. An unset webhook
+        # returns "none" and does nothing at all -- every 3-hourly run would
+        # "succeed" forever while notifying no one. And a revoked webhook raises,
+        # which would take the assembled digest down with it AFTER the candidates
+        # in it were already committed as seen, so they never reappear as new.
+        try:
+            channel = notify.send(text)
+        except Exception as exc:  # noqa: BLE001
+            channel = "failed"
+            text += f"\n\n⚠ digest delivery failed: {exc}"
+        if channel in ("none", "failed"):
+            reason = ("no delivery channel configured (set DISCORD_WEBHOOK, or "
+                      "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)"
+                      if channel == "none" else "delivery raised")
+            print(f"⚠ digest was NOT delivered: {reason}", file=sys.stderr)
     return text
 
 

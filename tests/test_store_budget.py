@@ -142,3 +142,26 @@ def test_prune_budget_drops_stale_windows_but_keeps_the_current_one(tmp_path):
     store.reserve(conn, "core", 5, now=3 * HOUR)
     store.prune_budget(conn, now=3 * HOUR)
     assert store.spent(conn, "core", now=3 * HOUR) == 5
+
+
+def test_a_core_wait_is_capped_by_max_wait_s_not_by_the_window(tmp_path):
+    """The core window is 3600s. Sleeping to its boundary ignores max_wait_s.
+
+    The waited>=limit check runs before the sleep is computed, so without a cap
+    the FIRST sleep is always 'time to the next boundary' -- up to an hour for
+    core, with no signal, contradicting this function's own docstring.
+    """
+    conn = _conn(tmp_path)
+    store.reserve(conn, "core", store.QUOTA_LIMIT["core"], now=0.0)
+    slept = []
+    clock = {"t": 0.0}
+
+    def sleep(seconds):
+        slept.append(seconds)
+        clock["t"] += seconds
+
+    assert store.reserve_or_wait(
+        conn, "core", 1, max_wait_s=65,
+        clock=lambda: clock["t"], sleep=sleep) is False
+    assert sum(slept) <= 65
+    assert max(slept) <= 65

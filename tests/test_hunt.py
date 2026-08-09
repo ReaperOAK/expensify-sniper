@@ -205,3 +205,43 @@ def test_build_sources_rejects_an_unknown_name():
 
     with pytest.raises(ValueError, match="nope"):
         hunt.build_sources(["nope"])
+
+
+def test_an_unconfigured_delivery_channel_is_announced_not_silent(tmp_path, fake_get, monkeypatch, capsys):
+    """An unset webhook made every run 'succeed' while notifying nobody.
+
+    Delivery is the one stage whose failure a human would never otherwise see,
+    which is exactly why it has to say so.
+    """
+    from sniper import notify
+
+    monkeypatch.setattr(notify.config, "DISCORD_WEBHOOK", "")
+    monkeypatch.setattr(notify.config, "TELEGRAM_BOT_TOKEN", "")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], dry_run=False)
+    assert "NOT delivered" in capsys.readouterr().err
+
+
+def test_a_delivery_failure_does_not_destroy_the_digest(tmp_path, fake_get, monkeypatch, capsys):
+    """The candidates were already committed as seen before send() ran.
+
+    Letting the exception escape loses the digest AND guarantees those
+    candidates never reappear as 'new' on a later run.
+    """
+    from sniper import notify
+
+    monkeypatch.setattr(notify.config, "DISCORD_WEBHOOK", "https://discord/hook")
+
+    def boom(*a, **k):
+        raise RuntimeError("webhook revoked")
+
+    monkeypatch.setattr(notify, "send", boom)
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], dry_run=False)
+    assert "acme/widgets#1" in text
+    assert "delivery failed" in text
+    assert "NOT delivered" in capsys.readouterr().err

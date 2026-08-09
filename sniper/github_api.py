@@ -38,8 +38,12 @@ from . import config
 API = "https://api.github.com"
 UA = "expensify-sniper/1.0"
 
-# The Search API hard-caps at 1000 results regardless of total_count. Paging past
-# page 10 at per_page=100 returns a 422, so we stop ourselves first.
+# The Search API hard-caps at 1000 results regardless of total_count; asking for
+# more returns a 422, so we stop ourselves first. The cap is in RESULTS, not
+# pages, so it does not move when per_page does -- and it does move: production
+# pages at config.SEARCH_PER_PAGE (50) over config.BOUNTY_SEARCH_MAX_PAGES (20),
+# not at this function's own 100/10 defaults, because per_page=100 trips GitHub's
+# burst guard on this query. Nothing calls those defaults.
 SEARCH_RESULT_CAP = 1000
 
 
