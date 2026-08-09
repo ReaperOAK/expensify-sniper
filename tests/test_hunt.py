@@ -36,8 +36,9 @@ def _conn(tmp_path, payers=("acme/widgets",)):
     return conn
 
 
-def _run(conn, *, sources, now=NOW, dry_run=True):
-    return hunt.run(conn, sources=sources, now=now, dry_run=dry_run)
+def _run(conn, *, sources, now=NOW, dry_run=True, notify_when_empty=True):
+    return hunt.run(conn, sources=sources, now=now, dry_run=dry_run,
+                    notify_when_empty=notify_when_empty)
 
 
 def _cand(number, *, labels=None, assignee=None, state="open", comments=0,
@@ -71,7 +72,10 @@ FORK = {"fork": True, "archived": False, "stargazers_count": 0,
 
 
 def test_free_rejects_run_before_any_enrichment_call(tmp_path, fake_get):
-    conn = _conn(tmp_path)
+    # payers=() -> acme/widgets is NOT a proven payer, so the multi-amount rule
+    # still fires. On a repo that HAS paid, three $-labels mean tiers and the
+    # candidate is kept (see test_a_proven_payer_may_offer_tiered_amounts).
+    conn = _conn(tmp_path, payers=("someone/else",))
     source = FakeSource("s", [
         _cand(1, assignee={"login": "x"}),
         _cand(2, state="closed"),
@@ -339,3 +343,72 @@ def test_reconciliation_abstains_when_the_roster_is_unavailable(tmp_path):
         store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
     assert store.apply_payout_rejections(conn, set(), 10, "$780") == 0
     assert len(store.live_candidates(conn, limit=50)) == 12
+
+
+def test_a_quiet_watch_sweep_says_nothing(tmp_path, fake_get, monkeypatch, capsys):
+    """The watch runs every ten minutes: 144 'nothing new' messages a day.
+
+    That does not merely annoy -- it trains the reader to ignore the channel, so
+    the one message that matters lands somewhere nobody looks.
+    """
+    from sniper import notify
+
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda text, **kw: sent.append(text) or "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+    sent.clear()
+
+    # Second sweep: nothing new, nothing wrong.
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False,
+         notify_when_empty=False)
+    assert sent == []
+
+
+def test_a_quiet_sweep_with_a_WARNING_still_speaks(tmp_path, fake_get, monkeypatch):
+    """'Nothing found' and 'I could not look' must never be the same silence."""
+    from sniper import notify
+
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda text, **kw: sent.append(text) or "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+    sent.clear()
+
+    _run(conn, sources=[FakeSource("broken", raises=RuntimeError("boom"))],
+         now=NOW + 600, dry_run=False, notify_when_empty=False)
+    assert len(sent) == 1
+    assert "⚠" in sent[0]
+
+
+def test_a_proven_payer_may_offer_tiered_amounts(tmp_path, fake_get):
+    """go-gitea/gitea#1872 carries $250, $50 and $500 and is a real bounty.
+
+    The spam rule was built for a farm issue carrying three prices at once. It
+    cannot tell that from tiers, so payout history decides -- and getting it
+    wrong hid a live bounty at a proven payer. Priced at the LOWEST tier: which
+    scope the work lands in is unknowable, and the low tier is the only figure
+    the operator is actually promised.
+    """
+    conn = _conn(tmp_path, payers=("acme/widgets",))
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    tiered = _cand(1, labels=[{"name": "$250"}, {"name": "$50"}, {"name": "$500"}])
+    assert tiered.amount_usd is None and tiered.amounts_seen == (50, 250, 500)
+    _run(conn, sources=[FakeSource("s", [tiered])])
+    row = conn.execute("SELECT amount_usd, rejected FROM candidates WHERE number=1").fetchone()
+    assert row["rejected"] is None
+    assert row["amount_usd"] == 50
+
+
+def test_an_untrusted_repo_with_tiers_is_still_treated_as_spam(tmp_path, fake_get):
+    conn = _conn(tmp_path, payers=("someone/else",))
+    tiered = _cand(1, labels=[{"name": "$250"}, {"name": "$50"}, {"name": "$500"}])
+    _run(conn, sources=[FakeSource("s", [tiered])])
+    row = conn.execute("SELECT rejected FROM candidates WHERE number=1").fetchone()
+    assert row["rejected"] == "multiple amount labels"
+    assert fake_get.calls == []

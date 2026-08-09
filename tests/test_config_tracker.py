@@ -60,3 +60,21 @@ def test_env_overrides_the_amount_floor(monkeypatch):
     finally:
         monkeypatch.delenv("AMOUNT_FLOOR_USD")
         importlib.reload(config)
+
+
+def test_the_fast_sweep_includes_expensify():
+    """Expensify is the best-proven payer available and its issues go fast.
+
+    6,264 closed Help Wanted at a flat $250, and 86 open with ZERO unassigned
+    (measured 2026-08-09) -- so a 3-hourly digest arrives after they are taken.
+    Its 100-event page spanned 5h18m that day: 1.8x margin at 3 hours against
+    32x at ten minutes.
+    """
+    assert "expensify" in config.WATCH_SOURCES
+    assert "payer-watch" in config.WATCH_SOURCES
+
+
+def test_the_watch_cadence_stays_well_inside_the_event_window():
+    # A single events page holds 100 entries; on Expensify/App that was 5h18m
+    # and on go-gitea/gitea a single day. Polling slower loses labels silently.
+    assert config.WATCH_EVERY_MINUTES <= 15

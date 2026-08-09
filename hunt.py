@@ -109,6 +109,7 @@ def run(
     sources: list[Source] | None = None,
     now: float | None = None,
     dry_run: bool = False,
+    notify_when_empty: bool = True,
 ) -> str:
     stamp = time.time() if now is None else now
     store.prune_budget(conn, now=stamp)
@@ -148,6 +149,14 @@ def run(
     # they just read it in a digest, so it is already stored and already live.
     store.apply_dismissals(conn)
 
+    # Payout history first: one cached search for the whole run, and stage 1 needs
+    # it. Whether three $-labels mean a spam farm or a tiered bounty is not
+    # decidable from the labels -- only from whether the repo has ever paid.
+    payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
+    warnings.extend(payer_warnings)
+    store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
+                                  payers.ALGORA_LABEL)
+
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []
     for cand in discovered:
@@ -157,22 +166,14 @@ def run(
                 conn, cand, now=stamp,
                 rejected=f"dismissed by operator{': ' + note if note else ''}")
             continue
-        reason = filters.free_reject(cand)
+        trusted = cand.repo in payer_repos
+        reason = filters.free_reject(cand, trusted=trusted)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:
-            survivors.append(cand)
+            survivors.append(cand.with_conservative_amount() if trusted else cand)
 
-    # Stage 1b -- payout history. One cached search for the whole run, so it
-    # belongs with the cheap rejects rather than with enrichment. This is the
-    # difference between ranking a $917,000 farm first and ranking it not at all.
-    payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
-    warnings.extend(payer_warnings)
-    # Retroactive, like dismissals: a filter that ships later has to reach the
-    # rows already stored, or the digest keeps recommending what it now knows to
-    # be a farm until GitHub happens to touch each issue again.
-    store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
-                                  payers.ALGORA_LABEL)
+
     open_here: dict[str, int] = {}
     for cand in survivors:
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
@@ -243,6 +244,20 @@ def run(
     text = notify.format_digest(new_rows, standing_rows, warnings,
                                 first_run=first_run, now=stamp,
                                 held_back=held_back)
+    # A sweep that found nothing and hit no trouble is not news. The watch runs
+    # every ten minutes: delivering "nothing new" each time is 144 messages a
+    # day, which does not merely annoy -- it trains the reader to ignore the
+    # channel, so the one message that matters arrives somewhere nobody looks.
+    #
+    # Warnings ALWAYS deliver. "Nothing found" and "I could not look" must never
+    # be the same silence, which is the failure this whole pipeline is built
+    # against. Silence here means, and only means: I swept, and there was
+    # nothing. watch.log records every sweep either way, so liveness is provable
+    # without spending the reader's attention.
+    nothing_to_say = not new_rows and not warnings and not first_run
+    if nothing_to_say and not notify_when_empty:
+        return text
+
     if not dry_run:
         # Delivery is the one stage whose failure a human would never see, which
         # makes it the one that most needs saying out loud. An unset webhook
@@ -308,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.watch:
-        names = [PayerWatchSource.name]
+        names = config.WATCH_SOURCES
     else:
         names = (args.sources.split(",") if args.sources
                  else config.HUNT_ENABLED_SOURCES)

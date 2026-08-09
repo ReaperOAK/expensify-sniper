@@ -22,6 +22,7 @@ def free_reject(
     *,
     paid_labels: set[str] | None = None,
     floor: int | None = None,
+    trusted: bool = False,
 ) -> str | None:
     """Reason to drop this candidate, from the search payload alone. None = keep."""
     # Normalise the override too, not just config's. The contract is
@@ -40,7 +41,12 @@ def free_reject(
     # A real bounty carries one amount. Three at once is a spam farm --
     # SecureBananaLabs/bug-bounty#11398 carries $780, $1k and $1.2k. Sharpest
     # spam signal in the data.
-    if len(cand.amounts_seen) > 1:
+    #
+    # Unless the repo has actually paid people. go-gitea/gitea#1872 carries $250,
+    # $50 and $500: tiers for different scopes, on a repo with a real payout
+    # history. The rule cannot tell tiers from spam on its own, so payout history
+    # decides -- and getting this wrong hid a live bounty at a proven payer.
+    if len(cand.amounts_seen) > 1 and not trusted:
         return "multiple amount labels"
     # A missing amount is not a reject: it sorts last, because expected value
     # cannot be computed without one.
