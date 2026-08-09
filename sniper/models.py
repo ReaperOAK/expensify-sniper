@@ -145,6 +145,15 @@ class Candidate:
     has_assignee: bool
     amount_usd: int | None
     amounts_seen: tuple[int, ...]
+    # Assignee logins, alongside the has_assignee flag rather than replacing it.
+    # The flag is what filters.free_reject reads; the logins are what
+    # github_api.linked_pr_state needs to recognise a PR author who is already
+    # assigned. Keeping both avoids rewriting every Candidate(...) in the suite.
+    assignees: tuple[str, ...] = ()
+    # None means the timeline was never read, never "there are no PRs". Stage 3
+    # can be skipped when the core budget runs out, and a skipped check that
+    # scored as zero competition would flatter the candidate.
+    open_pr_count: int | None = None
     # Filled by with_repo_detail(); None means "not enriched", never "zero".
     language: str | None = None
     stars: int | None = None
@@ -187,7 +196,16 @@ class Candidate:
                 if len(candidate_amounts) == 1:
                     amount = candidate_amounts[0]
                     break
-        has_assignee = bool(payload.get("assignee") or payload.get("assignees"))
+        # Collect from both shapes. GitHub emits `assignees` and still emits the
+        # legacy singular `assignee`; a payload carrying only the singular form
+        # would otherwise yield an empty login list, and the claim test would
+        # silently never fire.
+        logins: list[str] = []
+        for entry in ([payload.get("assignee")] + list(payload.get("assignees") or [])):
+            login = (entry or {}).get("login")
+            if login and login not in logins:
+                logins.append(login)
+        has_assignee = bool(logins)
         return cls(
             source=source,
             repo=repo,
@@ -200,6 +218,7 @@ class Candidate:
             created_at=payload.get("created_at", ""),
             updated_at=payload.get("updated_at", ""),
             has_assignee=has_assignee,
+            assignees=tuple(logins),
             amount_usd=amount,
             amounts_seen=seen,
         )
@@ -229,6 +248,10 @@ class Candidate:
         if self.amount_usd is not None or not self.amounts_seen:
             return self
         return replace(self, amount_usd=min(self.amounts_seen))
+
+    def with_linked_prs(self, count: int) -> Candidate:
+        """Record how many OPEN pull requests reference this issue."""
+        return replace(self, open_pr_count=count)
 
     def with_score(self, value: float) -> Candidate:
         return replace(self, score=value)

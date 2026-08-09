@@ -35,7 +35,7 @@ BOUNTY_QUERY = 'label:"💎 Bounty" state:open is:issue no:assignee -label:"💰
 # Each target is independent -- consumed by exactly one test of one function. In
 # particular repo_healthy and timeline_with_open_pr are NOT a matched pair and
 # deliberately name different repos: repo_healthy backs the get_repo() test,
-# timeline_with_open_pr backs the has_open_linked_pr() test, and no test uses both.
+# timeline_with_open_pr backs the linked_pr_state() test, and no test uses both.
 # Swapping one target never requires swapping another.
 TARGETS = [
     # name, path, params
@@ -52,8 +52,18 @@ TARGETS = [
     # Confirmed 2026-08-08 to carry 6 open pull-request cross-references. Cross-refs
     # churn fast -- if the Step 6 check reports False, re-run the finder in Step 6's
     # troubleshooting note and swap this target rather than weakening the assertion.
+    #
+    # linked_pr_state() reads the WHOLE timeline (no short-circuit), and this
+    # issue's timeline is 167 events -- more than one page. has_open_linked_pr()
+    # never surfaced that, because it returned on the first open PR, well inside
+    # page 1. Both pages are recorded here so the fixture matches what the
+    # function actually consumes; recording only page 1 (as before) makes
+    # test_real_recorded_timeline_counts_open_prs try to page past the fixture
+    # and fail on an unqueued request, not on a bad assertion.
     ("timeline_with_open_pr", "/repos/arakoodev/EdgeChains/issues/279/timeline",
-     {"per_page": 100}),
+     {"per_page": 100, "page": 1}),
+    ("timeline_with_open_pr_page2", "/repos/arakoodev/EdgeChains/issues/279/timeline",
+     {"per_page": 100, "page": 2}),
     ("events_expensify", f"/repos/{config.REPO}/issues/events", {"per_page": 100}),
 ]
 

@@ -418,17 +418,49 @@ def iter_timeline(repo: str, number: int) -> Iterator[dict[str, Any]]:
         page += 1
 
 
-def has_open_linked_pr(repo: str, number: int) -> bool:
-    """True if an OPEN pull request cross-references this issue.
+@dataclass(frozen=True)
+class LinkedPRs:
+    """What the open pull requests on an issue actually tell us.
 
-    Someone is mid-flight; the bounty is effectively taken even though no one is
-    assigned. Cross-references from plain issues (including issues in unrelated
-    repos, which do occur) are ignored -- only a `pull_request` source counts.
+    `open_count` is competition and belongs in the score. `claimant` is a claim
+    and belongs in a reject: it is set only when an OPEN linked PR's author is
+    already an assignee of the issue, which is the one pattern that means the
+    work has been handed to someone. Selection happens by proposal on Expensify
+    and by merge on Algora; in both cases the winner ends up assigned AND owning
+    the PR, so this single test covers both platforms.
     """
+
+    open_count: int
+    claimant: str | None
+
+
+def linked_pr_state(repo: str, number: int, assignees: frozenset[str]) -> LinkedPRs:
+    """Count open linked PRs and spot one authored by an assignee.
+
+    Cross-references from plain issues (including issues in unrelated repos,
+    which do occur -- bounty-index bots open tracking issues) are ignored: only
+    a `pull_request` source counts.
+
+    Logins are compared case-insensitively; GitHub preserves the author's casing
+    in payloads but treats logins case-insensitively, and an assignee list
+    assembled from a different endpoint can disagree on case. `claimant` returns
+    the author's login as GitHub spelled it, so the reject reason names the real
+    account.
+
+    This reads the WHOLE timeline. The predecessor short-circuited on the first
+    open PR, which a count cannot do without under-reporting competition.
+    """
+    lowered = {login.lower() for login in assignees}
+    open_count = 0
+    claimant: str | None = None
     for event in iter_timeline(repo, number):
         if event.get("event") != "cross-referenced":
             continue
         source = (event.get("source") or {}).get("issue") or {}
-        if source.get("pull_request") and source.get("state") == "open":
-            return True
-    return False
+        if not source.get("pull_request") or source.get("state") != "open":
+            continue
+        open_count += 1
+        author = (source.get("user") or {}).get("login") or ""
+        if claimant is None and author.lower() in lowered:
+            claimant = author
+    return LinkedPRs(open_count=open_count, claimant=claimant)
