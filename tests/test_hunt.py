@@ -18,8 +18,22 @@ import hunt
 NOW = dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc).timestamp()
 
 
-def _conn(tmp_path):
-    return store.connect(tmp_path / "t.sqlite")
+def _conn(tmp_path, payers=("acme/widgets",)):
+    """Connect, and pre-seed the payout roster so run() makes no lookup call.
+
+    hunt.run() consults payout history once per run. These tests are about the
+    pipeline, not about that lookup (tests/test_payers.py owns it), and a live
+    lookup would consume the first queued response and shift every other
+    assertion. Seeding at NOW keeps it inside the cache window.
+    """
+    import json
+
+    from sniper import payers as payers_mod
+
+    conn = store.connect(tmp_path / "t.sqlite")
+    store.set_cache(conn, payers_mod.CACHE_KEY, None,
+                    json.dumps({"fetched_at": NOW, "repos": list(payers)}))
+    return conn
 
 
 def _run(conn, *, sources, now=NOW, dry_run=True):

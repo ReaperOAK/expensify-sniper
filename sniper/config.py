@@ -151,6 +151,17 @@ DIGEST_STANDING_N = int(os.environ.get("DIGEST_STANDING_N", "5"))
 # but a digest that only ever shows one repo is useless either way.
 DIGEST_MAX_PER_REPO = int(os.environ.get("DIGEST_MAX_PER_REPO", "3"))
 
+# Payout history -- the strongest signal available, and the one the tracker
+# originally ignored. Measured 2026-08-09: two repos advertising $917,000 across
+# 383 open Algora bounties had never rewarded or even closed a single one, while
+# a repo offering $200 had paid out 150 times. Amount alone ranks them backwards.
+# Cached for a day: payout history moves in days, not in the 3h between runs.
+PAYER_CACHE_S = float(os.environ.get("PAYER_CACHE_S", str(24 * 3600)))
+PAYER_SEARCH_MAX_PAGES = int(os.environ.get("PAYER_SEARCH_MAX_PAGES", "6"))
+# How many open Algora bounties a repo must be advertising before never having
+# paid one counts against it. A new project with two bounties is not a farm.
+UNPAID_REPO_THRESHOLD = int(os.environ.get("UNPAID_REPO_THRESHOLD", "10"))
+
 # Two quota classes, shared with the Expensify watcher through one token. The
 # budget guard in store.py refuses to start a run it cannot finish rather than
 # reporting an empty world -- a throttled search is indistinguishable from "no

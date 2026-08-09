@@ -28,7 +28,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sniper import config, filters, github_api, notify, score as scoring, store  # noqa: E402
+from sniper import config, filters, github_api, notify, payers
+from sniper import score as scoring, store  # noqa: E402
 from sniper.models import Candidate  # noqa: E402
 from sniper.sources.base import Source, SourceResult  # noqa: E402
 from sniper.sources.bounty_labels import BountyLabelSource  # noqa: E402
@@ -146,6 +147,24 @@ def run(
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:
             survivors.append(cand)
+
+    # Stage 1b -- payout history. One cached search for the whole run, so it
+    # belongs with the cheap rejects rather than with enrichment. This is the
+    # difference between ranking a $917,000 farm first and ranking it not at all.
+    payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
+    warnings.extend(payer_warnings)
+    open_here: dict[str, int] = {}
+    for cand in survivors:
+        open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
+    kept: list[Candidate] = []
+    for cand in survivors:
+        reason = payers.payout_reject(
+            cand.repo, cand.labels, open_here[cand.repo], payer_repos)
+        if reason:
+            store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
+        else:
+            kept.append(cand)
+    survivors = kept
 
     # Stage 2 -- repo detail, then repo rejects.
     survivors = enrich(conn, survivors, warnings)
