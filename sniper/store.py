@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS candidates (
 CREATE INDEX IF NOT EXISTS candidates_live
     ON candidates (rejected, score DESC);
 
+CREATE TABLE IF NOT EXISTS dismissed (
+    repo        TEXT NOT NULL,
+    number      INTEGER NOT NULL,
+    reason      TEXT,
+    dismissed_at REAL NOT NULL,
+    PRIMARY KEY (repo, number)
+);
+
 CREATE TABLE IF NOT EXISTS rate_budget (
     quota  TEXT    NOT NULL,
     window INTEGER NOT NULL,
@@ -389,3 +397,38 @@ def prune_budget(conn: sqlite3.Connection, *, now: float | None = None) -> None:
             (quota, _window(quota, now)),
         )
     conn.commit()
+
+
+def dismiss(conn: sqlite3.Connection, repo: str, number: int,
+            reason: str | None = None, *, now: float | None = None) -> None:
+    """Kill one issue permanently, by operator judgement.
+
+    Metadata cannot see everything. commaai/opendbc#3426 advertised $10,000 and
+    passed every automated check -- real company, real programme, seven closed
+    bounties -- while its eligibility link 301'd to a Rick Astley video. Only a
+    human following the link could know that.
+
+    A digest arriving every three hours is worthless if the operator has to
+    re-reject the same issue each time.
+    """
+    conn.execute(
+        "INSERT INTO dismissed (repo, number, reason, dismissed_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(repo, number) DO UPDATE SET reason = excluded.reason, "
+        "dismissed_at = excluded.dismissed_at",
+        (repo, number, reason, time.time() if now is None else now),
+    )
+    conn.commit()
+
+
+def undismiss(conn: sqlite3.Connection, repo: str, number: int) -> bool:
+    """Reverse a dismissal. Returns True if there was one."""
+    cur = conn.execute("DELETE FROM dismissed WHERE repo = ? AND number = ?",
+                       (repo, number))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def dismissed_reasons(conn: sqlite3.Connection) -> dict[tuple[str, int], str | None]:
+    """Every dismissal, keyed (repo, number). Read once per run, not per candidate."""
+    return {(row["repo"], row["number"]): row["reason"]
+            for row in conn.execute("SELECT repo, number, reason FROM dismissed")}

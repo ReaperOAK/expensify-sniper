@@ -139,9 +139,19 @@ def run(
         warnings.extend(result.warnings)
         discovered.extend(result.candidates)
 
+    # Stage 0 of the rejects -- the operator's own verdicts. These outrank every
+    # automated signal: a human followed a link and saw something metadata cannot.
+    dismissed = store.dismissed_reasons(conn)
+
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []
     for cand in discovered:
+        if (cand.repo, cand.number) in dismissed:
+            note = dismissed[(cand.repo, cand.number)]
+            store.upsert_candidate(
+                conn, cand, now=stamp,
+                rejected=f"dismissed by operator{': ' + note if note else ''}")
+            continue
         reason = filters.free_reject(cand)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
@@ -247,13 +257,44 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Rank open unclaimed bounties.")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the digest instead of sending it")
+    parser.add_argument("--dismiss", metavar="REPO#NUMBER", default=None,
+                        help="never show this issue again (e.g. commaai/opendbc#3426)")
+    parser.add_argument("--undismiss", metavar="REPO#NUMBER", default=None,
+                        help="reverse a --dismiss")
+    parser.add_argument("--reason", default=None,
+                        help="why, recorded alongside --dismiss")
+    parser.add_argument("--list-dismissed", action="store_true",
+                        help="print every dismissal and exit")
     parser.add_argument("--sources", default=None,
                         help="comma-separated source names "
                              f"(default: {','.join(config.HUNT_ENABLED_SOURCES)})")
     args = parser.parse_args(argv)
 
-    names = (args.sources.split(",") if args.sources else config.HUNT_ENABLED_SOURCES)
     conn = store.connect()
+
+    if args.list_dismissed:
+        rows = store.dismissed_reasons(conn)
+        if not rows:
+            print("nothing dismissed")
+        for (repo, number), reason in sorted(rows.items()):
+            print(f"{repo}#{number}  {reason or '(no reason recorded)'}")
+        return 0
+    if args.dismiss or args.undismiss:
+        target = args.dismiss or args.undismiss
+        if "#" not in target:
+            print(f"expected REPO#NUMBER, got {target!r}", file=sys.stderr)
+            return 2
+        repo, _, num = target.rpartition("#")
+        if args.dismiss:
+            store.dismiss(conn, repo, int(num), args.reason)
+            print(f"dismissed {repo}#{num}"
+                  f"{' -- ' + args.reason if args.reason else ''}")
+        else:
+            found = store.undismiss(conn, repo, int(num))
+            print(f"{'restored' if found else 'was not dismissed'}: {repo}#{num}")
+        return 0
+
+    names = (args.sources.split(",") if args.sources else config.HUNT_ENABLED_SOURCES)
     text = run(conn, sources=build_sources(names), dry_run=args.dry_run)
     print(text)
     return 0

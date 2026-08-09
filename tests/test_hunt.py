@@ -259,3 +259,33 @@ def test_a_delivery_failure_does_not_destroy_the_digest(tmp_path, fake_get, monk
     assert "acme/widgets#1" in text
     assert "delivery failed" in text
     assert "NOT delivered" in capsys.readouterr().err
+
+
+def test_a_dismissed_issue_never_reaches_the_digest_again(tmp_path, fake_get):
+    """The operator outranks every automated signal.
+
+    commaai/opendbc#3426 advertised $10,000 and passed every check the tracker
+    can make -- real company, real programme, seven closed bounties -- while its
+    eligibility link 301'd to a Rick Astley video. Only a human following that
+    link could know. A 3-hourly digest is worthless if it re-suggests it forever.
+    """
+    conn = _conn(tmp_path)
+    store.dismiss(conn, "acme/widgets", 1, "eligibility link is a rickroll")
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])])
+    assert "acme/widgets#1" not in text
+    # Recorded with the reason, not silently vanished.
+    row = conn.execute("SELECT rejected FROM candidates WHERE number = 1").fetchone()
+    assert "dismissed by operator" in row["rejected"]
+    assert "rickroll" in row["rejected"]
+    # And it cost nothing: dismissal is decided before any enrichment call.
+    assert fake_get.calls == []
+
+
+def test_a_dismissal_can_be_reversed(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    store.dismiss(conn, "acme/widgets", 1, "changed my mind later")
+    assert store.undismiss(conn, "acme/widgets", 1) is True
+    assert store.undismiss(conn, "acme/widgets", 1) is False
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    assert "acme/widgets#1" in _run(conn, sources=[FakeSource("s", [_cand(1)])])
