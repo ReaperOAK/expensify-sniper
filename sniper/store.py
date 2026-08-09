@@ -496,8 +496,8 @@ def apply_dismissals(conn: sqlite3.Connection) -> int:
 
 
 def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
-                            threshold: int, algora_label: str) -> int:
-    """Re-judge STORED candidates against the payout roster. Returns rows changed.
+                            threshold: int, closed_for) -> int:
+    """Re-judge STORED candidates against payout history. Returns rows changed.
 
     Filters that arrive later must reach the rows already in the table, for the
     same reason dismissals do. When the payout filter shipped, every candidate
@@ -505,14 +505,24 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
     with 201 open bounties and zero payouts until GitHub happened to touch each
     issue again.
 
+    `closed_for(repo, label) -> int | None` supplies the closed-bounty count and
+    is called LAZILY, only for repos that are over the threshold and off the
+    payer roster. That matters: it costs a search unit each, and asking about
+    every repo in the table would blow the 30/min pool on rows that were never
+    going to be rejected. None means unknown, and this abstains on it.
+
     Uses only stored columns (`labels` is kept as JSON precisely so a judgement
-    can be revisited), so this costs no API call.
+    can be revisited), so the callback is the only cost.
     """
+    # Imported here, not at module scope: payers imports store.
+    from . import payers as payers_module
+
     if not payers:
         return 0  # roster unavailable: abstain, exactly as payout_reject does
 
     counts = {row["repo"]: row["n"] for row in conn.execute(
         "SELECT repo, COUNT(*) AS n FROM candidates WHERE rejected IS NULL GROUP BY repo")}
+    closed_cache: dict[tuple[str, str], int | None] = {}
     changed = 0
     rows = conn.execute(
         "SELECT repo, number, labels FROM candidates WHERE rejected IS NULL").fetchall()
@@ -521,15 +531,21 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
         if repo in payers or counts.get(repo, 0) < threshold:
             continue
         try:
-            labels = json.loads(row["labels"])
+            labels = tuple(str(name) for name in json.loads(row["labels"]))
         except (ValueError, TypeError):
             continue
-        if not any(str(name).strip() == algora_label for name in labels):
+        label = payers_module.bounty_label_of(labels)
+        if label is None:
+            continue
+        if (repo, label) not in closed_cache:
+            closed_cache[(repo, label)] = closed_for(repo, label)
+        reason = payers_module.payout_reject(
+            repo, labels, counts[repo], payers, closed_cache[(repo, label)])
+        if reason is None:
             continue
         conn.execute(
             "UPDATE candidates SET rejected = ? WHERE repo = ? AND number = ?",
-            (f"no payout history ({counts[repo]} open Algora bounties here, "
-             f"0 ever rewarded)", repo, row["number"]))
+            (reason, repo, row["number"]))
         changed += 1
     conn.commit()
     return changed

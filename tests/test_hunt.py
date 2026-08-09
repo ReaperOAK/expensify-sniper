@@ -377,20 +377,56 @@ def test_the_payout_filter_reaches_candidates_stored_before_it_existed(tmp_path)
         store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
     assert len(store.live_candidates(conn, limit=50)) == 12
 
+    # _cand carries a $780 label, which bounty_label_of falls back to (an
+    # amount label, since it's neither Algora's exact string nor "bounty").
+    # The callback reports 0 ever closed -- a farm's shape.
     changed = store.apply_payout_rejections(
-        conn, {"someone/else"}, 10, "$780")  # _cand carries a $780 label
+        conn, {"someone/else"}, 10, lambda repo, label: 0)
     assert changed == 12
     assert store.live_candidates(conn, limit=50) == []
     row = conn.execute("SELECT rejected FROM candidates WHERE number = 0").fetchone()
-    assert "0 ever rewarded" in row["rejected"]
+    assert "0 ever closed" in row["rejected"]
 
 
 def test_reconciliation_abstains_when_the_roster_is_unavailable(tmp_path):
     conn = store.connect(tmp_path / "t.sqlite")
     for n in range(12):
         store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
-    assert store.apply_payout_rejections(conn, set(), 10, "$780") == 0
+    assert store.apply_payout_rejections(conn, set(), 10, lambda repo, label: 0) == 0
     assert len(store.live_candidates(conn, limit=50)) == 12
+
+
+def test_closed_for_is_asked_only_about_qualifying_repos_and_cached_by_label(tmp_path):
+    """The callback costs a search unit each, so it must not be asked idly.
+
+    Three repos are stored: one over threshold and off the roster (the only
+    shape `payout_reject` can ever act on), one below threshold, and one on the
+    roster despite being over threshold. Only the first should ever reach the
+    callback -- and its 12 candidates share one (repo, label) pair, so it must
+    be asked about exactly once, not 12 times.
+    """
+    conn = store.connect(tmp_path / "t.sqlite")
+    calls: list[tuple[str, str]] = []
+
+    def counting_closed_for(repo: str, label: str) -> int | None:
+        calls.append((repo, label))
+        return 0
+
+    for n in range(12):  # over threshold(10), off the roster -- qualifies
+        store.upsert_candidate(
+            conn, _cand(n, repo="farm/repo").with_score(100.0), now=1.0)
+    for n in range(3):  # below threshold -- must never be asked about
+        store.upsert_candidate(
+            conn, _cand(n, repo="small/repo").with_score(100.0), now=1.0)
+    for n in range(12):  # over threshold but on the roster -- never asked either
+        store.upsert_candidate(
+            conn, _cand(n, repo="acme/widgets").with_score(100.0), now=1.0)
+
+    changed = store.apply_payout_rejections(
+        conn, {"acme/widgets"}, 10, counting_closed_for)
+
+    assert changed == 12  # only farm/repo's candidates were rejected
+    assert calls == [("farm/repo", "$780")]  # asked about once, not 12 times
 
 
 def test_a_quiet_watch_sweep_says_nothing(tmp_path, fake_get, monkeypatch, capsys):

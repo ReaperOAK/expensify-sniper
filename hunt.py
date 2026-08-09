@@ -163,8 +163,12 @@ def run(
     # decidable from the labels -- only from whether the repo has ever paid.
     payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
     warnings.extend(payer_warnings)
+
+    def closed_for(repo: str, label: str) -> int | None:
+        return payers.ever_closed_with(conn, repo, label, now=stamp)
+
     store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
-                                  payers.ALGORA_LABEL)
+                                  closed_for)
 
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []
@@ -188,8 +192,17 @@ def run(
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
     kept: list[Candidate] = []
     for cand in survivors:
+        # The guard matters: without it every candidate costs a search unit,
+        # and payout_reject would abstain on nearly all of them anyway (below
+        # threshold, or already on the payer roster). ever_closed_with caches
+        # per (repo, label), so repeated candidates in one repo cost one call.
+        label = payers.bounty_label_of(cand.labels)
+        closed = (closed_for(cand.repo, label)
+                  if label and cand.repo not in payer_repos
+                  and open_here[cand.repo] >= config.UNPAID_REPO_THRESHOLD
+                  else None)
         reason = payers.payout_reject(
-            cand.repo, cand.labels, open_here[cand.repo], payer_repos)
+            cand.repo, cand.labels, open_here[cand.repo], payer_repos, closed)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:
