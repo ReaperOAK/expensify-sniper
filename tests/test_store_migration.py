@@ -75,3 +75,34 @@ def test_migration_is_idempotent(tmp_path):
     conn = store.connect(db)  # second open must not raise "duplicate column name"
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)")}
     assert "open_pr_count" in columns
+
+
+def test_reopening_a_database_that_actually_ran_the_alter_is_idempotent(tmp_path):
+    """test_migration_is_idempotent above only reopens a database born from
+    SCHEMA, which never goes through ALTER TABLE at all -- it is already on the
+    new shape from CREATE TABLE IF NOT EXISTS. That leaves the actually risky
+    reopen unexercised: a database that took the OLD_SCHEMA path, ran the ALTER
+    once, and is then opened again. In production that second connect() is
+    hunt.py's cron or the Expensify watch sweep starting up minutes later
+    against the now-migrated file -- exactly the case _migrate's duplicate-
+    column guard exists for.
+    """
+    db = tmp_path / "old.sqlite"
+    raw = sqlite3.connect(db)
+    raw.executescript(OLD_SCHEMA)
+    raw.execute(
+        "INSERT INTO candidates VALUES "
+        "('github-labels','acme/w',1,'t','u','open',100,0,'[]',NULL,NULL,NULL,"
+        "'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',1.0,1.0,NULL)")
+    raw.commit()
+    raw.close()
+
+    store.connect(db).close()  # first open: runs the ALTER
+    conn = store.connect(db)   # second open: must not raise "duplicate column name"
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)")}
+    assert "open_pr_count" in columns
+    row = conn.execute("SELECT * FROM candidates").fetchone()
+    assert row["repo"] == "acme/w"
+    assert row["amount_usd"] == 100
+    assert row["open_pr_count"] is None

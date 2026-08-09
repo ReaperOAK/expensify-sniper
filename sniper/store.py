@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     language      TEXT,
     stars         INTEGER,
     score         REAL,
-    open_pr_count  INTEGER,
+    open_pr_count INTEGER,
     created_at    TEXT    NOT NULL,
     updated_at    TEXT    NOT NULL,
     first_seen_at REAL    NOT NULL,
@@ -97,11 +97,26 @@ ADDED_COLUMNS: dict[str, dict[str, str]] = {
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
+    # hunt.py's cron fires every 3 hours and the Expensify watch sweep every 10
+    # minutes, independently, and both call connect() against the same file --
+    # upsert_candidate()'s own docstring calls that "the normal case, not a
+    # corner one" after measuring 8 of 10 racing writers collide on a bare
+    # check-then-act. `have` is exactly that shape: on first deploy, while the
+    # database is still on the old schema, two callers can both read `column
+    # not in have` before either has run its ALTER. The loser's ALTER TABLE
+    # then raises "duplicate column name" -- which means a peer already added
+    # the column, the outcome this function wanted, not a failure. Any OTHER
+    # OperationalError (a genuinely broken ALTER) still propagates.
     for table, wanted in ADDED_COLUMNS.items():
         have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         for column, declaration in wanted.items():
-            if column not in have:
+            if column in have:
+                continue
+            try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
     conn.commit()
 
 
