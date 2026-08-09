@@ -222,6 +222,37 @@ def wait_for_reset(reset_epoch: int) -> None:
     time.sleep(max(0, reset_epoch - time.time()) + 1)
 
 
+def _fetch_search_page(query, sort, order, per_page, page, *,
+                       retries, backoff, sleep, have_items=True):
+    """One search page, retrying a SECONDARY throttle. None = give up gracefully.
+
+    A secondary (burst) limit is a few minutes of cooldown and then it is gone,
+    so abandoning a query over one is expensive: measured live, giving up cost
+    420 of 520 candidates and produced a digest dominated by whichever repo
+    happened to fill page one. A PRIMARY limit needs the whole rate window to
+    roll, which is longer than a run should sit blocking, so it is not retried.
+
+    Raising versus returning None is the caller's "have I got anything yet"
+    question, so the caller passes `have_items` and this never has to guess.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return _get(
+                "/search/issues",
+                params={"q": query, "sort": sort, "order": order,
+                        "per_page": per_page, "page": page},
+            )
+        except RateLimited as exc:
+            out_of_attempts = attempt == retries
+            if exc.secondary and not out_of_attempts:
+                sleep(exc.retry_after or backoff * (2 ** attempt))
+                continue
+            if have_items:
+                return None
+            raise
+    return None
+
+
 @dataclass(frozen=True)
 class SearchResult:
     """Outcome of a paged search.
@@ -247,6 +278,8 @@ def search_issues(
     max_pages: int = 10,
     stop: Callable[[list[dict[str, Any]]], bool] | None = None,
     pause_s: float | None = None,
+    retries: int | None = None,
+    backoff_s: float | None = None,
     sleep=time.sleep,
 ) -> SearchResult:
     """Page /search/issues for `query`, newest-updated first.
@@ -269,6 +302,8 @@ def search_issues(
     pages_fetched = 0
 
     pause = config.SEARCH_PAGE_PAUSE_S if pause_s is None else pause_s
+    retries = config.SEARCH_MAX_RETRIES if retries is None else retries
+    backoff = config.SEARCH_RETRY_BACKOFF_S if backoff_s is None else backoff_s
 
     for page in range(1, max_pages + 1):
         # Pace the pages. The primary 30/min pool is not the binding constraint
@@ -279,24 +314,18 @@ def search_issues(
         # the secondary limit is about rate, not volume.
         if page > 1 and pause:
             sleep(pause)
-        try:
-            resp = _get(
-                "/search/issues",
-                params={"q": query, "sort": sort, "order": order,
-                        "per_page": per_page, "page": page},
-            )
-        except RateLimited:
-            # Keep the pages we already paid for. Letting this propagate threw
-            # away every completed page -- measured live, three pages of real
-            # candidates were collected and then binned, and the digest said
-            # "top 0 by score", i.e. reported an empty world because of a
-            # throttle on page four. That is the precise failure this module is
-            # written to prevent, one level deeper than it was being applied.
-            #
-            # With nothing in hand there is nothing to salvage, so re-raise and
-            # let the caller warn.
-            if not items:
-                raise
+        resp = _fetch_search_page(
+            query, sort, order, per_page, page,
+            retries=retries, backoff=backoff, sleep=sleep,
+            have_items=bool(items),
+        )
+        if resp is None:
+            # Throttled past our patience. Keep the pages already paid for:
+            # letting this propagate threw away every completed page -- measured
+            # live, three good pages were binned and the digest said "top 0 by
+            # score", reporting an empty world because of a throttle on page
+            # four. With nothing in hand there is nothing to salvage, so
+            # _fetch_search_page re-raises instead of returning None.
             incomplete = True
             break
         resp.raise_for_status()

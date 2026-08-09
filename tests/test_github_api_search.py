@@ -229,3 +229,74 @@ def test_the_cap_trims_a_page_that_overshoots_it(fake_get):
     # The trim must drop the tail, not the head: results are newest-updated first.
     assert result.items[0]["number"] == 0
     assert result.items[-1]["number"] == github_api.SEARCH_RESULT_CAP - 1
+
+
+def _secondary(remaining="26"):
+    return (403, {"message": "You have exceeded a secondary rate limit."},
+            {"X-RateLimit-Remaining": remaining, "X-RateLimit-Limit": "30"})
+
+
+def test_a_secondary_throttle_is_waited_out_and_retried(fake_get):
+    """Giving up on a burst throttle cost 420 of 520 candidates, measured live.
+
+    It clears in minutes. Retrying it is the difference between a digest of the
+    whole inventory and one dominated by whichever repo filled page one.
+    """
+    fake_get.queue(*_secondary())
+    fake_get.queue(200, _page(3, 3))
+    slept = []
+    result = github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert len(result.items) == 3
+    assert result.incomplete is False
+    assert slept == [60]
+
+
+def test_backoff_doubles_between_attempts(fake_get):
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    fake_get.queue(200, _page(2, 2))
+    slept = []
+    github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert slept == [60, 120, 240]
+
+
+def test_github_supplied_retry_after_wins_over_the_backoff_schedule(fake_get):
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"Retry-After": "7"})
+    fake_get.queue(200, _page(1, 1))
+    slept = []
+    github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert slept == [7]
+
+
+def test_a_primary_limit_is_never_retried(fake_get):
+    # A primary limit needs the whole rate window to roll -- far longer than a
+    # run should sit blocking, and the budget guard exists to avoid it entirely.
+    fake_get.queue(403, {"message": "API rate limit exceeded"},
+                   {"X-RateLimit-Reset": "1786205456"})
+    slept = []
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert excinfo.value.secondary is False
+    assert slept == []
+
+
+def test_exhausting_the_retries_keeps_the_pages_already_paid_for(fake_get):
+    fake_get.queue(200, _page(50, 500, start=0))
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    slept = []
+    result = github_api.search_issues("q", per_page=50, retries=1, backoff_s=5,
+                                      sleep=slept.append)
+    assert len(result.items) == 50
+    assert result.incomplete is True
+    assert slept == [5]
+
+
+def test_exhausting_the_retries_with_nothing_in_hand_still_raises(fake_get):
+    # An empty SearchResult here would be indistinguishable from "no bounties".
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    with pytest.raises(github_api.RateLimited):
+        github_api.search_issues("q", retries=1, backoff_s=5, sleep=lambda s: None)

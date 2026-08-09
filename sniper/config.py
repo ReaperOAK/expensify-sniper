@@ -173,6 +173,14 @@ SEARCH_PAGE_PAUSE_S = float(os.environ.get("SEARCH_PAGE_PAUSE_S", "3"))
 # Smaller than the search pause because core requests are individually cheap.
 CORE_CALL_PAUSE_S = float(os.environ.get("CORE_CALL_PAUSE_S", "0.5"))
 
+# A secondary (burst) throttle clears in minutes, so a search page is worth
+# waiting out rather than abandoning: measured 2026-08-09, giving up on one cost
+# 420 of 520 candidates and produced a digest dominated by whichever repo filled
+# page one. Backoff doubles per attempt (60s, 120s, 240s). Only SECONDARY limits
+# are retried -- a primary one needs the whole window to roll.
+SEARCH_MAX_RETRIES = int(os.environ.get("SEARCH_MAX_RETRIES", "3"))
+SEARCH_RETRY_BACKOFF_S = float(os.environ.get("SEARCH_RETRY_BACKOFF_S", "60"))
+
 HUNT_ENABLED_SOURCES = [
     name.strip()
     for name in os.environ.get("HUNT_SOURCES", "github-labels,expensify").split(",")

@@ -94,3 +94,8 @@ def no_budget_waiting(monkeypatch):
     # Real seconds in a unit test buy nothing.
     monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 0, raising=False)
     monkeypatch.setattr(config, "CORE_CALL_PAUSE_S", 0, raising=False)
+    # Retries default to 60/120/240s of real backoff. Tests that exercise the
+    # retry path pass `retries=`/`backoff_s=` explicitly; every other test wants
+    # a throttle to surface immediately, exactly as it did before retries existed.
+    monkeypatch.setattr(config, "SEARCH_MAX_RETRIES", 0, raising=False)
+    monkeypatch.setattr(config, "SEARCH_RETRY_BACKOFF_S", 0, raising=False)
