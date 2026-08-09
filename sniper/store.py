@@ -569,3 +569,33 @@ def clear_rejections(conn: sqlite3.Connection, reason: str) -> int:
         "UPDATE candidates SET rejected = NULL WHERE rejected = ?", (reason,))
     conn.commit()
     return cur.rowcount
+
+
+def held_back_candidates(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Live candidates with no readable amount, newest first.
+
+    These are the rows `live_candidates(require_amount=True)` excludes -- 529 of
+    them on 2026-08-09. They are excluded from the DIGEST for a good reason: they
+    cannot be ranked by expected value, and once the rankable ones ran out they
+    padded it with 700-day-old issues titled "test" and "tttt". But excluded from
+    the digest is not the same as invisible, and until the board existed there
+    was no way to look at them at all.
+
+    Ordered by first_seen_at, our own clock, because there is no amount to sort
+    on and GitHub's created_at is meaningless for a label applied years later.
+    """
+    return conn.execute(
+        "SELECT * FROM candidates WHERE rejected IS NULL AND amount_usd IS NULL "
+        "ORDER BY first_seen_at DESC LIMIT ?", (limit,)).fetchall()
+
+
+def rejection_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Every reject reason and how many candidates carry it, largest first.
+
+    This is how a wrong filter becomes visible. 'open linked PR' sat at 562 --
+    larger than everything the tracker kept -- for as long as nobody ran this
+    query by hand.
+    """
+    return [(row["rejected"], row["n"]) for row in conn.execute(
+        "SELECT rejected, COUNT(*) AS n FROM candidates "
+        "WHERE rejected IS NOT NULL GROUP BY rejected ORDER BY n DESC, rejected")]

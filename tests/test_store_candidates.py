@@ -9,6 +9,8 @@ forever after, which is exactly why GitHub's created_at is displayed but never
 scored.
 """
 
+from dataclasses import replace
+
 from sniper import store
 from sniper.models import Candidate
 
@@ -245,3 +247,36 @@ def test_clear_rejections_returns_zero_when_nothing_matches(tmp_path):
     conn = store.connect(tmp_path / "s.sqlite")
     store.upsert_candidate(conn, _candidate(number=1), rejected="fork", now=1.0)
     assert store.clear_rejections(conn, "open linked PR") == 0
+
+
+def test_held_back_candidates_returns_only_the_amountless_live_ones(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    priced = replace(_candidate(number=1), amount_usd=100)
+    unpriced = replace(_candidate(number=2), amount_usd=None)
+    rejected = replace(_candidate(number=3), amount_usd=None)
+    store.upsert_candidate(conn, priced, now=1.0)
+    store.upsert_candidate(conn, unpriced, now=2.0)
+    store.upsert_candidate(conn, rejected, rejected="fork", now=3.0)
+
+    rows = store.held_back_candidates(conn, 10)
+
+    assert [row["number"] for row in rows] == [2]
+
+
+def test_held_back_candidates_are_newest_first(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    for number, seen in ((1, 10.0), (2, 30.0), (3, 20.0)):
+        store.upsert_candidate(conn, replace(_candidate(number=number),
+                                             amount_usd=None), now=seen)
+    rows = store.held_back_candidates(conn, 10)
+    assert [row["number"] for row in rows] == [2, 3, 1]
+
+
+def test_rejection_counts_group_by_reason_largest_first(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), rejected="fork", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=2), rejected="archived repo", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=3), rejected="archived repo", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=4), now=1.0)
+
+    assert store.rejection_counts(conn) == [("archived repo", 2), ("fork", 1)]
