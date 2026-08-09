@@ -18,8 +18,22 @@ import hunt
 NOW = dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc).timestamp()
 
 
-def _conn(tmp_path):
-    return store.connect(tmp_path / "t.sqlite")
+def _conn(tmp_path, payers=("acme/widgets",)):
+    """Connect, and pre-seed the payout roster so run() makes no lookup call.
+
+    hunt.run() consults payout history once per run. These tests are about the
+    pipeline, not about that lookup (tests/test_payers.py owns it), and a live
+    lookup would consume the first queued response and shift every other
+    assertion. Seeding at NOW keeps it inside the cache window.
+    """
+    import json
+
+    from sniper import payers as payers_mod
+
+    conn = store.connect(tmp_path / "t.sqlite")
+    store.set_cache(conn, payers_mod.CACHE_KEY, None,
+                    json.dumps({"fetched_at": NOW, "repos": list(payers)}))
+    return conn
 
 
 def _run(conn, *, sources, now=NOW, dry_run=True):
@@ -245,3 +259,83 @@ def test_a_delivery_failure_does_not_destroy_the_digest(tmp_path, fake_get, monk
     assert "acme/widgets#1" in text
     assert "delivery failed" in text
     assert "NOT delivered" in capsys.readouterr().err
+
+
+def test_a_dismissed_issue_never_reaches_the_digest_again(tmp_path, fake_get):
+    """The operator outranks every automated signal.
+
+    commaai/opendbc#3426 advertised $10,000 and passed every check the tracker
+    can make -- real company, real programme, seven closed bounties -- while its
+    eligibility link 301'd to a Rick Astley video. Only a human following that
+    link could know. A 3-hourly digest is worthless if it re-suggests it forever.
+    """
+    conn = _conn(tmp_path)
+    store.dismiss(conn, "acme/widgets", 1, "eligibility link is a rickroll")
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])])
+    assert "acme/widgets#1" not in text
+    # Recorded with the reason, not silently vanished.
+    row = conn.execute("SELECT rejected FROM candidates WHERE number = 1").fetchone()
+    assert "dismissed by operator" in row["rejected"]
+    assert "rickroll" in row["rejected"]
+    # And it cost nothing: dismissal is decided before any enrichment call.
+    assert fake_get.calls == []
+
+
+def test_a_dismissal_can_be_reversed(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    store.dismiss(conn, "acme/widgets", 1, "changed my mind later")
+    assert store.undismiss(conn, "acme/widgets", 1) is True
+    assert store.undismiss(conn, "acme/widgets", 1) is False
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    assert "acme/widgets#1" in _run(conn, sources=[FakeSource("s", [_cand(1)])])
+
+
+def test_dismissing_removes_an_issue_that_was_already_stored(tmp_path, fake_get):
+    """An operator dismisses what they just READ, so it is already in the table.
+
+    Applying dismissals only to fresh discoveries would leave it live until
+    GitHub happened to touch the issue again -- for a months-old bounty, never.
+    """
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    first = _run(conn, sources=[FakeSource("s", [_cand(1)])])
+    assert "acme/widgets#1" in first
+
+    store.dismiss(conn, "acme/widgets", 1, "link is a rickroll")
+    assert store.live_candidates(conn, limit=10) != []   # still live until applied
+    assert store.apply_dismissals(conn) == 1
+    assert store.live_candidates(conn, limit=10) == []
+    row = conn.execute("SELECT rejected FROM candidates WHERE number = 1").fetchone()
+    assert "rickroll" in row["rejected"]
+
+
+def test_the_payout_filter_reaches_candidates_stored_before_it_existed(tmp_path):
+    """A filter that ships later must re-judge what is already in the table.
+
+    Otherwise the digest keeps recommending a repo it now knows has 201 open
+    bounties and zero payouts, until GitHub happens to touch each issue again --
+    which for a months-old bounty may be never.
+    """
+    from sniper import payers as payers_mod
+
+    conn = store.connect(tmp_path / "t.sqlite")
+    for n in range(12):
+        store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
+    assert len(store.live_candidates(conn, limit=50)) == 12
+
+    changed = store.apply_payout_rejections(
+        conn, {"someone/else"}, 10, "$780")  # _cand carries a $780 label
+    assert changed == 12
+    assert store.live_candidates(conn, limit=50) == []
+    row = conn.execute("SELECT rejected FROM candidates WHERE number = 0").fetchone()
+    assert "0 ever rewarded" in row["rejected"]
+
+
+def test_reconciliation_abstains_when_the_roster_is_unavailable(tmp_path):
+    conn = store.connect(tmp_path / "t.sqlite")
+    for n in range(12):
+        store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
+    assert store.apply_payout_rejections(conn, set(), 10, "$780") == 0
+    assert len(store.live_candidates(conn, limit=50)) == 12

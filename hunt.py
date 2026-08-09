@@ -28,15 +28,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sniper import config, filters, github_api, notify, score as scoring, store  # noqa: E402
+from sniper import config, filters, github_api, notify, payers
+from sniper import score as scoring, store  # noqa: E402
 from sniper.models import Candidate  # noqa: E402
 from sniper.sources.base import Source, SourceResult  # noqa: E402
 from sniper.sources.bounty_labels import BountyLabelSource  # noqa: E402
-from sniper.sources.expensify import ExpensifySource  # noqa: E402
+from sniper.sources.expensify import ExpensifySource
+from sniper.sources.payer_watch import PayerWatchSource  # noqa: E402
 
 SOURCE_CLASSES = {
     BountyLabelSource.name: BountyLabelSource,
     ExpensifySource.name: ExpensifySource,
+    PayerWatchSource.name: PayerWatchSource,
 }
 
 
@@ -138,14 +141,50 @@ def run(
         warnings.extend(result.warnings)
         discovered.extend(result.candidates)
 
+    # Stage 0 of the rejects -- the operator's own verdicts. These outrank every
+    # automated signal: a human followed a link and saw something metadata cannot.
+    dismissed = store.dismissed_reasons(conn)
+    # Retroactive, not just prospective: an operator dismisses an issue because
+    # they just read it in a digest, so it is already stored and already live.
+    store.apply_dismissals(conn)
+
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []
     for cand in discovered:
+        if (cand.repo, cand.number) in dismissed:
+            note = dismissed[(cand.repo, cand.number)]
+            store.upsert_candidate(
+                conn, cand, now=stamp,
+                rejected=f"dismissed by operator{': ' + note if note else ''}")
+            continue
         reason = filters.free_reject(cand)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:
             survivors.append(cand)
+
+    # Stage 1b -- payout history. One cached search for the whole run, so it
+    # belongs with the cheap rejects rather than with enrichment. This is the
+    # difference between ranking a $917,000 farm first and ranking it not at all.
+    payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
+    warnings.extend(payer_warnings)
+    # Retroactive, like dismissals: a filter that ships later has to reach the
+    # rows already stored, or the digest keeps recommending what it now knows to
+    # be a farm until GitHub happens to touch each issue again.
+    store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
+                                  payers.ALGORA_LABEL)
+    open_here: dict[str, int] = {}
+    for cand in survivors:
+        open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
+    kept: list[Candidate] = []
+    for cand in survivors:
+        reason = payers.payout_reject(
+            cand.repo, cand.labels, open_here[cand.repo], payer_repos)
+        if reason:
+            store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
+        else:
+            kept.append(cand)
+    survivors = kept
 
     # Stage 2 -- repo detail, then repo rejects.
     survivors = enrich(conn, survivors, warnings)
@@ -228,13 +267,51 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Rank open unclaimed bounties.")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the digest instead of sending it")
+    parser.add_argument("--watch", action="store_true",
+                        help="fast sweep of proven-payer repos only "
+                             "(cheap: core quota, and a 304 costs nothing)")
+    parser.add_argument("--dismiss", metavar="REPO#NUMBER", default=None,
+                        help="never show this issue again (e.g. commaai/opendbc#3426)")
+    parser.add_argument("--undismiss", metavar="REPO#NUMBER", default=None,
+                        help="reverse a --dismiss")
+    parser.add_argument("--reason", default=None,
+                        help="why, recorded alongside --dismiss")
+    parser.add_argument("--list-dismissed", action="store_true",
+                        help="print every dismissal and exit")
     parser.add_argument("--sources", default=None,
                         help="comma-separated source names "
                              f"(default: {','.join(config.HUNT_ENABLED_SOURCES)})")
     args = parser.parse_args(argv)
 
-    names = (args.sources.split(",") if args.sources else config.HUNT_ENABLED_SOURCES)
     conn = store.connect()
+
+    if args.list_dismissed:
+        rows = store.dismissed_reasons(conn)
+        if not rows:
+            print("nothing dismissed")
+        for (repo, number), reason in sorted(rows.items()):
+            print(f"{repo}#{number}  {reason or '(no reason recorded)'}")
+        return 0
+    if args.dismiss or args.undismiss:
+        target = args.dismiss or args.undismiss
+        if "#" not in target:
+            print(f"expected REPO#NUMBER, got {target!r}", file=sys.stderr)
+            return 2
+        repo, _, num = target.rpartition("#")
+        if args.dismiss:
+            store.dismiss(conn, repo, int(num), args.reason)
+            print(f"dismissed {repo}#{num}"
+                  f"{' -- ' + args.reason if args.reason else ''}")
+        else:
+            found = store.undismiss(conn, repo, int(num))
+            print(f"{'restored' if found else 'was not dismissed'}: {repo}#{num}")
+        return 0
+
+    if args.watch:
+        names = [PayerWatchSource.name]
+    else:
+        names = (args.sources.split(",") if args.sources
+                 else config.HUNT_ENABLED_SOURCES)
     text = run(conn, sources=build_sources(names), dry_run=args.dry_run)
     print(text)
     return 0

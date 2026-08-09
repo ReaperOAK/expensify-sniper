@@ -90,6 +90,7 @@ ssh "$HOST" "crontab -l 2>/dev/null | grep -v 'hunt.py' > /tmp/ct.\$\$ || true
              cat >> /tmp/ct.\$\$ <<'CRON'
 PATH=/usr/local/bin:/usr/bin:/bin:\$HOME/.local/bin
 0 */3 * * * cd \$HOME/expensify-sniper && /usr/bin/python3 hunt.py >> \$HOME/expensify-sniper/hunt.log 2>&1
+*/10 * * * * cd \$HOME/expensify-sniper && /usr/bin/python3 hunt.py --watch >> \$HOME/expensify-sniper/watch.log 2>&1
 CRON
              crontab /tmp/ct.\$\$ && rm -f /tmp/ct.\$\$"
 

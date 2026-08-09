@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS candidates (
 CREATE INDEX IF NOT EXISTS candidates_live
     ON candidates (rejected, score DESC);
 
+CREATE TABLE IF NOT EXISTS dismissed (
+    repo        TEXT NOT NULL,
+    number      INTEGER NOT NULL,
+    reason      TEXT,
+    dismissed_at REAL NOT NULL,
+    PRIMARY KEY (repo, number)
+);
+
 CREATE TABLE IF NOT EXISTS rate_budget (
     quota  TEXT    NOT NULL,
     window INTEGER NOT NULL,
@@ -389,3 +397,103 @@ def prune_budget(conn: sqlite3.Connection, *, now: float | None = None) -> None:
             (quota, _window(quota, now)),
         )
     conn.commit()
+
+
+def dismiss(conn: sqlite3.Connection, repo: str, number: int,
+            reason: str | None = None, *, now: float | None = None) -> None:
+    """Kill one issue permanently, by operator judgement.
+
+    Metadata cannot see everything. commaai/opendbc#3426 advertised $10,000 and
+    passed every automated check -- real company, real programme, seven closed
+    bounties -- while its eligibility link 301'd to a Rick Astley video. Only a
+    human following the link could know that.
+
+    A digest arriving every three hours is worthless if the operator has to
+    re-reject the same issue each time.
+    """
+    conn.execute(
+        "INSERT INTO dismissed (repo, number, reason, dismissed_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(repo, number) DO UPDATE SET reason = excluded.reason, "
+        "dismissed_at = excluded.dismissed_at",
+        (repo, number, reason, time.time() if now is None else now),
+    )
+    conn.commit()
+
+
+def undismiss(conn: sqlite3.Connection, repo: str, number: int) -> bool:
+    """Reverse a dismissal. Returns True if there was one."""
+    cur = conn.execute("DELETE FROM dismissed WHERE repo = ? AND number = ?",
+                       (repo, number))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def dismissed_reasons(conn: sqlite3.Connection) -> dict[tuple[str, int], str | None]:
+    """Every dismissal, keyed (repo, number). Read once per run, not per candidate."""
+    return {(row["repo"], row["number"]): row["reason"]
+            for row in conn.execute("SELECT repo, number, reason FROM dismissed")}
+
+
+def apply_dismissals(conn: sqlite3.Connection) -> int:
+    """Mark already-stored candidates rejected if they are on the dismiss list.
+
+    Dismissing only future discoveries is useless: an operator dismisses an issue
+    precisely because they just read it in a digest, and it is already stored. It
+    would then survive in `live_candidates` until GitHub happened to touch it
+    again -- which for a months-old bounty could be never.
+
+    Returns how many rows this changed.
+    """
+    cur = conn.execute(
+        """
+        UPDATE candidates SET rejected = 'dismissed by operator' ||
+            COALESCE(': ' || (SELECT reason FROM dismissed d
+                              WHERE d.repo = candidates.repo
+                                AND d.number = candidates.number), '')
+        WHERE rejected IS NULL
+          AND EXISTS (SELECT 1 FROM dismissed d
+                      WHERE d.repo = candidates.repo AND d.number = candidates.number)
+        """
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
+                            threshold: int, algora_label: str) -> int:
+    """Re-judge STORED candidates against the payout roster. Returns rows changed.
+
+    Filters that arrive later must reach the rows already in the table, for the
+    same reason dismissals do. When the payout filter shipped, every candidate
+    discovered before it stayed live -- so the digest kept recommending a repo
+    with 201 open bounties and zero payouts until GitHub happened to touch each
+    issue again.
+
+    Uses only stored columns (`labels` is kept as JSON precisely so a judgement
+    can be revisited), so this costs no API call.
+    """
+    if not payers:
+        return 0  # roster unavailable: abstain, exactly as payout_reject does
+
+    counts = {row["repo"]: row["n"] for row in conn.execute(
+        "SELECT repo, COUNT(*) AS n FROM candidates WHERE rejected IS NULL GROUP BY repo")}
+    changed = 0
+    rows = conn.execute(
+        "SELECT repo, number, labels FROM candidates WHERE rejected IS NULL").fetchall()
+    for row in rows:
+        repo = row["repo"]
+        if repo in payers or counts.get(repo, 0) < threshold:
+            continue
+        try:
+            labels = json.loads(row["labels"])
+        except (ValueError, TypeError):
+            continue
+        if not any(str(name).strip() == algora_label for name in labels):
+            continue
+        conn.execute(
+            "UPDATE candidates SET rejected = ? WHERE repo = ? AND number = ?",
+            (f"no payout history ({counts[repo]} open Algora bounties here, "
+             f"0 ever rewarded)", repo, row["number"]))
+        changed += 1
+    conn.commit()
+    return changed

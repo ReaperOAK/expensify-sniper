@@ -113,6 +113,39 @@ ranks on metadata alone, and pushes a Discord digest every 3 hours from OCI.
 6. **Search responses carry no ETag.** Incremental discovery diffs `updated_at`
    against SQLite instead.
 
+### The market's actual shape (measured 2026-08-09) -- read this before tuning anything
+
+The tracker works. The channel is the problem, and the numbers say why.
+
+**Proven payers pay steadily but hold no standing inventory.**
+
+    Algora issues ever rewarded                          3,114
+    rewarded, updated in the last 90 days                  501
+    rewarded, updated in the last 30 days                   10
+
+    open UNASSIGNED bounties at the 10 most-recent payers    3
+      (Mudlet, qdrant, projectdiscovery/httpx, CapSoftware,
+       documenso, outerbase, tscircuit x2, gitea, highlight)
+
+**Farms hold enormous inventory and pay nothing.**
+
+    ClankerNation/OpenAgents      201 open, 0 rewarded, 0 closed
+    UnsafeLabs/Bounty-Hunters     182 open, 0 rewarded, 0 closed
+
+So visible inventory is INVERSELY correlated with inventory that pays. Anything
+still sitting unassigned on a real payer's repo is sitting there for a reason;
+everything else has been claimed within hours. A 3-hourly digest is the right
+cadence for mining a backlog and the wrong one for catching real money.
+
+**Expensify, for comparison:** 86 open Help Wanted, **0 unassigned**, 6,264
+closed all time. Same shape -- a proven payer with zero standing inventory.
+
+Implication: a periodic digest cannot win a bounty that is claimed in minutes.
+The two ways forward are (a) poll the ~38 known payer repos frequently and act
+fast, or (b) accept that this channel supplements rather than provides income.
+Do not tune the filters expecting a bigger list -- the filters are not what is
+limiting it.
+
 ### What the inventory actually looks like (measured 2026-08-09)
 
 1506 candidates seen, 738 live, but only **206 carry a readable amount, across 5

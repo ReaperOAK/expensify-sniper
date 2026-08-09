@@ -151,6 +151,29 @@ DIGEST_STANDING_N = int(os.environ.get("DIGEST_STANDING_N", "5"))
 # but a digest that only ever shows one repo is useless either way.
 DIGEST_MAX_PER_REPO = int(os.environ.get("DIGEST_MAX_PER_REPO", "3"))
 
+# Payout history -- the strongest signal available, and the one the tracker
+# originally ignored. Measured 2026-08-09: two repos advertising $917,000 across
+# 383 open Algora bounties had never rewarded or even closed a single one, while
+# a repo offering $200 had paid out 150 times. Amount alone ranks them backwards.
+# Cached for a day: payout history moves in days, not in the 3h between runs.
+PAYER_CACHE_S = float(os.environ.get("PAYER_CACHE_S", str(24 * 3600)))
+PAYER_SEARCH_MAX_PAGES = int(os.environ.get("PAYER_SEARCH_MAX_PAGES", "6"))
+# How many open Algora bounties a repo must be advertising before never having
+# paid one counts against it. A new project with two bounties is not a farm.
+UNPAID_REPO_THRESHOLD = int(os.environ.get("UNPAID_REPO_THRESHOLD", "10"))
+
+# --- payer watch --------------------------------------------------------------
+# How many proven-payer repos to watch. Each costs one core request per sweep,
+# and nothing at all when the repo is unchanged (a 304 leaves the quota
+# untouched, measured 2026-08-09). 38 distinct payers appeared in the 100 most
+# recent payouts, so this covers the live set with room to grow.
+WATCH_MAX_REPOS = int(os.environ.get("WATCH_MAX_REPOS", "60"))
+# Sweep cadence, minutes. Not a preference: a single events page holds 100
+# entries and covered only ONE DAY on go-gitea/gitea, so polling slower than a
+# repo's event velocity loses labels silently. Ten minutes is far inside that
+# for every payer measured.
+WATCH_EVERY_MINUTES = int(os.environ.get("WATCH_EVERY_MINUTES", "10"))
+
 # Two quota classes, shared with the Expensify watcher through one token. The
 # budget guard in store.py refuses to start a run it cannot finish rather than
 # reporting an empty world -- a throttled search is indistinguishable from "no
