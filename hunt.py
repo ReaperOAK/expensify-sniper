@@ -109,6 +109,7 @@ def run(
     sources: list[Source] | None = None,
     now: float | None = None,
     dry_run: bool = False,
+    notify_when_empty: bool = True,
 ) -> str:
     stamp = time.time() if now is None else now
     store.prune_budget(conn, now=stamp)
@@ -243,6 +244,20 @@ def run(
     text = notify.format_digest(new_rows, standing_rows, warnings,
                                 first_run=first_run, now=stamp,
                                 held_back=held_back)
+    # A sweep that found nothing and hit no trouble is not news. The watch runs
+    # every ten minutes: delivering "nothing new" each time is 144 messages a
+    # day, which does not merely annoy -- it trains the reader to ignore the
+    # channel, so the one message that matters arrives somewhere nobody looks.
+    #
+    # Warnings ALWAYS deliver. "Nothing found" and "I could not look" must never
+    # be the same silence, which is the failure this whole pipeline is built
+    # against. Silence here means, and only means: I swept, and there was
+    # nothing. watch.log records every sweep either way, so liveness is provable
+    # without spending the reader's attention.
+    nothing_to_say = not new_rows and not warnings and not first_run
+    if nothing_to_say and not notify_when_empty:
+        return text
+
     if not dry_run:
         # Delivery is the one stage whose failure a human would never see, which
         # makes it the one that most needs saying out loud. An unset webhook

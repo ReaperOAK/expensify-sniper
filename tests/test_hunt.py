@@ -36,8 +36,9 @@ def _conn(tmp_path, payers=("acme/widgets",)):
     return conn
 
 
-def _run(conn, *, sources, now=NOW, dry_run=True):
-    return hunt.run(conn, sources=sources, now=now, dry_run=dry_run)
+def _run(conn, *, sources, now=NOW, dry_run=True, notify_when_empty=True):
+    return hunt.run(conn, sources=sources, now=now, dry_run=dry_run,
+                    notify_when_empty=notify_when_empty)
 
 
 def _cand(number, *, labels=None, assignee=None, state="open", comments=0,
@@ -339,3 +340,43 @@ def test_reconciliation_abstains_when_the_roster_is_unavailable(tmp_path):
         store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
     assert store.apply_payout_rejections(conn, set(), 10, "$780") == 0
     assert len(store.live_candidates(conn, limit=50)) == 12
+
+
+def test_a_quiet_watch_sweep_says_nothing(tmp_path, fake_get, monkeypatch, capsys):
+    """The watch runs every ten minutes: 144 'nothing new' messages a day.
+
+    That does not merely annoy -- it trains the reader to ignore the channel, so
+    the one message that matters lands somewhere nobody looks.
+    """
+    from sniper import notify
+
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda text, **kw: sent.append(text) or "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+    sent.clear()
+
+    # Second sweep: nothing new, nothing wrong.
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False,
+         notify_when_empty=False)
+    assert sent == []
+
+
+def test_a_quiet_sweep_with_a_WARNING_still_speaks(tmp_path, fake_get, monkeypatch):
+    """'Nothing found' and 'I could not look' must never be the same silence."""
+    from sniper import notify
+
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda text, **kw: sent.append(text) or "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+    sent.clear()
+
+    _run(conn, sources=[FakeSource("broken", raises=RuntimeError("boom"))],
+         now=NOW + 600, dry_run=False, notify_when_empty=False)
+    assert len(sent) == 1
+    assert "⚠" in sent[0]
