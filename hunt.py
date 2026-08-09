@@ -187,16 +187,23 @@ def run(
     # Stage 4 -- digest.
     if first_run:
         new_rows = store.live_candidates(conn, config.DIGEST_TOP_N,
-                                         max_per_repo=config.DIGEST_MAX_PER_REPO)
+                                         max_per_repo=config.DIGEST_MAX_PER_REPO,
+                                         require_amount=True)
         standing_rows = []
     else:
         new_rows = store.live_candidates(conn, config.DIGEST_TOP_N, since=stamp,
-                                         max_per_repo=config.DIGEST_MAX_PER_REPO)
+                                         max_per_repo=config.DIGEST_MAX_PER_REPO,
+                                         require_amount=True)
         standing_rows = store.live_candidates(conn, config.DIGEST_STANDING_N,
-                                              max_per_repo=config.DIGEST_MAX_PER_REPO)
+                                              max_per_repo=config.DIGEST_MAX_PER_REPO,
+                                              require_amount=True)
 
+    held_back = conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE rejected IS NULL AND amount_usd IS NULL"
+    ).fetchone()[0]
     text = notify.format_digest(new_rows, standing_rows, warnings,
-                                first_run=first_run, now=stamp)
+                                first_run=first_run, now=stamp,
+                                held_back=held_back)
     if not dry_run:
         # Delivery is the one stage whose failure a human would never see, which
         # makes it the one that most needs saying out loud. An unset webhook

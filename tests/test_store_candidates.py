@@ -165,3 +165,29 @@ def test_no_single_repo_can_monopolise_the_digest(tmp_path):
     # Uncapped, the loud repo still wins outright -- the cap is the only defence.
     assert all(r["repo"] == "acme/widgets"
                for r in store.live_candidates(conn, limit=6))
+
+
+def test_unrankable_candidates_do_not_take_a_digest_slot(tmp_path):
+    """Measured 2026-08-09: 543 of 748 live candidates had no readable amount.
+
+    They padded the digest with 700-day-old issues titled "test" and "tttt" once
+    the handful of real ones ran out. They stay in the database -- hunt.py
+    reports how many were held back -- but they do not displace something that
+    can actually be ranked by expected value.
+    """
+    conn = _conn(tmp_path)
+    store.upsert_candidate(conn, _cand(1).with_score(500.0), now=1.0)
+
+    junk = Candidate.from_search_item("github-labels", {
+        "number": 99, "title": "tttt", "state": "open", "comments": 4,
+        "created_at": "2024-01-01T00:00:00Z", "updated_at": "2026-08-01T00:00:00Z",
+        "html_url": "u", "repository_url": "https://api.github.com/repos/xeymxmkf/aaa",
+        "assignee": None, "labels": [{"name": "bounty"}],
+    }).with_repo_detail({"fork": False, "archived": False, "stargazers_count": 0,
+                         "pushed_at": "2026-08-01T00:00:00Z", "language": None})
+    assert junk.amount_usd is None
+    store.upsert_candidate(conn, junk.with_score(0.0), now=1.0)
+
+    assert len(store.live_candidates(conn, limit=10)) == 2
+    ranked = store.live_candidates(conn, limit=10, require_amount=True)
+    assert [r["number"] for r in ranked] == [1]

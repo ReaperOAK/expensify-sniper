@@ -77,6 +77,43 @@ def amounts_in_title(title: str) -> tuple[int, ...]:
     return tuple(sorted(found))
 
 
+# "$500 bounty", "bounty: $500", "reward — $1.5k". Requires the WORD near the
+# number: an issue body is long prose and plain "$5" in it is far more often a
+# price, a gas fee or an example than a prize.
+_BOUNTY_WORD = r"(?:bount(?:y|ies)|reward|prize|payout)"
+_AMOUNT = r"\$\s*(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s*([kK])?\b"
+# [^\n$]{0,25} rather than \W{0,25}: the gap is usually words -- "bounty of $500",
+# "reward for this issue: $1k" -- but must not cross a newline or another '$',
+# which would let an unrelated figure elsewhere in the body match.
+_BOUNTY_NEAR_AMOUNT = re.compile(
+    rf"{_BOUNTY_WORD}[^\n$]{{0,25}}{_AMOUNT}"
+    rf"|{_AMOUNT}[^\n$]{{0,25}}{_BOUNTY_WORD}",
+    re.IGNORECASE,
+)
+
+# How much of a body to read. Bounty statements live at the top; the tail is
+# reproduction steps and logs full of numbers that are not prizes.
+BODY_SCAN_CHARS = 600
+
+
+def amounts_in_body(body: str) -> tuple[int, ...]:
+    """Distinct amounts stated NEAR the word bounty/reward/prize, ascending.
+
+    Measured 2026-08-09 on a full backlog: 543 of 748 live candidates had no
+    parseable amount from labels or title, and only 5 repos of 26 carried one at
+    all. The amounts are mostly in the body. `body` already arrives in the search
+    payload, so reading it costs no extra API call.
+    """
+    found = set()
+    for match in _BOUNTY_NEAR_AMOUNT.finditer((body or "")[:BODY_SCAN_CHARS]):
+        whole = match.group(1) or match.group(4)
+        fraction = match.group(2) or match.group(5) or ""
+        suffix = match.group(3) or match.group(6)
+        value = float(whole.replace(",", "") + fraction)
+        found.add(int(value * 1000) if suffix else int(value))
+    return tuple(sorted(found))
+
+
 def repo_from_url(repository_url: str) -> str:
     """"https://api.github.com/repos/acme/widgets" -> "acme/widgets"."""
     owner, name = repository_url.rstrip("/").rsplit("/", 2)[-2:]
@@ -139,12 +176,17 @@ class Candidate:
         if amount is None and len(seen) == 1:
             amount = seen[0]
         if amount is None and not seen:
-            # Labels said nothing. Fall back to the title -- but only on an
-            # unambiguous single figure, for the same reason two $-labels mean
-            # spam rather than a bigger prize.
-            from_title = amounts_in_title(payload.get("title", ""))
-            if len(from_title) == 1:
-                amount = from_title[0]
+            # Labels said nothing. Fall back to the title, then the body -- each
+            # only on an unambiguous single figure, for the same reason two
+            # $-labels mean spam rather than a bigger prize. Evidence weakens as
+            # we go: a label is structured, a title is short prose, a body is long
+            # prose, so the body match additionally demands the word "bounty"
+            # (or reward/prize/payout) next to the number.
+            for candidate_amounts in (amounts_in_title(payload.get("title", "")),
+                                      amounts_in_body(payload.get("body", ""))):
+                if len(candidate_amounts) == 1:
+                    amount = candidate_amounts[0]
+                    break
         has_assignee = bool(payload.get("assignee") or payload.get("assignees"))
         return cls(
             source=source,

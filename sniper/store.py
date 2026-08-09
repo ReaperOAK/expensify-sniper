@@ -246,6 +246,7 @@ def live_candidates(
     *,
     since: float | None = None,
     max_per_repo: int | None = None,
+    require_amount: bool = False,
 ) -> list[sqlite3.Row]:
     """Unrejected candidates, best first. `since` restricts to newly first-seen ones.
 
@@ -256,6 +257,14 @@ def live_candidates(
     digest that only ever shows one of them is useless either way.
     """
     where = "rejected IS NULL" + ("" if since is None else " AND first_seen_at >= ?")
+    if require_amount:
+        # A candidate with no readable amount cannot be ranked by expected value,
+        # which is the digest's entire premise. Measured 2026-08-09: 543 of 748
+        # live candidates had none, and they padded the digest with 700-day-old
+        # issues titled "test" and "tttt" once the real ones ran out. They stay in
+        # the database -- hunt.py says how many were held back -- but they do not
+        # take a slot from something rankable.
+        where += " AND amount_usd IS NOT NULL"
     params: list[Any] = [] if since is None else [since]
     order = " ORDER BY score DESC, amount_usd DESC"
 

@@ -36,7 +36,7 @@ def format_row(row, *, now: float | None = None) -> str:
 
 
 def format_digest(new_rows, standing_rows, warnings, *, first_run: bool,
-                  now: float | None = None) -> str:
+                  now: float | None = None, held_back: int = 0) -> str:
     """Render the whole digest. Warnings first, always."""
     parts: list[str] = []
 
@@ -48,7 +48,7 @@ def format_digest(new_rows, standing_rows, warnings, *, first_run: bool,
     if first_run:
         parts.append(f"**Bounty backlog — top {len(new_rows)} by score**")
         parts.extend(format_row(row, now=now) for row in new_rows)
-        return "\n".join(parts)
+        return "\n".join(parts + _held_back_note(held_back))
 
     if new_rows:
         parts.append(f"**{len(new_rows)} new since last run**")
@@ -61,7 +61,16 @@ def format_digest(new_rows, standing_rows, warnings, *, first_run: bool,
         parts.append(f"**Top {len(standing_rows)} standing**")
         parts.extend(format_row(row, now=now) for row in standing_rows)
 
-    return "\n".join(parts)
+    return "\n".join(parts + _held_back_note(held_back))
+
+
+def _held_back_note(held_back: int) -> list[str]:
+    """Say what was excluded. Silence here would read as "that is all there is"."""
+    if not held_back:
+        return []
+    return ["",
+            f"_{held_back} more open and unclaimed, but with no amount readable "
+            f"from labels, title or body -- not rankable, so not shown._"]
 
 
 def chunk(text: str, limit: int) -> list[str]:

@@ -198,3 +198,29 @@ def test_a_title_with_no_amount_stays_none():
     cand = Candidate.from_search_item("github-labels", _item(
         title="Fix the thing", labels=[{"name": "bounty"}]))
     assert cand.amount_usd is None
+
+
+def test_a_body_amount_is_used_when_labels_and_title_are_silent():
+    """543 of 748 live candidates had no amount in labels or title, measured.
+
+    body already arrives in the search payload, so reading it is free.
+    """
+    cand = Candidate.from_search_item("github-labels", _item(
+        title="Add wallet integration", labels=[{"name": "bounty"}],
+        body="We are offering a bounty of $500 for this. Steps to reproduce..."))
+    assert cand.amount_usd == 500
+
+
+def test_a_bare_dollar_figure_in_a_body_is_not_treated_as_a_prize():
+    # Bodies are long prose. "$5" is far more often a price or a gas fee.
+    cand = Candidate.from_search_item("github-labels", _item(
+        title="Checkout is broken", labels=[{"name": "bounty"}],
+        body="The cart shows $5 but charges $7. Expected $5."))
+    assert cand.amount_usd is None
+
+
+def test_the_title_still_beats_the_body():
+    cand = Candidate.from_search_item("github-labels", _item(
+        title="[$900 bounty] fix it", labels=[{"name": "bounty"}],
+        body="bounty of $100 maybe"))
+    assert cand.amount_usd == 900
