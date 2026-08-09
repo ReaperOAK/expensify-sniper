@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     language      TEXT,
     stars         INTEGER,
     score         REAL,
+    open_pr_count  INTEGER,
     created_at    TEXT    NOT NULL,
     updated_at    TEXT    NOT NULL,
     first_seen_at REAL    NOT NULL,
@@ -85,12 +86,32 @@ CREATE TABLE IF NOT EXISTS rate_budget (
 """
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
+# existing database on whatever shape it was created with, so every later column
+# has to be added explicitly. Keep this list append-only and keep the type
+# declarations identical to SCHEMA's, so a migrated database and a fresh one are
+# indistinguishable.
+ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "candidates": {"open_pr_count": "INTEGER"},
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, wanted in ADDED_COLUMNS.items():
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, declaration in wanted.items():
+            if column not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    conn.commit()
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
     db_path = Path(path or config.DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -205,13 +226,13 @@ def upsert_candidate(
         """
         INSERT OR IGNORE INTO candidates
             (source, repo, number, title, url, state, amount_usd, comments, labels,
-             language, stars, score, created_at, updated_at, first_seen_at,
-             last_seen_at, rejected)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             language, stars, score, open_pr_count, created_at, updated_at,
+             first_seen_at, last_seen_at, rejected)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (source, repo, number, cand.title, cand.url, cand.state, cand.amount_usd,
          cand.comments, labels, cand.language, cand.stars, cand.score,
-         cand.created_at, cand.updated_at, stamp, stamp, rejected),
+         cand.open_pr_count, cand.created_at, cand.updated_at, stamp, stamp, rejected),
     )
     is_new = cur.rowcount > 0
     if not is_new:
@@ -221,13 +242,13 @@ def upsert_candidate(
             """
             UPDATE candidates SET
                 title = ?, url = ?, state = ?, amount_usd = ?, comments = ?,
-                labels = ?, language = ?, stars = ?, score = ?, updated_at = ?,
-                last_seen_at = ?, rejected = ?
+                labels = ?, language = ?, stars = ?, score = ?, open_pr_count = ?,
+                updated_at = ?, last_seen_at = ?, rejected = ?
             WHERE source = ? AND repo = ? AND number = ?
             """,
             (cand.title, cand.url, cand.state, cand.amount_usd, cand.comments,
-             labels, cand.language, cand.stars, cand.score, cand.updated_at,
-             stamp, rejected, source, repo, number),
+             labels, cand.language, cand.stars, cand.score, cand.open_pr_count,
+             cand.updated_at, stamp, rejected, source, repo, number),
         )
     conn.commit()
     return is_new
@@ -497,3 +518,23 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
         changed += 1
     conn.commit()
     return changed
+
+
+def clear_rejections(conn: sqlite3.Connection, reason: str) -> int:
+    """Un-reject stored candidates that were dropped for `reason`. Rows changed.
+
+    A filter that changes its mind has to reach the rows it already judged. When
+    the open-linked-PR rule was replaced, 562 stored candidates were sitting
+    rejected under the old question -- and because a candidate is only re-judged
+    when GitHub happens to touch it again, a months-old bounty could have stayed
+    wrongly rejected forever. Clearing the reason puts them back in front of the
+    new rule on the next sweep.
+
+    Matches the reason EXACTLY. Reasons that interpolate a value (a repo's open
+    count, a claimant's login) are deliberately not clearable this way: a prefix
+    match would be a blunt instrument aimed at a table this is meant to correct.
+    """
+    cur = conn.execute(
+        "UPDATE candidates SET rejected = NULL WHERE rejected = ?", (reason,))
+    conn.commit()
+    return cur.rowcount

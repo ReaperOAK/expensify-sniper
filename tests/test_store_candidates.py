@@ -17,6 +17,16 @@ def _conn(tmp_path):
     return store.connect(tmp_path / "t.sqlite")
 
 
+def _candidate(*, number: int, source: str = "github-labels",
+               repo: str = "acme/widgets") -> Candidate:
+    return Candidate(
+        source=source, repo=repo, number=number, title="t",
+        url=f"https://github.com/{repo}/issues/{number}", state="open",
+        comments=0, labels=(), created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z", has_assignee=False,
+        amount_usd=100, amounts_seen=(100,))
+
+
 def _cand(number=7, *, updated="2026-08-01T00:00:00Z", source="github-labels"):
     return Candidate.from_search_item(source, {
         "number": number, "title": f"issue {number}", "state": "open", "comments": 2,
@@ -191,3 +201,47 @@ def test_unrankable_candidates_do_not_take_a_digest_slot(tmp_path):
     assert len(store.live_candidates(conn, limit=10)) == 2
     ranked = store.live_candidates(conn, limit=10, require_amount=True)
     assert [r["number"] for r in ranked] == [1]
+
+
+def test_open_pr_count_round_trips(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    cand = _candidate(number=1).with_linked_prs(3)
+    store.upsert_candidate(conn, cand, now=1.0)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 3
+
+
+def test_unchecked_candidate_stores_null_not_zero(tmp_path):
+    # "the timeline was never read" and "there are no PRs" must not collapse.
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), now=1.0)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] is None
+
+
+def test_open_pr_count_is_updated_on_a_later_sighting(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1).with_linked_prs(1), now=1.0)
+    store.upsert_candidate(conn, _candidate(number=1).with_linked_prs(4), now=2.0)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 4
+
+
+def test_clear_rejections_revives_only_the_named_reason(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), rejected="open linked PR", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=2), rejected="archived repo", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=3), now=1.0)
+
+    changed = store.clear_rejections(conn, "open linked PR")
+
+    assert changed == 1
+    live = {row["number"] for row in
+            conn.execute("SELECT number FROM candidates WHERE rejected IS NULL")}
+    assert live == {1, 3}
+
+
+def test_clear_rejections_returns_zero_when_nothing_matches(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), rejected="fork", now=1.0)
+    assert store.clear_rejections(conn, "open linked PR") == 0
