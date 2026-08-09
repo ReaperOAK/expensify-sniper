@@ -150,11 +150,18 @@ def find_magic_code(since_epoch: float, timeout: int = 120, poll: int = 5,
     """
     deadline = time.time() + timeout
     last_error: Exception | None = None
+    conn = None
 
-    while time.time() < deadline:
-        try:
-            conn = connect()
+    # ONE connection, reused across polls. Reconnecting every 5s meant ~60 Gmail logins
+    # per wait, each doing SELECT + SEARCH over a ~37k-message mailbox; Gmail throttled
+    # it and the poller died with "The read operation timed out" -- which reads exactly
+    # like "the code never arrived". Raising the timeout made it worse, not better,
+    # because it doubled the number of logins.
+    try:
+        while time.time() < deadline:
             try:
+                if conn is None:
+                    conn = connect()
                 # Gmail can file automated mail in Spam; a code sitting there is
                 # indistinguishable from one that never arrived, so check both.
                 for folder in FOLDERS:
@@ -183,14 +190,23 @@ def find_magic_code(since_epoch: float, timeout: int = 120, poll: int = 5,
                         code = _best_code(subject, _body_text(msg))
                         if code:
                             return MagicCode(code, subject, received_at, uid.decode())
-            finally:
+            except Exception as exc:
+                # A dropped or throttled connection is recoverable; force a fresh one
+                # on the next pass rather than spinning on a dead socket.
+                last_error = exc
                 try:
-                    conn.logout()
+                    if conn is not None:
+                        conn.logout()
                 except Exception:
                     pass
-        except Exception as exc:
-            last_error = exc
-        time.sleep(poll)
+                conn = None
+            time.sleep(poll)
+    finally:
+        try:
+            if conn is not None:
+                conn.logout()
+        except Exception:
+            pass
 
     raise MailboxError(
         f"no Expensify magic code within {timeout}s"

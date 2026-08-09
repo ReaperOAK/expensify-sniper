@@ -116,7 +116,34 @@ def _locator(page, target: str):
 
     Expensify is React Native Web, so class names are generated and unstable.
     Text and testID are the only selectors worth writing by hand.
+
+    Every branch ends in `.first`, because Playwright locators are strict by default and
+    an ambiguous selector raises "strict mode violation ... resolved to N elements",
+    which killed a 17-of-18 run on `label=Create expense` (a label the app uses twice).
+
+    Do NOT wrap these in `filter(visible=True)`. Visibility is evaluated at match time,
+    so an element that has not rendered yet matches nothing and `wait_for` then times out
+    on an empty locator -- that regressed a run from 18 steps back to 8. The hidden-match
+    problem is real but rare, and is handled where it actually bites, in the click verb.
     """
+    if target.startswith("testid="):
+        return page.get_by_test_id(target[7:]).first
+    if target.startswith("css="):
+        return page.locator(target[4:]).first
+    if target.startswith("role="):
+        role, _, name = target[5:].partition(":")
+        return page.get_by_role(role.strip(), name=name.strip() or None).first
+    if target.startswith("label="):
+        return page.get_by_label(target[6:]).first
+    if target.startswith("placeholder="):
+        return page.get_by_placeholder(target[12:]).first
+    if target.startswith("text="):
+        target = target[5:]
+    return page.get_by_text(target, exact=False).first
+
+
+def _locator_all(page, target: str):
+    """The same resolution, unnarrowed — used to retry against other matches."""
     if target.startswith("testid="):
         return page.get_by_test_id(target[7:])
     if target.startswith("css="):
@@ -130,7 +157,22 @@ def _locator(page, target: str):
         return page.get_by_placeholder(target[12:])
     if target.startswith("text="):
         target = target[5:]
-    return page.get_by_text(target, exact=False).first
+    return page.get_by_text(target, exact=False)
+
+
+def _click(page, target: str, timeout_ms: int = 12000):
+    """Click the first match; if it is a hidden copy, fall back to a visible one.
+
+    React Native Web keeps offscreen and collapsed copies of menu items mounted, so the
+    first DOM match is sometimes unclickable while a later one is fine. Waiting on the
+    wrong copy times out and reads as "the bug did not reproduce".
+    """
+    try:
+        _locator(page, target).click(timeout=timeout_ms)
+        return
+    except (PWTimeout, PWError):
+        pass
+    _locator_all(page, target).filter(visible=True).first.click(timeout=timeout_ms)
 
 
 # Expensify sits behind Cloudflare bot management. The headless shell gets its
@@ -356,7 +398,7 @@ class ReproSession:
         """Execute a generated step list. Unknown verbs fail loudly rather than no-op."""
         verbs = {
             "goto": lambda s: self.page.goto(s["url"], wait_until="domcontentloaded"),
-            "click": lambda s: _locator(self.page, s["target"]).click(),
+            "click": lambda s: _click(self.page, s["target"]),
             "type": lambda s: _locator(self.page, s["target"]).fill(s["text"]),
             "keyboard": lambda s: self.page.keyboard.type(s["text"], delay=40),
             "press": lambda s: self.page.keyboard.press(s["key"]),

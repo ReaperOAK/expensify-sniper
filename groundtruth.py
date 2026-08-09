@@ -37,7 +37,17 @@ START_WEB = Path.home() / "start-web.sh"
 
 
 def fix_pr_for(issue_num):
-    """The merged PR that closed this issue, via the timeline (core rate limit)."""
+    """The merged PR that FIXED this issue.
+
+    Taking the first merged PR that merely cross-references the issue is wrong and
+    dangerously plausible: for #95711 that picked PR #95318, which is the PR that
+    INTRODUCED the regression (contributors link the culprit while diagnosing). Scoring
+    against the culprit's diff would invert the result.
+
+    Expensify's PR template requires the fixed issue as a `$ <issue url>` line, so that
+    is the reliable signal. Fall back to the newest merged cross-reference only when no
+    PR declares it, and say so.
+    """
     events = gh(f"/repos/Expensify/App/issues/{issue_num}/timeline?per_page=100",
                 paginate=True) or []
     candidates = []
@@ -48,17 +58,35 @@ def fix_pr_for(issue_num):
             src = (ev.get("source") or {}).get("issue") or {}
             if src.get("pull_request") and src.get("number"):
                 candidates.append(src["number"])
+
+    declared, fallback = [], []
     for n in dict.fromkeys(candidates):
         pr = gh(f"/repos/Expensify/App/pulls/{n}")
         if not pr or not pr.get("merged"):
             continue
         files = gh(f"/repos/Expensify/App/pulls/{n}/files?per_page=100", paginate=True) or []
         src = [f for f in files if f["filename"].startswith("src/")]
-        if src:
-            return {"pr": n, "author": pr["user"]["login"], "merged_at": pr["merged_at"],
-                    "files": [f["filename"] for f in src],
-                    "patch": "\n".join(f"=== {f['filename']}\n{f.get('patch','')}"
-                                       for f in src)[:20000]}
+        if not src:
+            continue
+        rec = {"pr": n, "author": pr["user"]["login"], "merged_at": pr["merged_at"],
+               "files": [f["filename"] for f in src],
+               "patch": "\n".join(f"=== {f['filename']}\n{f.get('patch','')}"
+                                  for f in src)[:20000]}
+        body = pr.get("body") or ""
+        if re.search(rf"\$\s*https://github\.com/Expensify/App/issues/{issue_num}\b", body):
+            declared.append(rec)
+        else:
+            fallback.append(rec)
+
+    if declared:
+        # Newest declared fix wins if several link the same issue.
+        return max(declared, key=lambda r: r["merged_at"])
+    if fallback:
+        pick = max(fallback, key=lambda r: r["merged_at"])
+        pick["undeclared"] = True
+        print(f"  WARNING: no PR declares '$ .../issues/{issue_num}'; "
+              f"falling back to newest merged cross-reference #{pick['pr']}")
+        return pick
     return None
 
 
@@ -79,11 +107,25 @@ def restart_server():
     subprocess.Popen(["nohup", str(START_WEB)],
                      stdout=open(Path.home() / "web.log", "w"),
                      stderr=subprocess.STDOUT, start_new_session=True)
-    for _ in range(40):
-        time.sleep(8)
-        probe = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
-        if ":8082" in probe.stdout:
-            time.sleep(10)  # let the first build settle before driving it
+    # The port opens BEFORE rsbuild has finished compiling, and after a checkout to an
+    # older commit that is a full rebuild. Sleeping a fixed 10s once the socket appears
+    # is not enough -- the first navigation then hangs and the run dies with a bare
+    # "Page.goto: Timeout", which looks like a broken repro rather than a cold server.
+    # Poll for a real 200 instead.
+    deadline = time.time() + 420
+    listening = False
+    while time.time() < deadline:
+        time.sleep(6)
+        if not listening:
+            probe = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+            listening = ":8082" in probe.stdout
+            if not listening:
+                continue
+        served = subprocess.run(
+            ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-m", "45",
+             "https://dev.new.expensify.com:8082/"],
+            capture_output=True, text=True)
+        if served.stdout.strip() == "200":
             return True
     return False
 
@@ -130,11 +172,17 @@ def run_one(issue_num, keep_checkout=False):
         print(f"  winner {truth['author']} posted no proposal -> skip (nothing to hide)")
         return None
 
-    sha = git(["rev-list", "-1", f"--before={cutoff}", "origin/main"]).stdout.strip()
+    # Check out just before the fix MERGED, not before the winning proposal was posted.
+    # The bug is present at either point, but the merge is far more recent -- a proposal
+    # can predate its merge by weeks, and #95711's cutoff sat 13k package-lock lines away
+    # from HEAD, which would need its own multi-GB install. Pre-merge commits here are
+    # ~180 lock lines from HEAD, so they share node_modules.
+    # Hindsight is prevented separately, by hiding comments from `cutoff` via --as-of.
+    sha = git(["rev-list", "-1", f"--before={truth['merged_at']}", "origin/main"]).stdout.strip()
     if not sha:
-        print("  no commit before cutoff -> skip")
+        print("  no commit before the fix merge -> skip")
         return None
-    print(f"  cutoff {cutoff}  ->  checkout {sha[:11]}")
+    print(f"  merged {truth['merged_at']} -> checkout {sha[:11]}   (comments hidden from {cutoff})")
 
     original = git(["rev-parse", "HEAD"]).stdout.strip()
     dirty = git(["status", "--porcelain", "--", "src", "tests", "assets"]).stdout.strip()
@@ -151,8 +199,11 @@ def run_one(issue_num, keep_checkout=False):
             print("  dev server did not come up at that commit")
             return None
 
+        # Reuse previously discovered steps when present: discovery costs ~45 min and
+        # several dollars, and steps recorded under the same --as-of cutoff were already
+        # produced blind, so re-running it buys nothing for a retry.
         cmd = [sys.executable, "-u", str(HERE / "verify.py"), str(issue_num),
-               "--as-of", cutoff]
+               "--as-of", cutoff, "--reuse-steps"]
         print(f"  running loop blind (as-of {cutoff})")
         subprocess.run(["xvfb-run", "-a", *cmd], cwd=str(HERE), timeout=9000)
 

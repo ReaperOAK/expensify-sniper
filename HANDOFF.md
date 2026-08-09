@@ -82,7 +82,7 @@ verification.
 **1. `has_open_linked_pr()` is WRONG for Expensify, and it is silently costing bounties.**
 
 `hunt.py` stage 3 rejects any candidate with an open cross-referenced PR. On Algora repos
-that is correct -- the PR *is* the claim. On Expensify it is not: selection happens by
+that is correct -- the PR _is_ the claim. On Expensify it is not: selection happens by
 **proposal**, a C+ picks one, and only then is that person assigned and writes the PR.
 Plenty of people now run AI agents that auto-raise PRs on Help Wanted issues. Those PRs are
 noise. Rejecting on them discards still-winnable $250 bounties as "taken", in the
@@ -113,14 +113,14 @@ Expensify is now one `Source` among several. `hunt.py` discovers open unclaimed
 bounties from GitHub label search, rejects noise before spending quota on it,
 ranks on metadata alone, and pushes a Discord digest every 3 hours from OCI.
 
-| file | does |
-| --- | --- |
-| `sniper/models.py` | `Candidate`; amount parsing from label, then title, then body |
-| `sniper/filters.py` | free rejects (search payload) then repo rejects (needs enrichment) |
-| `sniper/score.py` | `amount / (1 + comments) x repo_health`. Age and language are never scored |
-| `sniper/sources/` | `Source` protocol, bounty-label source, Expensify source |
-| `sniper/notify.py` | digest formatting, Discord webhook / Telegram |
-| `hunt.py` | the pipeline |
+| file                | does                                                                       |
+| ------------------- | -------------------------------------------------------------------------- |
+| `sniper/models.py`  | `Candidate`; amount parsing from label, then title, then body              |
+| `sniper/filters.py` | free rejects (search payload) then repo rejects (needs enrichment)         |
+| `sniper/score.py`   | `amount / (1 + comments) x repo_health`. Age and language are never scored |
+| `sniper/sources/`   | `Source` protocol, bounty-label source, Expensify source                   |
+| `sniper/notify.py`  | digest formatting, Discord webhook / Telegram                              |
+| `hunt.py`           | the pipeline                                                               |
 
 `python3 hunt.py --dry-run` prints without sending. 212 tests, no network.
 
@@ -214,17 +214,70 @@ count.
   headless gets `403` on `/api/Ping` + "You appear to be offline"). **Xvfb is mandatory.**
 - Test account onboarding completed, auth state cached per-host
 
-## What is NOT proven — the open question
+## Verify-loop results as of 2026-08-09 — READ BEFORE RESUMING THAT WORK
 
-**Can generated Playwright steps actually reproduce a bug in Expensify's UI?**
-Zero loop runs so far. React Native Web means class names are generated and unstable, so
-selectors must be testID / aria-label / visible text. If this leg is unreliable the whole
-verified-proposal thesis collapses to static analysis.
+**Answered:** yes, generated Playwright steps CAN reproduce bugs in Expensify's UI. Two
+runs reproduced real bugs and two more got to 25/26 and 18/19 steps.
 
-Next action: `xvfb-run -a python3 verify.py 96348` on OCI.
-(#96348 = "@j.doe short-email mention not recognized" — chosen because the repro is
-typing one string in a chat, no backend setup. It has 7 rival proposals, so it is a
-machinery test, not a real bid.)
+**Not answered, and it is the whole question: the loop has emitted ZERO proposals.**
+Both completed runs were refuted at the last gate.
+
+| run                   | cost              | outcome                                                        |
+| --------------------- | ----------------- | -------------------------------------------------------------- |
+| #96348                | $9.21             | reproduced → fixed → symptom gone → test written → **REFUTED** |
+| #96352                | $26.05            | same, two-user flow via `as_user` → **REFUTED**                |
+| #95711 (ground truth) | ~$16 over retries | never reproduced; died at 25/26 steps                          |
+| #95149 (ground truth) | in flight         | —                                                              |
+
+Both refutations were verified by hand against spec and code and were **correct**:
+
+- #96348 — `contributingGuides/MENTIONS_HIGHLIGHTING_IN_CHAT.md:8,13` _specifies_ the
+  behaviour. Our account is on a public domain (gmail), so
+  `areEmailsFromSamePrivateDomain` (`src/libs/LoginUtils.ts:84-86`) means it has no
+  short-mention namespace at all — the bug is unreproducible with it in principle.
+- #96352 — the repro clicked `DisplayNamesWithToolTip` (the header _title_), not the
+  "From" link, and blamed the element it never touched.
+  `AvatarWithDisplayName.tsx:381-390` wraps the entire header in one pressable.
+
+**The pattern that matters: both refutations killed the REPRODUCTION, not the theory.**
+The discovery agent authors both the repro and the theory, so they agree by construction.
+A repro written to confirm a belief is not evidence of it. Before implementing, confirm
+the repro exercised the exact element/branch being blamed and that a CONTROL element does
+not behave the same way.
+
+**Open calibration risk:** at n=2 a 100% rejection rate cannot be distinguished from a
+refuter that rejects everything. Both rejections were right, so it is not miscalibrated
+yet — but a refuter that never passes is an expensive way to produce nothing. Track false
+rejections as runs accumulate.
+
+### Ground-truth harness (`groundtruth.py`)
+
+Scores the loop against issues whose merged fix is already known — the only test the
+loop's own internal consistency cannot fool.
+
+- Finds the fix PR by the `$ https://github.com/Expensify/App/issues/<n>` line in the PR
+  body. **Do not take the first merged cross-referenced PR**: for #95711 that picked
+  #95318, the PR that _introduced_ the regression, which would have inverted the score.
+- Checks out just before the fix **merged** (not before the winning proposal was posted).
+  Pre-merge commits are ~180 package-lock lines from HEAD so they share `node_modules`;
+  the proposal cutoff can be weeks earlier and 13k lines away.
+- Hides hindsight separately via `verify.py --as-of <cutoff>`, which drops every comment
+  from the winning proposal onward.
+- `--reuse-steps` skips the discovery stage (20–46 min, $3.50–18) on a retry.
+- Waits for a real HTTP 200 from the dev server before driving the browser — the port
+  opens before rsbuild finishes compiling.
+
+### Operational constraints learned the hard way
+
+- **Anthropic session limits kill a run mid-flight** and are NOT retryable (unlike the
+  safety classifier, which is — `SafeguardFlagged` retries 3×). A full run needs a long
+  discovery stage plus five more model calls, so any scheduler must back off and resume
+  rather than mark the issue failed.
+- Cost per complete run: **$9–26**, dominated by discovery.
+- Isolation (`SNIPER_ISOLATE=1`) is for backtests only. Production runs un-isolated so
+  the child sees `CLAUDE.md` and the repo skills. Every number above the "Measurements"
+  heading was taken WITH isolation on and on the CLI's default model — they are floors.
+  `SNIPER_MODEL` now pins the model explicitly.
 
 ## Measurements (do not re-derive)
 
@@ -307,6 +360,36 @@ Conclusion: MelvinBot is a lead, not a seed. Static analysis alone is ~1-in-4.
 - cron/systemd scheduling on OCI for `verify.py` (the bounty tracker `hunt.py`
   is already scheduled: `deploy/install-hunt-cron.sh`, every 3 hours)
 - `AUTO_POST` default is `1` in config but nothing posts yet
+
+## claude-omni (routing generator calls through OmniRoute)
+
+`~/.local/bin/claude-omni` is Claude Code pointed at a local OmniRoute
+(`http://127.0.0.1:20128`, which serves `/v1/messages` in Anthropic format). Plain
+`claude` is untouched — the wrapper sets `ANTHROPIC_BASE_URL` only for the process it
+execs, uses its own `CLAUDE_CONFIG_DIR` (`~/.claude-omni`), and **unsets
+`CLAUDE_CODE_OAUTH_TOKEN`** (otherwise that wins and traffic quietly goes to Anthropic
+anyway, which looks like success while defeating the point).
+
+**The trap it guards:** on 2026-08-08, `auto/claude-opus` returned HTTP 200 with a
+well-formed reply served by `gemini-3.1-flash-lite`; `auto/claude-sonnet` served
+`gemini-2.5-flash`. No Anthropic provider was reachable (kilocode 401, cursor 400,
+openrouter 403). For work whose value IS analysis quality, that downgrade is invisible —
+it shows up as worse proposals, never as an error. The wrapper therefore probes first,
+prints `requested X -> served by Y`, and refuses a Claude→non-Claude substitution unless
+`OMNI_ALLOW_DOWNGRADE=1`.
+
+The operator reports having fixed provider auth on 2026-08-09. **Re-probe rather than
+assuming either state**, and never trust an `auto/*` alias to honour the vendor in its
+name — check the `model` field of the response.
+
+Two things to settle before routing the pipeline through it:
+
+1. **OmniRoute runs on the LOCAL machine; the sniper runs on OCI.** OCI cannot reach
+   `127.0.0.1:20128` without a reverse SSH tunnel or its own OmniRoute install.
+2. **Change one variable at a time.** Every measurement in this document was taken on
+   Claude. Swapping the model _and_ the harness together makes any quality change
+   unattributable. Get a ground-truth number on Claude first, then re-run the same issue
+   through `claude-omni` and compare directly.
 
 ## Running things
 

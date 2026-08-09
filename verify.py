@@ -400,6 +400,9 @@ comparison is the entire evidence. So they must be RE-RUNNABLE:
 - Anything you create must be unique per run. Write `{{{{RUNID}}}}` inside any name or
   email you invent and it is replaced with a different short string on each pass —
   e.g. `qa{{{{RUNID}}}}@example.com`. Use it every time, not once.
+- NEVER put `{{{{RUNID}}}}` in an `as_user` name. User names are identities and must stay
+  stable ("a", "b", "c"); a fresh name forces a brand-new account signup, which is slow
+  and can time out. RUNID belongs in DATA you type, not in who you are logged in as.
 - Assume the app may already contain whatever a previous pass created.
 {traps()}
 STEP FORMAT — the replayer understands exactly these verbs:
@@ -434,6 +437,17 @@ def stage_refute(num, ctx, implement_summary, before_md, run_dir):
 
 Someone has proposed the following root cause for this bug. Your job is to REFUTE it.
 Assume it is wrong and go looking for the proof. You are not being asked to be fair.
+
+NOTE ON THE WORKING TREE: the proposed fix has been deliberately REVERTED before you
+were asked, so you judge the claim against the code as it actually ships. Its absence
+from `git status` or `git diff` is expected and is NOT evidence against the proposal —
+do not spend any of your argument on it.
+
+Attack the DIAGNOSIS and the REPRODUCTION, in that order of value. Both refutations so
+far succeeded by invalidating the reproduction rather than the theory: one asserted the
+very thing a checked-in spec defines as correct, and one clicked a different element
+than the issue describes and then attributed the result to the element it never touched.
+Check that the repro actually exercised the thing being blamed.
 
 ## Proposed root cause
 {implement_summary[:6000]}
@@ -669,6 +683,9 @@ def main():
                     help="leave the fix applied in the working tree")
     ap.add_argument("--static-steps", action="store_true",
                     help="generate steps from source only, without driving a live browser")
+    ap.add_argument("--reuse-steps", action="store_true",
+                    help="reuse a previously discovered repro-steps.json instead of "
+                         "re-running discovery (that stage costs ~45min and several $)")
     ap.add_argument("--as-of", default=None,
                     help="ISO timestamp; hide every comment posted at or after it "
                          "(ground-truth backtests, so the winning proposal stays hidden)")
@@ -691,9 +708,14 @@ def main():
     (run_dir / "context.md").write_text(ctx, encoding="utf-8")
 
     try:
-        print("\n[1/6] discovering repro steps in a live browser")
-        discover = stage_repro_steps if args.static_steps else stage_discover_steps
-        steps, c = discover(num, ctx, run_dir); totals["cost"] += c or 0
+        cached_steps = run_dir / "repro-steps.json"
+        if args.reuse_steps and cached_steps.exists():
+            steps = json.loads(cached_steps.read_text())
+            print(f"\n[1/6] reusing {len(steps)} previously discovered steps")
+        else:
+            print("\n[1/6] discovering repro steps in a live browser")
+            discover = stage_repro_steps if args.static_steps else stage_discover_steps
+            steps, c = discover(num, ctx, run_dir); totals["cost"] += c or 0
 
         print("\n[2/6] reproducing on local dev server")
         before, before_dir = run_repro(num, materialise(steps, f"b{run_id}"), "before")
