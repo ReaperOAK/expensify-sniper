@@ -24,7 +24,10 @@ def free_reject(
     floor: int | None = None,
     trusted: bool = False,
 ) -> str | None:
-    """Reason to drop this candidate, from the search payload alone. None = keep."""
+    """Reason to drop this candidate, from the search payload alone. None = keep.
+
+    Sources listed in config.ASSIGNEE_NOT_A_CLAIM are exempt from the assignee rule.
+    """
     # Normalise the override too, not just config's. The contract is
     # case-insensitive matching, and a caller passing {"Paid Out"} would
     # otherwise silently match nothing.
@@ -34,7 +37,11 @@ def free_reject(
 
     if cand.state != "open":
         return "closed"
-    if cand.has_assignee:
+    # An assignee is a claim on most sources and pure noise on Expensify, which
+    # assigns an internal engineer at posting time. See config.ASSIGNEE_NOT_A_CLAIM.
+    # Those sources are judged by stage 3's claim test instead, which is the
+    # sharper question everywhere: is an assignee also the author of an open PR?
+    if cand.has_assignee and cand.source not in config.ASSIGNEE_NOT_A_CLAIM:
         return "assigned"
     if any(label.strip().lower() in paid for label in cand.labels):
         return "already rewarded"

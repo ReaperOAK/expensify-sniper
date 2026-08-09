@@ -42,8 +42,8 @@ def _run(conn, *, sources, now=NOW, dry_run=True, notify_when_empty=True):
 
 
 def _cand(number, *, labels=None, assignee=None, state="open", comments=0,
-          repo="acme/widgets"):
-    return Candidate.from_search_item("github-labels", {
+          repo="acme/widgets", source="github-labels"):
+    return Candidate.from_search_item(source, {
         "number": number, "title": f"issue {number}", "state": state,
         "comments": comments, "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-08-01T00:00:00Z",
@@ -460,3 +460,30 @@ def test_an_untrusted_repo_with_tiers_is_still_treated_as_spam(tmp_path, fake_ge
     row = conn.execute("SELECT rejected FROM candidates WHERE number=1").fetchone()
     assert row["rejected"] == "multiple amount labels"
     assert fake_get.calls == []
+
+
+def test_an_assigned_expensify_issue_reaches_stage_three(tmp_path, fake_get):
+    # The exemption is not a free pass -- it moves the question from "is anyone
+    # assigned" to "is an assignee also writing the PR", which is the sharper
+    # test. This candidate is assigned and survives, because nobody has a PR.
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [
+        _cand(1, source="expensify", assignee={"login": "stitesExpensify"})])],
+        dry_run=True)
+    assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] is None
+
+
+def test_an_assignee_who_opened_the_pr_is_a_claim(tmp_path, fake_get):
+    # Expensify's actual award: a C+ picks a proposal, its author is assigned,
+    # and that author opens the PR. That pair is the claim -- and it is the same
+    # pair on Algora, where the winner is whoever merges.
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("daledah")])
+    _run(conn, sources=[FakeSource("s", [
+        _cand(1, source="expensify", assignee={"login": "daledah"})])],
+        dry_run=True)
+    row = conn.execute("SELECT rejected FROM candidates").fetchone()
+    assert row["rejected"] == "claimed by assignee @daledah"

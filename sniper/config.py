@@ -228,6 +228,23 @@ HUNT_ENABLED_SOURCES = [
     if name.strip()
 ]
 
+# Sources where an assignee tells us nothing about whether the work is taken.
+#
+# Expensify assigns an internal engineer the moment a job is posted, and a
+# Contributor+ when one volunteers. Verified 2026-08-09: #97949 was open and
+# accepting proposals, labelled External/Daily/Help Wanted, assigned to
+# stitesExpensify. The blanket assignee reject therefore dropped 100% of
+# Expensify candidates at stage 1 -- the whole $250 channel, silently.
+#
+# Whether such a job has actually been awarded is answered in stage 3 instead:
+# once a C+ picks a proposal, its author is assigned AND opens the PR, which is
+# exactly what github_api.linked_pr_state calls a claim.
+ASSIGNEE_NOT_A_CLAIM = frozenset(
+    name.strip()
+    for name in os.environ.get("ASSIGNEE_NOT_A_CLAIM", "expensify").split(",")
+    if name.strip()
+)
+
 
 def is_proposal(body: str | None) -> bool:
     """Exact reimplementation of getIsProposal() from proposalPoliceComment.ts:38."""

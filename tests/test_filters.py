@@ -16,7 +16,7 @@ from sniper.models import Candidate
 from tests.conftest import load_fixture
 
 
-def _cand(**over):
+def _cand(source="github-labels", **over):
     base = {
         "number": 7, "title": "t", "state": "open", "comments": 1,
         "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-08-01T00:00:00Z",
@@ -24,7 +24,7 @@ def _cand(**over):
         "assignee": None, "labels": [{"name": "$780"}],
     }
     base.update(over)
-    return Candidate.from_search_item("github-labels", base)
+    return Candidate.from_search_item(source, base)
 
 
 def test_a_clean_candidate_is_kept():
@@ -131,3 +131,28 @@ def test_regression_the_fork_would_also_be_rejected_at_the_repo_stage():
     cand = Candidate.from_search_item("github-labels", items[0]).with_repo_detail(
         load_fixture("repo_fork"))
     assert filters.repo_reject(cand) == "fork"
+
+
+def test_an_assigned_expensify_issue_is_not_rejected():
+    # Verified 2026-08-09 against the live API: #97949 is open and accepting
+    # proposals, labelled External/Daily/Help Wanted, assigned to
+    # stitesExpensify. Expensify assigns an internal engineer when the job is
+    # posted and a C+ when one volunteers; neither is a contributor taking the
+    # work. Rejecting on it darkened the entire $250 channel, silently, because
+    # a rejected candidate looks exactly like one that was never posted.
+    cand = _cand("expensify", assignee={"login": "stitesExpensify"})
+    assert filters.free_reject(cand) is None
+
+
+def test_an_assigned_issue_on_every_other_source_is_still_rejected():
+    assert filters.free_reject(
+        _cand("github-labels", assignee={"login": "x"})) == "assigned"
+
+
+def test_the_expensify_exemption_is_only_about_assignment():
+    # It says nothing about closed, rewarded or cheap.
+    assert filters.free_reject(
+        _cand("expensify", assignee={"login": "x"}, state="closed")) == "closed"
+    assert filters.free_reject(
+        _cand("expensify", assignee={"login": "x"},
+              labels=[{"name": "$780"}, {"name": "💰 Rewarded"}])) == "already rewarded"
