@@ -77,6 +77,36 @@ verification.
 - **The refute stage runs on a reverted tree** so it judges the claim against shipping
   code rather than being persuaded by a diff that already assumes the claim.
 
+## OPEN ITEMS for whoever picks this up next
+
+**1. `has_open_linked_pr()` is WRONG for Expensify, and it is silently costing bounties.**
+
+`hunt.py` stage 3 rejects any candidate with an open cross-referenced PR. On Algora repos
+that is correct -- the PR *is* the claim. On Expensify it is not: selection happens by
+**proposal**, a C+ picks one, and only then is that person assigned and writes the PR.
+Plenty of people now run AI agents that auto-raise PRs on Help Wanted issues. Those PRs are
+noise. Rejecting on them discards still-winnable $250 bounties as "taken", in the
+highest-value channel available, without saying so.
+
+Fix: make the filter source-aware -- skip it for `source == "expensify"`, or demote it to a
+displayed signal rather than a reject. NOT DONE as of 2026-08-09.
+
+**2. Rotate the GitHub PAT.** A failing pytest traceback printed it on 2026-08-08. Not in
+git, not in any repo file, but present in three `.jsonl` transcripts under
+`~/.claude/projects/`. Recurrence is prevented (`tests/conftest.py` seeds a dummy token
+before `sniper.config` loads; `tests/test_token_guard.py` pins it) but the exposure stands.
+Update `.env` on BOTH hosts.
+
+**3. Nothing has survived to a notification yet.** Every link is proven end to end -- real
+label events discovered, real filters applied, real enrichment, Discord HTTP 204 -- but no
+candidate has passed every filter, because as of 2026-08-09 every live bounty at a proven
+payer already had an open linked PR. That is a true finding, not a broken pipeline. Judge
+liveness by `watch.log` growing on the box, never by Discord silence.
+
+**4. If it stays quiet, widen rather than loosen.** The payer roster is capped at the 43
+most-recent payers; there are ~3,100 rewarded issues of history to mine. Dropping the $50
+floor is also reasonable -- a real $50 from a proven payer beats a fake $9,000.
+
 ## Bounty tracker (`hunt.py`)
 
 Expensify is now one `Source` among several. `hunt.py` discovers open unclaimed
