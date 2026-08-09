@@ -194,11 +194,19 @@ def run(
     for cand in survivors:
         # The guard matters: without it every candidate costs a search unit,
         # and payout_reject would abstain on nearly all of them anyway (below
-        # threshold, or already on the payer roster). ever_closed_with caches
-        # per (repo, label), so repeated candidates in one repo cost one call.
+        # threshold, already on the payer roster, or -- this one bit us --
+        # roster fetch FAILED). An empty payer_repos means known_payers could
+        # not look, not that nobody pays, and payout_reject's very first check
+        # abstains on that unconditionally; asking closed_for anyway would
+        # spend search units on an answer already guaranteed to be thrown
+        # away. Worse than wasted: reserve_or_wait blocks for up to
+        # BUDGET_WAIT_S once the pool is spent, and the roster fetch usually
+        # fails from that same rate pressure, so this would stall the run for
+        # minutes buying nothing. ever_closed_with caches per (repo, label),
+        # so repeated candidates in one repo cost one call.
         label = payers.bounty_label_of(cand.labels)
         closed = (closed_for(cand.repo, label)
-                  if label and cand.repo not in payer_repos
+                  if label and payer_repos and cand.repo not in payer_repos
                   and open_here[cand.repo] >= config.UNPAID_REPO_THRESHOLD
                   else None)
         reason = payers.payout_reject(

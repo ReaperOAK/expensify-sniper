@@ -165,16 +165,21 @@ def bounty_label_of(labels: tuple[str, ...]) -> str | None:
     None means the candidate carries nothing marking it as a bounty at all, and
     the caller must abstain: a repo's silence about a label it does not use says
     nothing about whether it pays.
+
+    Every branch returns the STRIPPED label, not the raw one: the return value
+    flows straight into `ever_closed_with`'s query as `label:"{label}"`, where
+    incidental leading/trailing whitespace would silently fail to match a real
+    closed issue.
     """
     for label in labels:
         if label.strip() == ALGORA_LABEL:
-            return label
+            return label.strip()
     for label in labels:
         if "bounty" in label.lower():
-            return label
+            return label.strip()
     for label in labels:
         if parse_amount_label(label) is not None:
-            return label
+            return label.strip()
     return None
 
 

@@ -51,7 +51,7 @@ def test_a_repo_with_no_bounty_ish_label_is_never_touched():
     this as a bounty at all", and that is what this now tests: a repo's silence
     about a label it does not use says nothing about whether it pays.
     """
-    assert payers.payout_reject("commaai/opendbc", NO_BOUNTY_LABEL, 20,
+    assert payers.payout_reject("some/other-repo", NO_BOUNTY_LABEL, 20,
                                 {"activepieces/activepieces"},
                                 closed_count=0) is None
 
@@ -194,6 +194,12 @@ def test_rejects_a_farm_using_its_own_label():
 
 
 def test_keeps_a_repo_that_has_closed_even_one():
+    """commaai/opendbc grounds this: no Algora label anywhere, yet it has
+    closed seven bounties including a $4,000 port. It would never appear in
+    Algora's rewarded roster and, on labels alone, looks identical to a farm
+    -- but closed_count > 0 is direct evidence a real programme is running,
+    so it is never touched.
+    """
     assert payers.payout_reject("new/project", ("Bounty",), 30, {"real/payer"},
                                 closed_count=1) is None
 

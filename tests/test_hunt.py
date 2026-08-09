@@ -429,6 +429,36 @@ def test_closed_for_is_asked_only_about_qualifying_repos_and_cached_by_label(tmp
     assert calls == [("farm/repo", "$780")]  # asked about once, not 12 times
 
 
+def test_an_empty_roster_never_reaches_closed_for(tmp_path, fake_get, monkeypatch):
+    """An empty payer_repos means known_payers COULD NOT LOOK, not that nobody
+    pays -- payout_reject's very first check abstains on that unconditionally.
+
+    The stage-1 guard has to check the roster BEFORE calling closed_for, not
+    just "off the roster" (which is vacuously true for every repo when the
+    roster is empty). Missing that check spent a search unit on every
+    qualifying candidate for an answer already guaranteed to be discarded --
+    and worse than merely wasted, because once the 30/min pool is spent,
+    reserve_or_wait blocks for up to config.BUDGET_WAIT_S waiting for the next
+    window, and the roster fetch usually fails from that same rate pressure.
+    So a run could stall for minutes buying answers nobody was going to use.
+    """
+    from sniper import payers as payers_mod
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        payers_mod, "ever_closed_with",
+        lambda conn, repo, label, **kw: calls.append((repo, label)) or 0)
+
+    conn = _conn(tmp_path, payers=())  # empty roster: the lookup "failed"
+    # 12 candidates, one repo, over UNPAID_REPO_THRESHOLD(10), carrying a
+    # bounty-ish label ($780 matches via bounty_label_of's amount fallback) --
+    # exactly the shape that WOULD reach closed_for if the roster were populated.
+    source = FakeSource("s", [_cand(n) for n in range(12)])
+    _run(conn, sources=[source], dry_run=True)
+
+    assert calls == []
+
+
 def test_a_quiet_watch_sweep_says_nothing(tmp_path, fake_get, monkeypatch, capsys):
     """The watch runs every ten minutes: 144 'nothing new' messages a day.
 
