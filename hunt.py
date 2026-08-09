@@ -142,6 +142,9 @@ def run(
     # Stage 0 of the rejects -- the operator's own verdicts. These outrank every
     # automated signal: a human followed a link and saw something metadata cannot.
     dismissed = store.dismissed_reasons(conn)
+    # Retroactive, not just prospective: an operator dismisses an issue because
+    # they just read it in a digest, so it is already stored and already live.
+    store.apply_dismissals(conn)
 
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []

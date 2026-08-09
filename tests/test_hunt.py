@@ -289,3 +289,23 @@ def test_a_dismissal_can_be_reversed(tmp_path, fake_get):
     fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
     fake_get.queue(200, [])
     assert "acme/widgets#1" in _run(conn, sources=[FakeSource("s", [_cand(1)])])
+
+
+def test_dismissing_removes_an_issue_that_was_already_stored(tmp_path, fake_get):
+    """An operator dismisses what they just READ, so it is already in the table.
+
+    Applying dismissals only to fresh discoveries would leave it live until
+    GitHub happened to touch the issue again -- for a months-old bounty, never.
+    """
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    first = _run(conn, sources=[FakeSource("s", [_cand(1)])])
+    assert "acme/widgets#1" in first
+
+    store.dismiss(conn, "acme/widgets", 1, "link is a rickroll")
+    assert store.live_candidates(conn, limit=10) != []   # still live until applied
+    assert store.apply_dismissals(conn) == 1
+    assert store.live_candidates(conn, limit=10) == []
+    row = conn.execute("SELECT rejected FROM candidates WHERE number = 1").fetchone()
+    assert "rickroll" in row["rejected"]

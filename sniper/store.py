@@ -432,3 +432,28 @@ def dismissed_reasons(conn: sqlite3.Connection) -> dict[tuple[str, int], str | N
     """Every dismissal, keyed (repo, number). Read once per run, not per candidate."""
     return {(row["repo"], row["number"]): row["reason"]
             for row in conn.execute("SELECT repo, number, reason FROM dismissed")}
+
+
+def apply_dismissals(conn: sqlite3.Connection) -> int:
+    """Mark already-stored candidates rejected if they are on the dismiss list.
+
+    Dismissing only future discoveries is useless: an operator dismisses an issue
+    precisely because they just read it in a digest, and it is already stored. It
+    would then survive in `live_candidates` until GitHub happened to touch it
+    again -- which for a months-old bounty could be never.
+
+    Returns how many rows this changed.
+    """
+    cur = conn.execute(
+        """
+        UPDATE candidates SET rejected = 'dismissed by operator' ||
+            COALESCE(': ' || (SELECT reason FROM dismissed d
+                              WHERE d.repo = candidates.repo
+                                AND d.number = candidates.number), '')
+        WHERE rejected IS NULL
+          AND EXISTS (SELECT 1 FROM dismissed d
+                      WHERE d.repo = candidates.repo AND d.number = candidates.number)
+        """
+    )
+    conn.commit()
+    return cur.rowcount
