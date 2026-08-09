@@ -218,6 +218,18 @@ class Candidate:
             language=payload.get("language"),
         )
 
+    def with_conservative_amount(self) -> Candidate:
+        """Price a tiered bounty at its LOWEST tier.
+
+        A repo offering $50/$250/$500 is quoting scopes, not one prize, and which
+        tier the work lands in is unknowable from metadata. Ranking it at $500
+        would flatter it above single-price bounties that are certain; the low
+        tier is the only figure the operator is actually promised.
+        """
+        if self.amount_usd is not None or not self.amounts_seen:
+            return self
+        return replace(self, amount_usd=min(self.amounts_seen))
+
     def with_score(self, value: float) -> Candidate:
         return replace(self, score=value)
 

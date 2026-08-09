@@ -72,7 +72,10 @@ FORK = {"fork": True, "archived": False, "stargazers_count": 0,
 
 
 def test_free_rejects_run_before_any_enrichment_call(tmp_path, fake_get):
-    conn = _conn(tmp_path)
+    # payers=() -> acme/widgets is NOT a proven payer, so the multi-amount rule
+    # still fires. On a repo that HAS paid, three $-labels mean tiers and the
+    # candidate is kept (see test_a_proven_payer_may_offer_tiered_amounts).
+    conn = _conn(tmp_path, payers=("someone/else",))
     source = FakeSource("s", [
         _cand(1, assignee={"login": "x"}),
         _cand(2, state="closed"),
@@ -380,3 +383,32 @@ def test_a_quiet_sweep_with_a_WARNING_still_speaks(tmp_path, fake_get, monkeypat
          now=NOW + 600, dry_run=False, notify_when_empty=False)
     assert len(sent) == 1
     assert "⚠" in sent[0]
+
+
+def test_a_proven_payer_may_offer_tiered_amounts(tmp_path, fake_get):
+    """go-gitea/gitea#1872 carries $250, $50 and $500 and is a real bounty.
+
+    The spam rule was built for a farm issue carrying three prices at once. It
+    cannot tell that from tiers, so payout history decides -- and getting it
+    wrong hid a live bounty at a proven payer. Priced at the LOWEST tier: which
+    scope the work lands in is unknowable, and the low tier is the only figure
+    the operator is actually promised.
+    """
+    conn = _conn(tmp_path, payers=("acme/widgets",))
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    tiered = _cand(1, labels=[{"name": "$250"}, {"name": "$50"}, {"name": "$500"}])
+    assert tiered.amount_usd is None and tiered.amounts_seen == (50, 250, 500)
+    _run(conn, sources=[FakeSource("s", [tiered])])
+    row = conn.execute("SELECT amount_usd, rejected FROM candidates WHERE number=1").fetchone()
+    assert row["rejected"] is None
+    assert row["amount_usd"] == 50
+
+
+def test_an_untrusted_repo_with_tiers_is_still_treated_as_spam(tmp_path, fake_get):
+    conn = _conn(tmp_path, payers=("someone/else",))
+    tiered = _cand(1, labels=[{"name": "$250"}, {"name": "$50"}, {"name": "$500"}])
+    _run(conn, sources=[FakeSource("s", [tiered])])
+    row = conn.execute("SELECT rejected FROM candidates WHERE number=1").fetchone()
+    assert row["rejected"] == "multiple amount labels"
+    assert fake_get.calls == []

@@ -149,6 +149,14 @@ def run(
     # they just read it in a digest, so it is already stored and already live.
     store.apply_dismissals(conn)
 
+    # Payout history first: one cached search for the whole run, and stage 1 needs
+    # it. Whether three $-labels mean a spam farm or a tiered bounty is not
+    # decidable from the labels -- only from whether the repo has ever paid.
+    payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
+    warnings.extend(payer_warnings)
+    store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
+                                  payers.ALGORA_LABEL)
+
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []
     for cand in discovered:
@@ -158,22 +166,14 @@ def run(
                 conn, cand, now=stamp,
                 rejected=f"dismissed by operator{': ' + note if note else ''}")
             continue
-        reason = filters.free_reject(cand)
+        trusted = cand.repo in payer_repos
+        reason = filters.free_reject(cand, trusted=trusted)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:
-            survivors.append(cand)
+            survivors.append(cand.with_conservative_amount() if trusted else cand)
 
-    # Stage 1b -- payout history. One cached search for the whole run, so it
-    # belongs with the cheap rejects rather than with enrichment. This is the
-    # difference between ranking a $917,000 farm first and ranking it not at all.
-    payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
-    warnings.extend(payer_warnings)
-    # Retroactive, like dismissals: a filter that ships later has to reach the
-    # rows already stored, or the digest keeps recommending what it now knows to
-    # be a farm until GitHub happens to touch each issue again.
-    store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
-                                  payers.ALGORA_LABEL)
+
     open_here: dict[str, int] = {}
     for cand in survivors:
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
