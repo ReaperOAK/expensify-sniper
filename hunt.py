@@ -323,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.watch:
-        names = [PayerWatchSource.name]
+        names = config.WATCH_SOURCES
     else:
         names = (args.sources.split(",") if args.sources
                  else config.HUNT_ENABLED_SOURCES)

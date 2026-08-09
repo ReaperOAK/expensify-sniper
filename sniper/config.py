@@ -174,6 +174,18 @@ WATCH_MAX_REPOS = int(os.environ.get("WATCH_MAX_REPOS", "60"))
 # for every payer measured.
 WATCH_EVERY_MINUTES = int(os.environ.get("WATCH_EVERY_MINUTES", "10"))
 
+# Which sources the fast sweep runs. Expensify belongs here, not in the 3-hourly
+# digest: it is the best-proven payer available (6,264 closed Help Wanted at a
+# flat $250) and its issues are claimed fast -- 86 open, ZERO unassigned,
+# measured 2026-08-09. Its 100-event page spanned 5h18m that day, so a 3-hourly
+# poll carried only 1.8x margin against a busy spell while a 10-minute one
+# carries 32x. The original sniper polled it every 20 SECONDS for this reason.
+WATCH_SOURCES = [
+    name.strip()
+    for name in os.environ.get("WATCH_SOURCES", "payer-watch,expensify").split(",")
+    if name.strip()
+]
+
 # Two quota classes, shared with the Expensify watcher through one token. The
 # budget guard in store.py refuses to start a run it cannot finish rather than
 # reporting an empty world -- a throttled search is indistinguishable from "no
