@@ -457,3 +457,43 @@ def apply_dismissals(conn: sqlite3.Connection) -> int:
     )
     conn.commit()
     return cur.rowcount
+
+
+def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
+                            threshold: int, algora_label: str) -> int:
+    """Re-judge STORED candidates against the payout roster. Returns rows changed.
+
+    Filters that arrive later must reach the rows already in the table, for the
+    same reason dismissals do. When the payout filter shipped, every candidate
+    discovered before it stayed live -- so the digest kept recommending a repo
+    with 201 open bounties and zero payouts until GitHub happened to touch each
+    issue again.
+
+    Uses only stored columns (`labels` is kept as JSON precisely so a judgement
+    can be revisited), so this costs no API call.
+    """
+    if not payers:
+        return 0  # roster unavailable: abstain, exactly as payout_reject does
+
+    counts = {row["repo"]: row["n"] for row in conn.execute(
+        "SELECT repo, COUNT(*) AS n FROM candidates WHERE rejected IS NULL GROUP BY repo")}
+    changed = 0
+    rows = conn.execute(
+        "SELECT repo, number, labels FROM candidates WHERE rejected IS NULL").fetchall()
+    for row in rows:
+        repo = row["repo"]
+        if repo in payers or counts.get(repo, 0) < threshold:
+            continue
+        try:
+            labels = json.loads(row["labels"])
+        except (ValueError, TypeError):
+            continue
+        if not any(str(name).strip() == algora_label for name in labels):
+            continue
+        conn.execute(
+            "UPDATE candidates SET rejected = ? WHERE repo = ? AND number = ?",
+            (f"no payout history ({counts[repo]} open Algora bounties here, "
+             f"0 ever rewarded)", repo, row["number"]))
+        changed += 1
+    conn.commit()
+    return changed

@@ -168,6 +168,11 @@ def run(
     # difference between ranking a $917,000 farm first and ranking it not at all.
     payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
     warnings.extend(payer_warnings)
+    # Retroactive, like dismissals: a filter that ships later has to reach the
+    # rows already stored, or the digest keeps recommending what it now knows to
+    # be a farm until GitHub happens to touch each issue again.
+    store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
+                                  payers.ALGORA_LABEL)
     open_here: dict[str, int] = {}
     for cand in survivors:
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1

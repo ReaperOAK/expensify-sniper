@@ -309,3 +309,33 @@ def test_dismissing_removes_an_issue_that_was_already_stored(tmp_path, fake_get)
     assert store.live_candidates(conn, limit=10) == []
     row = conn.execute("SELECT rejected FROM candidates WHERE number = 1").fetchone()
     assert "rickroll" in row["rejected"]
+
+
+def test_the_payout_filter_reaches_candidates_stored_before_it_existed(tmp_path):
+    """A filter that ships later must re-judge what is already in the table.
+
+    Otherwise the digest keeps recommending a repo it now knows has 201 open
+    bounties and zero payouts, until GitHub happens to touch each issue again --
+    which for a months-old bounty may be never.
+    """
+    from sniper import payers as payers_mod
+
+    conn = store.connect(tmp_path / "t.sqlite")
+    for n in range(12):
+        store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
+    assert len(store.live_candidates(conn, limit=50)) == 12
+
+    changed = store.apply_payout_rejections(
+        conn, {"someone/else"}, 10, "$780")  # _cand carries a $780 label
+    assert changed == 12
+    assert store.live_candidates(conn, limit=50) == []
+    row = conn.execute("SELECT rejected FROM candidates WHERE number = 0").fetchone()
+    assert "0 ever rewarded" in row["rejected"]
+
+
+def test_reconciliation_abstains_when_the_roster_is_unavailable(tmp_path):
+    conn = store.connect(tmp_path / "t.sqlite")
+    for n in range(12):
+        store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
+    assert store.apply_payout_rejections(conn, set(), 10, "$780") == 0
+    assert len(store.live_candidates(conn, limit=50)) == 12
