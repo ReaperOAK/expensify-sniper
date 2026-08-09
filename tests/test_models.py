@@ -265,3 +265,19 @@ def test_open_pr_count_starts_unknown_and_is_set_explicitly():
     assert cand.open_pr_count is None
     assert cand.with_linked_prs(2).open_pr_count == 2
     assert cand.with_linked_prs(0).open_pr_count == 0
+
+
+def test_repo_detail_captures_the_repos_own_age_and_backlog():
+    # Both arrive in the SAME payload the enrichment already fetches, so this
+    # costs nothing. repo_created_at is the REPOSITORY's birthday -- created_at
+    # on the Candidate is the issue's, and conflating them would rate a
+    # month-old farm as a decade-old project.
+    payload = {"fork": False, "archived": False, "stargazers_count": 5,
+               "pushed_at": "2026-08-09T00:00:00Z", "language": "Python",
+               "created_at": "2026-07-08T15:34:56Z", "open_issues": 526}
+    cand = Candidate.from_issue("github-labels", "farm/repo",
+                                {"number": 1, "title": "t", "labels": []})
+    enriched = cand.with_repo_detail(payload)
+    assert enriched.repo_created_at == "2026-07-08T15:34:56Z"
+    assert enriched.repo_open_issues == 526
+    assert enriched.created_at != enriched.repo_created_at

@@ -160,6 +160,8 @@ class Candidate:
     pushed_at: str | None = None
     fork: bool | None = None
     archived: bool | None = None
+    repo_created_at: str | None = None
+    repo_open_issues: int | None = None
     score: float | None = None
 
     @property
@@ -235,6 +237,8 @@ class Candidate:
             stars=payload.get("stargazers_count"),
             pushed_at=payload.get("pushed_at"),
             language=payload.get("language"),
+            repo_created_at=payload.get("created_at"),
+            repo_open_issues=payload.get("open_issues"),
         )
 
     def with_conservative_amount(self) -> Candidate:

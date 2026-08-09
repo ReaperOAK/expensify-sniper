@@ -45,16 +45,21 @@ def test_health_is_the_product_of_both_factors():
     assert scoring.repo_health(10_000, _at(0), now=NOW) == pytest.approx(1.0)
 
 
-def _cand(*, amount_label="$1000", comments=0, stars=1000, pushed_days=1):
+def _cand(*, amount_label="$1000", comments=0, stars=1000, pushed_days=1,
+          repo_age_days=None, repo_open_issues=None):
     payload = {
         "number": 7, "title": "t", "state": "open", "comments": comments,
         "created_at": _at(400), "updated_at": _at(1), "html_url": "u",
         "repository_url": "https://api.github.com/repos/acme/widgets",
         "assignee": None, "labels": [{"name": amount_label}],
     }
-    return Candidate.from_search_item("github-labels", payload).with_repo_detail(
-        {"fork": False, "archived": False, "stargazers_count": stars,
-         "pushed_at": _at(pushed_days), "language": "Python"})
+    detail = {"fork": False, "archived": False, "stargazers_count": stars,
+              "pushed_at": _at(pushed_days), "language": "Python"}
+    if repo_age_days is not None:
+        detail["created_at"] = _at(repo_age_days)
+    if repo_open_issues is not None:
+        detail["open_issues"] = repo_open_issues
+    return Candidate.from_search_item("github-labels", payload).with_repo_detail(detail)
 
 
 def test_score_is_amount_over_one_plus_comments_times_health():
@@ -123,3 +128,44 @@ def test_an_unchecked_candidate_scores_as_if_uncontested():
     base = _cand(amount_label="$1000", comments=0)
     assert base.open_pr_count is None
     assert scoring.score(base, now=NOW) == pytest.approx(1000.0)
+
+
+# The measured shape of zhangjiayang6835-cyber/bounty-plaza on 2026-08-09:
+# created 2026-07-08 (32 days), 5 stars, 526 open issues, 0 bounties ever
+# closed. It held three of the top four digest slots.
+def test_all_three_farm_signals_sink_the_score_hard():
+    cand = _cand(stars=5, repo_age_days=32, repo_open_issues=526)
+    assert scoring.farm_penalty(cand, now=NOW) == pytest.approx(0.25)
+
+
+def test_two_signals_sink_it_gently():
+    cand = _cand(stars=5, repo_age_days=2000, repo_open_issues=526)
+    assert scoring.farm_penalty(cand, now=NOW) == pytest.approx(0.6)
+
+
+def test_one_signal_is_not_a_farm():
+    cand = _cand(stars=5, repo_age_days=2000, repo_open_issues=12)
+    assert scoring.farm_penalty(cand, now=NOW) == pytest.approx(1.0)
+
+
+def test_a_young_well_starred_project_is_not_a_farm():
+    # A funded launch looks nothing like bounty-plaza and must not be punished
+    # for being new.
+    cand = _cand(stars=4000, repo_age_days=10, repo_open_issues=400)
+    assert scoring.farm_penalty(cand, now=NOW) == pytest.approx(1.0)
+
+
+def test_an_unenriched_repo_takes_no_penalty():
+    # Missing fields mean the detail call never returned them, not that the repo
+    # is clean. Penalising absent data punishes a failed API call, not a farm.
+    cand = _cand(stars=5)
+    assert cand.repo_created_at is None
+    assert scoring.farm_penalty(cand, now=NOW) == pytest.approx(1.0)
+
+
+def test_the_penalty_multiplies_into_the_score():
+    cand = _cand(amount_label="$200", comments=0, stars=5, pushed_days=1,
+                 repo_age_days=32, repo_open_issues=526)
+    # 200 / 1 * repo_health(5 stars, pushed yesterday) * 0.25
+    expected = 200 * scoring.repo_health(5, _at(1), now=NOW) * 0.25
+    assert scoring.score(cand, now=NOW) == pytest.approx(expected)
