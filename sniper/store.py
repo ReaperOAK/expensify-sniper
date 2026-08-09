@@ -1,14 +1,22 @@
-"""SQLite state: which label events we already handled, and how each bid ended.
+"""SQLite state: label events handled, bids placed, bounty candidates ranked,
+and how much of each GitHub quota class has been spent this window.
 
 Replaces the `last_issue_id` single-watermark approach in the old sniper.py, which
 silently dropped any second issue labelled inside the same poll window.
+
+`bids.issue INTEGER PRIMARY KEY` assumes a single repo. `candidates` is keyed on
+(source, repo, number) instead, so a second source cannot collide with it. The
+original three tables are untouched: verify.py's state must keep working.
 """
 
+import json
 import sqlite3
 import time
+from typing import Any
 from pathlib import Path
 
 from . import config
+from .models import Candidate
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_events (
@@ -35,6 +43,37 @@ CREATE TABLE IF NOT EXISTS http_cache (
     etag  TEXT,
     body  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS candidates (
+    source        TEXT    NOT NULL,
+    repo          TEXT    NOT NULL,
+    number        INTEGER NOT NULL,
+    title         TEXT    NOT NULL,
+    url           TEXT    NOT NULL,
+    state         TEXT    NOT NULL,
+    amount_usd    INTEGER,
+    comments      INTEGER NOT NULL,
+    labels        TEXT    NOT NULL,
+    language      TEXT,
+    stars         INTEGER,
+    score         REAL,
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL,
+    first_seen_at REAL    NOT NULL,
+    last_seen_at  REAL    NOT NULL,
+    rejected      TEXT,
+    PRIMARY KEY (source, repo, number)
+);
+
+CREATE INDEX IF NOT EXISTS candidates_live
+    ON candidates (rejected, score DESC);
+
+CREATE TABLE IF NOT EXISTS rate_budget (
+    quota  TEXT    NOT NULL,
+    window INTEGER NOT NULL,
+    spent  INTEGER NOT NULL,
+    PRIMARY KEY (quota, window)
+);
 """
 
 
@@ -45,6 +84,19 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     return conn
+
+
+def event_seen(conn: sqlite3.Connection, event_id: int) -> bool:
+    """Have we already handled this label event? Read-only -- records nothing.
+
+    mark_event_seen() both checks and commits, which is wrong for a caller that
+    might fail after the check: the event would be burnt without ever being
+    processed. This lets a source look first and mark only once the work landed.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM seen_events WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    return row is not None
 
 
 def mark_event_seen(conn: sqlite3.Connection, event_id: int, issue: int, labeled_at: str) -> bool:
@@ -111,3 +163,229 @@ def set_cache(conn: sqlite3.Connection, key: str, etag: str | None, body: str) -
 def stats(conn: sqlite3.Connection) -> dict[str, int]:
     rows = conn.execute("SELECT status, COUNT(*) AS n FROM bids GROUP BY status").fetchall()
     return {row["status"]: row["n"] for row in rows}
+
+
+def upsert_candidate(
+    conn: sqlite3.Connection,
+    cand: Candidate,
+    *,
+    rejected: str | None = None,
+    now: float | None = None,
+) -> bool:
+    """Record a candidate. Returns True if this is the first time we have seen it.
+
+    first_seen_at is preserved on update: it is our own freshness clock, and the
+    only honest one. GitHub's created_at is displayed but never scored, because
+    bounty labels land on issues that already exist.
+
+    A rejected candidate is still written, with its reason. Deleting it would
+    make "filtered out" and "never discovered" look identical on the next run.
+    """
+    stamp = time.time() if now is None else now
+    source, repo, number = cand.key
+    labels = json.dumps(list(cand.labels), ensure_ascii=False)
+
+    # Newness comes from the INSERT itself, not from a preceding SELECT.
+    #
+    # A bare SELECT takes no lock in Python's sqlite3, so a read-then-write pair
+    # lets two processes both conclude "new" for the same key -- measured, 8 of
+    # 10 racing writers did. INSERT OR IGNORE resolves that in one statement:
+    # exactly one writer gets rowcount 1, everyone else gets 0. hunt.py and the
+    # Expensify watcher share this database, so "concurrent" is the normal case,
+    # not a corner one.
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO candidates
+            (source, repo, number, title, url, state, amount_usd, comments, labels,
+             language, stars, score, created_at, updated_at, first_seen_at,
+             last_seen_at, rejected)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (source, repo, number, cand.title, cand.url, cand.state, cand.amount_usd,
+         cand.comments, labels, cand.language, cand.stars, cand.score,
+         cand.created_at, cand.updated_at, stamp, stamp, rejected),
+    )
+    is_new = cur.rowcount > 0
+    if not is_new:
+        # first_seen_at is deliberately absent from the SET list: it is our own
+        # freshness clock and must survive every later sighting.
+        conn.execute(
+            """
+            UPDATE candidates SET
+                title = ?, url = ?, state = ?, amount_usd = ?, comments = ?,
+                labels = ?, language = ?, stars = ?, score = ?, updated_at = ?,
+                last_seen_at = ?, rejected = ?
+            WHERE source = ? AND repo = ? AND number = ?
+            """,
+            (cand.title, cand.url, cand.state, cand.amount_usd, cand.comments,
+             labels, cand.language, cand.stars, cand.score, cand.updated_at,
+             stamp, rejected, source, repo, number),
+        )
+    conn.commit()
+    return is_new
+
+
+def known_updated_at(
+    conn: sqlite3.Connection, source: str, repo: str, number: int
+) -> str | None:
+    """The updated_at we last recorded, or None if this candidate is new to us."""
+    row = conn.execute(
+        "SELECT updated_at FROM candidates WHERE source = ? AND repo = ? AND number = ?",
+        (source, repo, number),
+    ).fetchone()
+    return row["updated_at"] if row else None
+
+
+def candidate_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+
+
+def live_candidates(
+    conn: sqlite3.Connection,
+    limit: int,
+    *,
+    since: float | None = None,
+    max_per_repo: int | None = None,
+    require_amount: bool = False,
+) -> list[sqlite3.Row]:
+    """Unrejected candidates, best first. `since` restricts to newly first-seen ones.
+
+    `max_per_repo` caps how many rows any single repository may occupy. Measured
+    2026-08-09: one repo held 188 live issues totalling $917,000 and took all 25
+    slots in the digest, burying every other repo in the inventory. Whether that
+    repo is generous or a farm is not something metadata can decide -- but a
+    digest that only ever shows one of them is useless either way.
+    """
+    where = "rejected IS NULL" + ("" if since is None else " AND first_seen_at >= ?")
+    if require_amount:
+        # A candidate with no readable amount cannot be ranked by expected value,
+        # which is the digest's entire premise. Measured 2026-08-09: 543 of 748
+        # live candidates had none, and they padded the digest with 700-day-old
+        # issues titled "test" and "tttt" once the real ones ran out. They stay in
+        # the database -- hunt.py says how many were held back -- but they do not
+        # take a slot from something rankable.
+        where += " AND amount_usd IS NOT NULL"
+    params: list[Any] = [] if since is None else [since]
+    order = " ORDER BY score DESC, amount_usd DESC"
+
+    if max_per_repo is None:
+        return conn.execute(
+            f"SELECT * FROM candidates WHERE {where}{order} LIMIT ?", (*params, limit)
+        ).fetchall()
+
+    # Cap in Python rather than SQL: the row counts here are hundreds, and a
+    # window function would need a SQLite version floor this project has not set.
+    kept: list[sqlite3.Row] = []
+    seen_per_repo: dict[str, int] = {}
+    for row in conn.execute(f"SELECT * FROM candidates WHERE {where}{order}", params):
+        count = seen_per_repo.get(row["repo"], 0)
+        if count >= max_per_repo:
+            continue
+        seen_per_repo[row["repo"]] = count + 1
+        kept.append(row)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+# Measured 2026-08-05 against the live API. Search and core are separate pools
+# with separate windows; spending one does not touch the other.
+QUOTA_LIMIT = {"search": config.SEARCH_QUOTA_PER_MIN, "core": config.CORE_QUOTA_PER_HOUR}
+WINDOW_SECONDS = {"search": 60, "core": 3600}
+
+
+def _window(quota: str, now: float | None) -> int:
+    stamp = time.time() if now is None else now
+    return int(stamp // WINDOW_SECONDS[quota])
+
+
+def reserve(
+    conn: sqlite3.Connection, quota: str, n: int = 1, *, now: float | None = None
+) -> bool:
+    """Atomically claim `n` units of `quota` in the current window.
+
+    Returns False and spends nothing if the claim would exceed the limit. The
+    guard lives in SQLite rather than in a process because hunt.py and the
+    Expensify watcher are separate processes sharing one token.
+    """
+    if quota not in QUOTA_LIMIT:
+        raise ValueError(f"unknown quota {quota!r}; known: {sorted(QUOTA_LIMIT)}")
+    window = _window(quota, now)
+    conn.execute(
+        "INSERT OR IGNORE INTO rate_budget (quota, window, spent) VALUES (?, ?, 0)",
+        (quota, window),
+    )
+    cur = conn.execute(
+        "UPDATE rate_budget SET spent = spent + ? "
+        "WHERE quota = ? AND window = ? AND spent + ? <= ?",
+        (n, quota, window, n, QUOTA_LIMIT[quota]),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def spent(conn: sqlite3.Connection, quota: str, *, now: float | None = None) -> int:
+    row = conn.execute(
+        "SELECT spent FROM rate_budget WHERE quota = ? AND window = ?",
+        (quota, _window(quota, now)),
+    ).fetchone()
+    return row["spent"] if row else 0
+
+
+def reserve_or_wait(
+    conn: sqlite3.Connection,
+    quota: str,
+    n: int = 1,
+    *,
+    max_wait_s: float | None = None,
+    clock=None,
+    sleep=time.sleep,
+) -> bool:
+    """Claim `n` units, sleeping to the next window if this one is exhausted.
+
+    `clock` is a CALLABLE returning epoch seconds -- unlike reserve()/spent(),
+    whose `now` is a plain float -- because this function reads the time again
+    after every sleep.
+
+    Returns False when `max_wait_s` elapses without a slot -- a TRANSIENT
+    condition. Callers turn that into a visible `⚠` line in the digest, because
+    silently returning fewer results is the failure mode trap #3 describes.
+
+    Asking for more than a whole window holds can never succeed, so it RAISES
+    instead of returning False. Returning False there would disguise a caller
+    bug as ordinary throttling forever -- the same "error looks like absent"
+    trap this guard exists to prevent.
+    """
+    if quota not in QUOTA_LIMIT:
+        raise ValueError(f"unknown quota {quota!r}; known: {sorted(QUOTA_LIMIT)}")
+    if n > QUOTA_LIMIT[quota]:
+        raise ValueError(
+            f"cannot reserve {n} units of {quota}: a whole window holds only "
+            f"{QUOTA_LIMIT[quota]}, so this can never succeed")
+    read_clock = (lambda: time.time()) if clock is None else clock
+    limit = config.BUDGET_WAIT_S if max_wait_s is None else max_wait_s
+    waited = 0.0
+    while True:
+        if reserve(conn, quota, n, now=read_clock()):
+            return True
+        if waited >= limit:
+            return False
+        window_s = WINDOW_SECONDS[quota]
+        # Cap the sleep at the remaining patience. Without this the FIRST sleep is
+        # always "time to the next window boundary" regardless of max_wait_s --
+        # harmless for search (60s windows, close to the 65s default) but for core
+        # the window is 3600s, so a single call could block for up to an hour with
+        # no signal, flatly contradicting this function's own docstring.
+        remaining = min(window_s - (read_clock() % window_s), limit - waited)
+        sleep(remaining)
+        waited += remaining
+
+
+def prune_budget(conn: sqlite3.Connection, *, now: float | None = None) -> None:
+    """Drop windows that can no longer be spent against."""
+    for quota in QUOTA_LIMIT:
+        conn.execute(
+            "DELETE FROM rate_budget WHERE quota = ? AND window < ?",
+            (quota, _window(quota, now)),
+        )
+    conn.commit()

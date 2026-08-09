@@ -1,0 +1,302 @@
+"""search_issues(): pagination, the 1000-result cap, and honest incompleteness.
+
+A rate-limited or timed-out search must never look like "no results"
+(HANDOFF.md trap #3). SearchResult.incomplete carries that distinction, and a
+throttle raises RateLimited rather than returning an empty list.
+"""
+
+import pytest
+
+from sniper import github_api
+from tests.conftest import load_fixture
+
+
+def _page(n_items, total, incomplete=False, start=0):
+    return {
+        "total_count": total,
+        "incomplete_results": incomplete,
+        "items": [{"number": start + i, "title": f"issue {start + i}"} for i in range(n_items)],
+    }
+
+
+def test_single_short_page_makes_one_call(fake_get):
+    fake_get.queue(200, _page(3, 3))
+    result = github_api.search_issues("label:bounty")
+    assert [i["number"] for i in result.items] == [0, 1, 2]
+    assert result.total_count == 3
+    assert result.incomplete is False
+    assert result.pages_fetched == 1
+    assert len(fake_get.calls) == 1
+
+
+def test_query_and_sort_are_sent_as_params(fake_get):
+    fake_get.queue(200, _page(1, 1))
+    github_api.search_issues('label:"💎 Bounty"', sort="updated", order="desc")
+    url, params = fake_get.calls[0]
+    assert url == "https://api.github.com/search/issues"
+    assert params["q"] == 'label:"💎 Bounty"'
+    assert params["sort"] == "updated"
+    assert params["order"] == "desc"
+    assert params["per_page"] == 100
+    assert params["page"] == 1
+
+
+def test_no_extra_page_when_total_count_is_an_exact_multiple_of_per_page(fake_get):
+    # A full page that already accounts for every result must not cost a second
+    # request. total_count % per_page == 0 is a common shape for a label query, and
+    # the wasted call comes out of the 30/min search pool.
+    fake_get.queue(200, _page(100, 100))
+    result = github_api.search_issues("q", per_page=100)
+    assert len(fake_get.calls) == 1
+    assert result.pages_fetched == 1
+    assert len(result.items) == 100
+    assert result.total_count == 100
+
+
+def test_pages_until_a_short_page(fake_get):
+    fake_get.queue(200, _page(100, 150, start=0))
+    fake_get.queue(200, _page(50, 150, start=100))
+    result = github_api.search_issues("q", per_page=100)
+    assert len(result.items) == 150
+    assert result.pages_fetched == 2
+    assert [p["page"] for _, p in fake_get.calls] == [1, 2]
+
+
+def test_stops_at_the_1000_result_cap(fake_get):
+    for page in range(10):
+        fake_get.queue(200, _page(100, 5000, start=page * 100))
+    result = github_api.search_issues("q", per_page=100, max_pages=99)
+    assert len(result.items) == github_api.SEARCH_RESULT_CAP
+    assert result.pages_fetched == 10
+    assert result.total_count == 5000
+
+
+def test_max_pages_bounds_the_search_quota_spend(fake_get):
+    fake_get.queue(200, _page(100, 5000, start=0))
+    fake_get.queue(200, _page(100, 5000, start=100))
+    result = github_api.search_issues("q", per_page=100, max_pages=2)
+    assert result.pages_fetched == 2
+    assert len(result.items) == 200
+
+
+def test_incomplete_results_is_surfaced_not_swallowed(fake_get):
+    fake_get.queue(200, _page(3, 3, incomplete=True))
+    result = github_api.search_issues("q")
+    assert result.incomplete is True
+    assert len(result.items) == 3
+
+
+def test_incomplete_on_any_page_marks_the_whole_result(fake_get):
+    fake_get.queue(200, _page(100, 150, start=0))
+    fake_get.queue(200, _page(50, 150, incomplete=True, start=100))
+    assert github_api.search_issues("q").incomplete is True
+
+
+def test_a_throttled_search_raises_rather_than_returning_empty(fake_get):
+    fake_get.queue(403, {"message": "API rate limit exceeded for user"},
+                   {"X-RateLimit-Reset": "999"})
+    with pytest.raises(github_api.RateLimited):
+        github_api.search_issues("q")
+
+
+def test_stop_callback_halts_paging_early(fake_get):
+    fake_get.queue(200, _page(100, 500, start=0))
+    fake_get.queue(200, _page(100, 500, start=100))
+    seen = []
+
+    def stop(page_items):
+        seen.append(len(page_items))
+        return len(seen) == 2
+
+    result = github_api.search_issues("q", stop=stop)
+    assert result.pages_fetched == 2
+    assert seen == [100, 100]
+
+
+def test_real_recorded_payload_parses(fake_get):
+    # Recorded live: 100 items, total_count 520 -- a genuine full first page, not a
+    # terminal short one. max_pages=1 keeps this test about payload-shape parsing
+    # (pagination mechanics are covered by the tests above) and matches the single
+    # fixture queued here, since the strict FIFO fake_get has no second page to give.
+    fake_get.queue(200, load_fixture("search_bounty_page1"))
+    result = github_api.search_issues(
+        'label:"💎 Bounty" state:open is:issue no:assignee -label:"💰 Rewarded"',
+        max_pages=1)
+    assert result.total_count > 0
+    assert result.incomplete is False
+    assert len(result.items) == 100
+    item = result.items[0]
+    assert item["repository_url"].startswith("https://api.github.com/repos/")
+    # Corrects the spec: search items carry no repo metadata, so fork/archived
+    # are NOT free rejects. Plan 2's pipeline depends on this.
+    assert "repository" not in item
+
+
+def test_a_secondary_rate_limit_is_reported_as_such_not_as_the_primary_pool(fake_get):
+    """GitHub's burst guard fires with primary quota still unspent.
+
+    Measured 2026-08-08: a 403 carrying "secondary rate limit" arrived with
+    X-RateLimit-Remaining 23 of 30. The X-RateLimit-Reset on that response
+    describes the PRIMARY window, so reporting "rate limited until <epoch>" from
+    it is a confident lie a caller cannot act on.
+    """
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"X-RateLimit-Remaining": "23", "X-RateLimit-Limit": "30",
+                    "X-RateLimit-Reset": "1786205456"})
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q")
+    assert excinfo.value.secondary is True
+    assert excinfo.value.retry_after is None
+    assert "23 of 30" in str(excinfo.value)
+
+
+def test_a_primary_rate_limit_still_reports_its_reset(fake_get):
+    fake_get.queue(403, {"message": "API rate limit exceeded"},
+                   {"X-RateLimit-Reset": "1786205456"})
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q")
+    assert excinfo.value.secondary is False
+    assert "1786205456" in str(excinfo.value)
+
+
+def test_retry_after_is_honoured_when_github_supplies_it(fake_get):
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"Retry-After": "42"})
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q")
+    assert excinfo.value.retry_after == 42.0
+    assert excinfo.value.secondary is True
+
+
+def test_pages_are_paced_to_avoid_the_burst_guard(fake_get):
+    # Ten back-to-back pages is exactly the shape that tripped the secondary
+    # limit live. The pause goes BETWEEN pages, never before the first.
+    fake_get.queue(200, _page(100, 300, start=0))
+    fake_get.queue(200, _page(100, 300, start=100))
+    fake_get.queue(200, _page(100, 300, start=200))
+    slept = []
+    result = github_api.search_issues("q", per_page=100, pause_s=3, sleep=slept.append)
+    assert result.pages_fetched == 3
+    assert slept == [3, 3]
+
+
+def test_a_single_page_search_never_pauses(fake_get):
+    fake_get.queue(200, _page(3, 3))
+    slept = []
+    github_api.search_issues("q", pause_s=3, sleep=slept.append)
+    assert slept == []
+
+
+def test_a_throttle_midway_keeps_the_pages_already_paid_for(fake_get):
+    """Measured live: three good pages were discarded by a 403 on page four.
+
+    The digest then said "top 0 by score" -- an empty world reported because of a
+    throttle, which is the exact confusion this module exists to prevent.
+    """
+    fake_get.queue(200, _page(100, 500, start=0))
+    fake_get.queue(200, _page(100, 500, start=100))
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"X-RateLimit-Remaining": "27", "X-RateLimit-Limit": "30"})
+    result = github_api.search_issues("q", per_page=100)
+    assert len(result.items) == 200
+    assert result.pages_fetched == 2
+    # The caller must still be able to tell this apart from a complete answer.
+    assert result.incomplete is True
+
+
+def test_a_throttle_on_the_very_first_page_still_raises(fake_get):
+    # Nothing to salvage, and silently returning an empty SearchResult would be
+    # indistinguishable from "no bounties matched".
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."})
+    with pytest.raises(github_api.RateLimited):
+        github_api.search_issues("q")
+
+
+def test_the_cap_trims_a_page_that_overshoots_it(fake_get):
+    """per_page=100 divides 1000 exactly, so the other cap test never trims.
+
+    Found by mutation during the final review: replacing
+    `del items[SEARCH_RESULT_CAP:]` with `pass` left the whole suite green.
+    per_page=30 overshoots (34 pages = 1020), which is the case the trim exists
+    for -- and 30 is a per_page the tracker may legitimately use, since 100 trips
+    GitHub's burst guard.
+    """
+    for page in range(34):
+        fake_get.queue(200, _page(30, 5000, start=page * 30))
+    result = github_api.search_issues("q", per_page=30, max_pages=99)
+    assert len(result.items) == github_api.SEARCH_RESULT_CAP
+    assert result.pages_fetched == 34
+    # The trim must drop the tail, not the head: results are newest-updated first.
+    assert result.items[0]["number"] == 0
+    assert result.items[-1]["number"] == github_api.SEARCH_RESULT_CAP - 1
+
+
+def _secondary(remaining="26"):
+    return (403, {"message": "You have exceeded a secondary rate limit."},
+            {"X-RateLimit-Remaining": remaining, "X-RateLimit-Limit": "30"})
+
+
+def test_a_secondary_throttle_is_waited_out_and_retried(fake_get):
+    """Giving up on a burst throttle cost 420 of 520 candidates, measured live.
+
+    It clears in minutes. Retrying it is the difference between a digest of the
+    whole inventory and one dominated by whichever repo filled page one.
+    """
+    fake_get.queue(*_secondary())
+    fake_get.queue(200, _page(3, 3))
+    slept = []
+    result = github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert len(result.items) == 3
+    assert result.incomplete is False
+    assert slept == [60]
+
+
+def test_backoff_doubles_between_attempts(fake_get):
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    fake_get.queue(200, _page(2, 2))
+    slept = []
+    github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert slept == [60, 120, 240]
+
+
+def test_github_supplied_retry_after_wins_over_the_backoff_schedule(fake_get):
+    fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."},
+                   {"Retry-After": "7"})
+    fake_get.queue(200, _page(1, 1))
+    slept = []
+    github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert slept == [7]
+
+
+def test_a_primary_limit_is_never_retried(fake_get):
+    # A primary limit needs the whole rate window to roll -- far longer than a
+    # run should sit blocking, and the budget guard exists to avoid it entirely.
+    fake_get.queue(403, {"message": "API rate limit exceeded"},
+                   {"X-RateLimit-Reset": "1786205456"})
+    slept = []
+    with pytest.raises(github_api.RateLimited) as excinfo:
+        github_api.search_issues("q", retries=3, backoff_s=60, sleep=slept.append)
+    assert excinfo.value.secondary is False
+    assert slept == []
+
+
+def test_exhausting_the_retries_keeps_the_pages_already_paid_for(fake_get):
+    fake_get.queue(200, _page(50, 500, start=0))
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    slept = []
+    result = github_api.search_issues("q", per_page=50, retries=1, backoff_s=5,
+                                      sleep=slept.append)
+    assert len(result.items) == 50
+    assert result.incomplete is True
+    assert slept == [5]
+
+
+def test_exhausting_the_retries_with_nothing_in_hand_still_raises(fake_get):
+    # An empty SearchResult here would be indistinguishable from "no bounties".
+    fake_get.queue(*_secondary())
+    fake_get.queue(*_secondary())
+    with pytest.raises(github_api.RateLimited):
+        github_api.search_issues("q", retries=1, backoff_s=5, sleep=lambda s: None)

@@ -98,6 +98,101 @@ BOT_AUTHORS = {
 
 HELP_WANTED = "Help Wanted"
 
+# --- bounty tracker ----------------------------------------------------------
+# Discovery queries. `sort`/`order` are NOT baked in here -- search_issues()
+# always sorts by `updated`, because bounty labels land on issues that already
+# exist (measured 2026-08-05: 1 of 521 live candidates was created in the
+# previous 30 days, so `created` ordering misses essentially everything).
+#
+# `💎 Bounty` (563 open) is Algora's label applied to the real GitHub issue,
+# which is how Algora's inventory is reachable for free. `bounty` (3825) is
+# noisy and carries the floor and spam filters' weight. Tune this list against
+# real digest output; it is here so that needs no code change.
+BOUNTY_QUERIES = [
+    'label:"💎 Bounty" state:open is:issue no:assignee -label:"💰 Rewarded"',
+    'label:bounty state:open is:issue no:assignee',
+]
+
+# 20, not 10: SEARCH_PER_PAGE halved, so twice the pages are needed to reach the
+# same 1000-result ceiling the Search API imposes.
+BOUNTY_SEARCH_MAX_PAGES = int(os.environ.get("BOUNTY_SEARCH_MAX_PAGES", "20"))
+
+# 50, not the API maximum of 100. Measured 2026-08-08 against the live endpoint:
+# per_page=100 on the bounty query returned 403 "secondary rate limit" on the
+# FIRST request with 24 of 30 primary units unspent, reproducibly, while
+# per_page=50 and per_page=30 both returned 200 immediately afterwards. GitHub's
+# burst guard weights by how expensive a query is to serve, and a 100-result page
+# over a label query with a negation is over that line. This is not a tuning
+# preference -- at 100 the tracker returns an empty digest every run.
+SEARCH_PER_PAGE = int(os.environ.get("SEARCH_PER_PAGE", "50"))
+
+# Markers meaning "this bounty has already paid out". Matched case-insensitively
+# against labels, so entries here must be lowercase. Other platforms' markers are
+# unknown; add them as they are observed.
+PAID_LABELS = {
+    label.strip().lower()
+    for label in os.environ.get("PAID_LABELS", "💰 Rewarded").split(",")
+    if label.strip()
+}
+
+# A bounty below this is not worth a working day. A MISSING amount does not
+# reject -- it sorts last, because expected value cannot be computed without one.
+AMOUNT_FLOOR_USD = int(os.environ.get("AMOUNT_FLOOR_USD", "50"))
+
+# Expensify Help Wanted issues pay a flat rate; there is no $-label to parse.
+EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
+
+DIGEST_TOP_N = int(os.environ.get("DIGEST_TOP_N", "25"))
+DIGEST_STANDING_N = int(os.environ.get("DIGEST_STANDING_N", "5"))
+
+# Cap per repository in the digest. Measured 2026-08-09: one repo held 188 live
+# issues worth \,000 and took all 25 slots, burying 26 other repos. Whether
+# that repo is generous or a bounty farm is not a judgement metadata can make --
+# but a digest that only ever shows one repo is useless either way.
+DIGEST_MAX_PER_REPO = int(os.environ.get("DIGEST_MAX_PER_REPO", "3"))
+
+# Two quota classes, shared with the Expensify watcher through one token. The
+# budget guard in store.py refuses to start a run it cannot finish rather than
+# reporting an empty world -- a throttled search is indistinguishable from "no
+# results" (HANDOFF.md trap #3).
+SEARCH_QUOTA_PER_MIN = int(os.environ.get("SEARCH_QUOTA_PER_MIN", "30"))
+CORE_QUOTA_PER_HOUR = int(os.environ.get("CORE_QUOTA_PER_HOUR", "5000"))
+CORE_BUDGET_PER_RUN = int(os.environ.get("CORE_BUDGET_PER_RUN", "1500"))
+
+# How long a caller will block waiting for an exhausted quota window to roll
+# over. Just over a minute, so a run that starts near the end of a search-quota
+# window does not fail for a reason that resolves itself in seconds. The test
+# suite zeroes this via an autouse fixture -- a suite that can sleep is a trap.
+BUDGET_WAIT_S = float(os.environ.get("BUDGET_WAIT_S", "65"))
+
+# Pause between consecutive search PAGES. Not about the documented 30/min pool --
+# that is what the budget guard is for. This defends against GitHub's secondary
+# (burst) rate limit, which fires on request rate regardless of remaining quota:
+# measured 2026-08-08, ten back-to-back pages got a 403 with 23 of 30 primary
+# units still unspent. At <=20 pages a run and a 3-hourly cadence, a couple of
+# seconds a page is free; tripping the burst guard costs the entire run.
+SEARCH_PAGE_PAUSE_S = float(os.environ.get("SEARCH_PAGE_PAUSE_S", "3"))
+
+# Same burst guard, core side. Run 1 is a backlog dump: one repo-detail call per
+# unique repo plus one timeline call per survivor, which is hundreds of requests
+# back to back. The 5000/hr pool has room for that; the burst guard does not.
+# Smaller than the search pause because core requests are individually cheap.
+CORE_CALL_PAUSE_S = float(os.environ.get("CORE_CALL_PAUSE_S", "0.5"))
+
+# A secondary (burst) throttle clears in minutes, so a search page is worth
+# waiting out rather than abandoning: measured 2026-08-09, giving up on one cost
+# 420 of 520 candidates and produced a digest dominated by whichever repo filled
+# page one. Backoff doubles per attempt (60s, 120s, 240s). Only SECONDARY limits
+# are retried -- a primary one needs the whole window to roll.
+SEARCH_MAX_RETRIES = int(os.environ.get("SEARCH_MAX_RETRIES", "3"))
+SEARCH_RETRY_BACKOFF_S = float(os.environ.get("SEARCH_RETRY_BACKOFF_S", "60"))
+
+HUNT_ENABLED_SOURCES = [
+    name.strip()
+    for name in os.environ.get("HUNT_SOURCES", "github-labels,expensify").split(",")
+    if name.strip()
+]
+
 
 def is_proposal(body: str | None) -> bool:
     """Exact reimplementation of getIsProposal() from proposalPoliceComment.ts:38."""

@@ -10,9 +10,23 @@ HANDOFF.md trap #3 warns about.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
+
+# Keep the REAL credential out of the test process entirely.
+#
+# sniper.config loads .env with os.environ.setdefault(), so a value already in
+# the environment wins and the real token is never read. This must run before
+# any test module imports sniper.config -- pytest imports conftest first, which
+# is the only reason this works here and would not work inside a fixture.
+#
+# This is not belt-and-braces. A failing test's traceback can render the frames
+# of _headers(), and a live token printed into a terminal ends up in scrollback,
+# CI logs, and session transcripts. No test needs a real token: every request is
+# served by FakeGet, which never inspects the Authorization header.
+os.environ["GITHUB_TOKEN"] = "test-token-not-a-real-credential"
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -76,3 +90,12 @@ def no_budget_waiting(monkeypatch):
     from sniper import config
 
     monkeypatch.setattr(config, "BUDGET_WAIT_S", 0, raising=False)
+    # Same reason: search_issues paces its pages to dodge GitHub's burst guard.
+    # Real seconds in a unit test buy nothing.
+    monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 0, raising=False)
+    monkeypatch.setattr(config, "CORE_CALL_PAUSE_S", 0, raising=False)
+    # Retries default to 60/120/240s of real backoff. Tests that exercise the
+    # retry path pass `retries=`/`backoff_s=` explicitly; every other test wants
+    # a throttle to surface immediately, exactly as it did before retries existed.
+    monkeypatch.setattr(config, "SEARCH_MAX_RETRIES", 0, raising=False)
+    monkeypatch.setattr(config, "SEARCH_RETRY_BACKOFF_S", 0, raising=False)
