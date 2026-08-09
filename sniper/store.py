@@ -12,6 +12,7 @@ original three tables are untouched: verify.py's state must keep working.
 import json
 import sqlite3
 import time
+from typing import Any
 from pathlib import Path
 
 from . import config
@@ -240,20 +241,42 @@ def candidate_count(conn: sqlite3.Connection) -> int:
 
 
 def live_candidates(
-    conn: sqlite3.Connection, limit: int, *, since: float | None = None
+    conn: sqlite3.Connection,
+    limit: int,
+    *,
+    since: float | None = None,
+    max_per_repo: int | None = None,
 ) -> list[sqlite3.Row]:
-    """Unrejected candidates, best first. `since` restricts to newly first-seen ones."""
-    if since is None:
+    """Unrejected candidates, best first. `since` restricts to newly first-seen ones.
+
+    `max_per_repo` caps how many rows any single repository may occupy. Measured
+    2026-08-09: one repo held 188 live issues totalling $917,000 and took all 25
+    slots in the digest, burying every other repo in the inventory. Whether that
+    repo is generous or a farm is not something metadata can decide -- but a
+    digest that only ever shows one of them is useless either way.
+    """
+    where = "rejected IS NULL" + ("" if since is None else " AND first_seen_at >= ?")
+    params: list[Any] = [] if since is None else [since]
+    order = " ORDER BY score DESC, amount_usd DESC"
+
+    if max_per_repo is None:
         return conn.execute(
-            "SELECT * FROM candidates WHERE rejected IS NULL "
-            "ORDER BY score DESC, amount_usd DESC LIMIT ?",
-            (limit,),
+            f"SELECT * FROM candidates WHERE {where}{order} LIMIT ?", (*params, limit)
         ).fetchall()
-    return conn.execute(
-        "SELECT * FROM candidates WHERE rejected IS NULL AND first_seen_at >= ? "
-        "ORDER BY score DESC, amount_usd DESC LIMIT ?",
-        (since, limit),
-    ).fetchall()
+
+    # Cap in Python rather than SQL: the row counts here are hundreds, and a
+    # window function would need a SQLite version floor this project has not set.
+    kept: list[sqlite3.Row] = []
+    seen_per_repo: dict[str, int] = {}
+    for row in conn.execute(f"SELECT * FROM candidates WHERE {where}{order}", params):
+        count = seen_per_repo.get(row["repo"], 0)
+        if count >= max_per_repo:
+            continue
+        seen_per_repo[row["repo"]] = count + 1
+        kept.append(row)
+        if len(kept) >= limit:
+            break
+    return kept
 
 
 # Measured 2026-08-05 against the live API. Search and core are separate pools

@@ -1,0 +1,17 @@
+# Bounty tracker -- every 3 hours.
+#
+# The cadence is set by the inventory, not by competition: ~520 standing
+# unclaimed bounties that turn over slowly (measured 2026-08-05). Eight runs a
+# day sits far inside both documented quotas.
+#
+# Wall-clock per run is NOT small, and that is deliberate. Search pages are
+# paced and a burst throttle is waited out with doubling backoff, because
+# abandoning a throttled query costs most of the inventory. A run that takes
+# fifteen minutes and returns everything beats one that takes twenty seconds
+# and returns page one.
+#
+# PATH is explicit: cron gets a minimal environment, and node/claude live under
+# the nvm prefix (HANDOFF.md trap #8). hunt.py itself needs only system python3
+# and requests.
+PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
+0 */3 * * * cd $HOME/expensify-sniper && /usr/bin/python3 hunt.py >> $HOME/expensify-sniper/hunt.log 2>&1

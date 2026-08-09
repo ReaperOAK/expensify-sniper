@@ -186,11 +186,14 @@ def run(
 
     # Stage 4 -- digest.
     if first_run:
-        new_rows = store.live_candidates(conn, config.DIGEST_TOP_N)
+        new_rows = store.live_candidates(conn, config.DIGEST_TOP_N,
+                                         max_per_repo=config.DIGEST_MAX_PER_REPO)
         standing_rows = []
     else:
-        new_rows = store.live_candidates(conn, config.DIGEST_TOP_N, since=stamp)
-        standing_rows = store.live_candidates(conn, config.DIGEST_STANDING_N)
+        new_rows = store.live_candidates(conn, config.DIGEST_TOP_N, since=stamp,
+                                         max_per_repo=config.DIGEST_MAX_PER_REPO)
+        standing_rows = store.live_candidates(conn, config.DIGEST_STANDING_N,
+                                              max_per_repo=config.DIGEST_MAX_PER_REPO)
 
     text = notify.format_digest(new_rows, standing_rows, warnings,
                                 first_run=first_run, now=stamp)

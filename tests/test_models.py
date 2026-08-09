@@ -167,3 +167,34 @@ def test_the_spam_farm_issue_shows_three_distinct_amounts():
     cand = Candidate.from_search_item("github-labels", issue)
     assert cand.amounts_seen == (780, 1000, 1200)
     assert cand.amount_usd is None
+
+
+def test_a_title_amount_is_used_when_the_labels_say_nothing():
+    """commaai/opendbc#3426 is "[$10k bounty] Ford F-150 2026 (TRON) support".
+
+    Real, well-funded, and it carries no $-label. Scoring those at zero buried
+    genuine work underneath a farm whose issues happen to be labelled properly.
+    """
+    cand = Candidate.from_search_item("github-labels", _item(
+        title="[$10k bounty] Ford F-150 2026 (TRON) support",
+        labels=[{"name": "bounty"}]))
+    assert cand.amount_usd == 10000
+
+
+def test_a_label_amount_always_beats_the_title():
+    cand = Candidate.from_search_item("github-labels", _item(
+        title="[$10k bounty] something", labels=[{"name": "$500"}]))
+    assert cand.amount_usd == 500
+
+
+def test_an_ambiguous_title_is_not_guessed_at():
+    # Two figures in prose is exactly as untrustworthy as two $-labels.
+    cand = Candidate.from_search_item("github-labels", _item(
+        title="[$500 bounty] plus a $50 gift card", labels=[{"name": "bounty"}]))
+    assert cand.amount_usd is None
+
+
+def test_a_title_with_no_amount_stays_none():
+    cand = Candidate.from_search_item("github-labels", _item(
+        title="Fix the thing", labels=[{"name": "bounty"}]))
+    assert cand.amount_usd is None

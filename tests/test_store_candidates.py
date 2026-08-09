@@ -140,3 +140,28 @@ def test_an_unscored_candidate_sorts_below_every_scored_one(tmp_path):
     store.upsert_candidate(conn, _cand(2), now=1.0)  # score stays None
     store.upsert_candidate(conn, _cand(3).with_score(50.0), now=1.0)
     assert [r["number"] for r in store.live_candidates(conn, limit=10)] == [3, 1, 2]
+
+
+def test_no_single_repo_can_monopolise_the_digest(tmp_path):
+    """Measured 2026-08-09: one repo held 188 live issues worth $917,000 and took
+    all 25 digest slots, burying 26 other repos."""
+    conn = _conn(tmp_path)
+    for n in range(10):  # one loud repo, high scores
+        store.upsert_candidate(conn, _cand(n).with_score(1000.0 - n), now=1.0)
+    for n in range(3):   # quieter repos, lower scores
+        c = Candidate.from_search_item("github-labels", {
+            "number": 500 + n, "title": "t", "state": "open", "comments": 0,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-08-01T00:00:00Z",
+            "html_url": "u", "repository_url": f"https://api.github.com/repos/other/r{n}",
+            "assignee": None, "labels": [{"name": "$100"}],
+        }).with_repo_detail({"fork": False, "archived": False, "stargazers_count": 9,
+                             "pushed_at": "2026-08-01T00:00:00Z", "language": "Go"})
+        store.upsert_candidate(conn, c.with_score(10.0), now=1.0)
+
+    rows = store.live_candidates(conn, limit=6, max_per_repo=2)
+    repos = [r["repo"] for r in rows]
+    assert repos.count("acme/widgets") == 2
+    assert len(set(repos)) == 4
+    # Uncapped, the loud repo still wins outright -- the cap is the only defence.
+    assert all(r["repo"] == "acme/widgets"
+               for r in store.live_candidates(conn, limit=6))

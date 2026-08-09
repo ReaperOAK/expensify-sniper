@@ -52,6 +52,31 @@ def amounts_in(labels: Iterable[str]) -> tuple[int, ...]:
     return tuple(sorted(found))
 
 
+# Amounts embedded in a title: "[ Bounty $9k ]", "[$10k bounty]", "[$10]".
+# Deliberately NOT anchored -- unlike a label, a title is prose and the amount is
+# somewhere inside it.
+_AMOUNT_IN_TEXT = re.compile(r"\$\s*(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s*([kK])?\b")
+
+
+def amounts_in_title(title: str) -> tuple[int, ...]:
+    """Distinct amounts mentioned in an issue title, ascending.
+
+    Plenty of real bounties never carry a $-label: commaai/opendbc#3426 is
+    "[$10k bounty] Ford F-150 2026 (TRON) support" with the number only in the
+    title. Scoring those at zero buried genuine, well-funded work underneath a
+    bounty farm whose issues happen to be labelled properly.
+
+    A title is weaker evidence than a label -- it is prose, and "$5 gift card"
+    parses the same as a bounty -- so this is only ever a FALLBACK, used when the
+    labels say nothing at all.
+    """
+    found = set()
+    for whole, fraction, suffix in _AMOUNT_IN_TEXT.findall(title or ""):
+        value = float(whole.replace(",", "") + (fraction or ""))
+        found.add(int(value * 1000) if suffix else int(value))
+    return tuple(sorted(found))
+
+
 def repo_from_url(repository_url: str) -> str:
     """"https://api.github.com/repos/acme/widgets" -> "acme/widgets"."""
     owner, name = repository_url.rstrip("/").rsplit("/", 2)[-2:]
@@ -113,6 +138,13 @@ class Candidate:
         amount = amount_usd
         if amount is None and len(seen) == 1:
             amount = seen[0]
+        if amount is None and not seen:
+            # Labels said nothing. Fall back to the title -- but only on an
+            # unambiguous single figure, for the same reason two $-labels mean
+            # spam rather than a bigger prize.
+            from_title = amounts_in_title(payload.get("title", ""))
+            if len(from_title) == 1:
+                amount = from_title[0]
         has_assignee = bool(payload.get("assignee") or payload.get("assignees"))
         return cls(
             source=source,

@@ -145,6 +145,12 @@ EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
 DIGEST_TOP_N = int(os.environ.get("DIGEST_TOP_N", "25"))
 DIGEST_STANDING_N = int(os.environ.get("DIGEST_STANDING_N", "5"))
 
+# Cap per repository in the digest. Measured 2026-08-09: one repo held 188 live
+# issues worth \,000 and took all 25 slots, burying 26 other repos. Whether
+# that repo is generous or a bounty farm is not a judgement metadata can make --
+# but a digest that only ever shows one repo is useless either way.
+DIGEST_MAX_PER_REPO = int(os.environ.get("DIGEST_MAX_PER_REPO", "3"))
+
 # Two quota classes, shared with the Expensify watcher through one token. The
 # budget guard in store.py refuses to start a run it cannot finish rather than
 # reporting an empty world -- a throttled search is indistinguishable from "no
