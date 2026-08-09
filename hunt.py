@@ -149,6 +149,15 @@ def run(
     # they just read it in a digest, so it is already stored and already live.
     store.apply_dismissals(conn)
 
+    # The open-linked-PR rule was replaced by a claim test. Rows it rejected under
+    # the old question have to be put back in front of the new one, or they stay
+    # rejected until GitHub happens to touch them again -- which for a months-old
+    # bounty is never. Costs one UPDATE and is a no-op once the table is drained.
+    revived = store.clear_rejections(conn, "open linked PR")
+    if revived:
+        warnings.append(f"{revived} candidates re-judged: an open PR is no longer "
+                        f"treated as a claim unless its author is assigned")
+
     # Payout history first: one cached search for the whole run, and stage 1 needs
     # it. Whether three $-labels mean a spam farm or a tiered bounty is not
     # decidable from the labels -- only from whether the repo has ever paid.
@@ -206,13 +215,22 @@ def run(
         if config.CORE_CALL_PAUSE_S:
             time.sleep(config.CORE_CALL_PAUSE_S)
         try:
-            taken = github_api.has_open_linked_pr(cand.repo, cand.number)
+            linked = github_api.linked_pr_state(
+                cand.repo, cand.number, frozenset(cand.assignees))
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"timeline for {cand.repo}#{cand.number} failed: {exc}")
             continue
-        if taken:
-            store.upsert_candidate(conn, cand, rejected="open linked PR", now=stamp)
+        # An open PR by someone already assigned is the one shape that means the
+        # work has been handed out -- true on Expensify, where a C+ picks a
+        # proposal and then assigns its author, and on Algora, where the winner
+        # is whoever merges. Every other open PR is a rival, and rivals are
+        # scored rather than rejected.
+        if linked.claimant:
+            store.upsert_candidate(
+                conn, cand, rejected=f"claimed by assignee @{linked.claimant}",
+                now=stamp)
             continue
+        cand = cand.with_linked_prs(linked.open_count)
         try:
             scored = cand.with_score(scoring.score(cand, now=stamp))
         except Exception as exc:  # noqa: BLE001 -- score() raises by contract on an

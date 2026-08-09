@@ -97,3 +97,29 @@ def test_a_cheaper_bounty_in_a_healthy_quiet_repo_can_beat_a_crowded_rich_one():
     quiet = _cand(amount_label="$500", comments=0, stars=1000, pushed_days=1)
     crowded = _cand(amount_label="$2000", comments=30, stars=1000, pushed_days=1)
     assert scoring.score(quiet, now=NOW) > scoring.score(crowded, now=NOW)
+
+
+def test_open_prs_count_as_competition():
+    # An open PR is a rival who has already written code, so it costs more than
+    # a comment. It is not a wall: on Expensify selection is by proposal, and on
+    # Algora only a merge wins, so a better entrant can still take it.
+    base = _cand(amount_label="$1000", comments=0)
+    contested = base.with_linked_prs(2)
+    assert scoring.score(contested, now=NOW) < scoring.score(base, now=NOW)
+    # 1000 / (1 + 0 + 2*2) = 200, against 1000 / 1 = 1000, both at health 1.0
+    assert scoring.score(contested, now=NOW) == pytest.approx(200.0)
+
+
+def test_comments_and_open_prs_both_count():
+    cand = _cand(amount_label="$1000", comments=3).with_linked_prs(1)
+    # 1000 / (1 + 3 + 2) = 166.67
+    assert scoring.score(cand, now=NOW) == pytest.approx(1000 / 6)
+
+
+def test_an_unchecked_candidate_scores_as_if_uncontested():
+    # open_pr_count is None when stage 3 never ran -- the core budget can run
+    # out mid-run. Guessing a penalty would be inventing evidence about a check
+    # we could not afford to make.
+    base = _cand(amount_label="$1000", comments=0)
+    assert base.open_pr_count is None
+    assert scoring.score(base, now=NOW) == pytest.approx(1000.0)

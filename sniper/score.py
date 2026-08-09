@@ -1,6 +1,6 @@
 """Metadata-only ranking. No LLM, by design.
 
-    score = amount_usd / (1 + comments) x repo_health
+    score = amount_usd / (1 + comments + 2 x open_prs) x repo_health
 
 `comments` is the competition proxy and arrives free in the search payload, so
 it costs no extra call. repo_health discounts repos where correct work is still
@@ -49,4 +49,10 @@ def score(cand: Candidate, *, now: float | None = None) -> float:
     if cand.amount_usd is None:
         return 0.0
     health = repo_health(cand.stars, cand.pushed_at, now=now)
-    return cand.amount_usd / (1 + cand.comments) * health
+    # An open PR is a rival who has already written code, so it weighs more than
+    # a comment -- but it is not a wall. Expensify selects by proposal and Algora
+    # by merge, so a later entrant can read the open PRs and beat them. None
+    # means stage 3 never ran, and inventing a penalty for a check we could not
+    # afford would be inventing evidence.
+    competition = 1 + cand.comments + 2 * (cand.open_pr_count or 0)
+    return cand.amount_usd / competition * health

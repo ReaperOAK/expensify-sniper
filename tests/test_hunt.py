@@ -125,15 +125,63 @@ def test_a_fork_is_rejected_at_the_repo_stage_and_costs_no_timeline_call(tmp_pat
     assert not any("timeline" in u for u, _ in fake_get.calls)
 
 
-def test_an_open_linked_pr_rejects_the_candidate(tmp_path, fake_get):
+def _open_pr_by(login: str) -> dict:
+    return {"event": "cross-referenced",
+            "source": {"issue": {"pull_request": {"url": "u"}, "state": "open",
+                                 "user": {"login": login}}}}
+
+
+def test_an_open_pr_from_a_stranger_keeps_the_candidate(tmp_path, fake_get):
+    # This is the change. Measured 2026-08-09, this rule had rejected 562
+    # candidates -- more than the 536 it kept -- and most of those PRs were
+    # opened by agents that auto-raise on any bounty label.
     conn = _conn(tmp_path)
     fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
-    fake_get.queue(200, [{"event": "cross-referenced",
-                          "source": {"issue": {"pull_request": {"url": "x"},
-                                               "state": "open"}}}])
+    fake_get.queue(200, [_open_pr_by("randobot")])
     _run(conn, sources=[FakeSource("s", [_cand(1)])], dry_run=True)
-    assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] == \
-        "open linked PR"
+    row = conn.execute("SELECT rejected, open_pr_count FROM candidates").fetchone()
+    assert row["rejected"] is None
+    assert row["open_pr_count"] == 1
+
+
+def test_open_prs_are_counted_not_just_detected(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("a"), _open_pr_by("b"), _open_pr_by("c")])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], dry_run=True)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 3
+
+
+def test_a_contested_candidate_scores_below_an_uncontested_one(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("randobot")])
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1), _cand(2)])], dry_run=True)
+    scores = {r["number"]: r["score"]
+              for r in conn.execute("SELECT number, score FROM candidates")}
+    assert scores[1] < scores[2]
+
+
+def test_stale_open_linked_pr_rejections_are_cleared_at_the_start_of_a_run(
+        tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    store.upsert_candidate(conn, _cand(99), rejected="open linked PR", now=NOW)
+    _run(conn, sources=[FakeSource("s", [])], dry_run=True)
+    row = conn.execute(
+        "SELECT rejected FROM candidates WHERE number = 99").fetchone()
+    assert row["rejected"] is None
+
+
+def test_clearing_stale_rejections_is_announced_rather_than_silent(
+        tmp_path, fake_get):
+    # A silent revival looks identical to newly discovered inventory, which
+    # would make a filter change unattributable the next time one is made.
+    conn = _conn(tmp_path)
+    store.upsert_candidate(conn, _cand(99), rejected="open linked PR", now=NOW)
+    text = _run(conn, sources=[FakeSource("s", [])], dry_run=True)
+    assert "re-judged" in text
 
 
 def test_survivors_are_scored_and_persisted(tmp_path, fake_get):
