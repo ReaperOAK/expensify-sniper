@@ -210,3 +210,22 @@ def test_a_throttle_on_the_very_first_page_still_raises(fake_get):
     fake_get.queue(403, {"message": "You have exceeded a secondary rate limit."})
     with pytest.raises(github_api.RateLimited):
         github_api.search_issues("q")
+
+
+def test_the_cap_trims_a_page_that_overshoots_it(fake_get):
+    """per_page=100 divides 1000 exactly, so the other cap test never trims.
+
+    Found by mutation during the final review: replacing
+    `del items[SEARCH_RESULT_CAP:]` with `pass` left the whole suite green.
+    per_page=30 overshoots (34 pages = 1020), which is the case the trim exists
+    for -- and 30 is a per_page the tracker may legitimately use, since 100 trips
+    GitHub's burst guard.
+    """
+    for page in range(34):
+        fake_get.queue(200, _page(30, 5000, start=page * 30))
+    result = github_api.search_issues("q", per_page=30, max_pages=99)
+    assert len(result.items) == github_api.SEARCH_RESULT_CAP
+    assert result.pages_fetched == 34
+    # The trim must drop the tail, not the head: results are newest-updated first.
+    assert result.items[0]["number"] == 0
+    assert result.items[-1]["number"] == github_api.SEARCH_RESULT_CAP - 1
