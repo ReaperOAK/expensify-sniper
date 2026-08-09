@@ -77,6 +77,50 @@ verification.
 - **The refute stage runs on a reverted tree** so it judges the claim against shipping
   code rather than being persuaded by a diff that already assumes the claim.
 
+## Bounty tracker (`hunt.py`)
+
+Expensify is now one `Source` among several. `hunt.py` discovers open unclaimed
+bounties from GitHub label search, rejects noise before spending quota on it,
+ranks on metadata alone, and pushes a Discord digest every 3 hours from OCI.
+
+| file | does |
+| --- | --- |
+| `sniper/models.py` | `Candidate`; amount parsing from label, then title, then body |
+| `sniper/filters.py` | free rejects (search payload) then repo rejects (needs enrichment) |
+| `sniper/score.py` | `amount / (1 + comments) x repo_health`. Age and language are never scored |
+| `sniper/sources/` | `Source` protocol, bounty-label source, Expensify source |
+| `sniper/notify.py` | digest formatting, Discord webhook / Telegram |
+| `hunt.py` | the pipeline |
+
+`python3 hunt.py --dry-run` prints without sending. 212 tests, no network.
+
+### Traps this cost real time to learn
+
+1. **GitHub has a SECONDARY rate limit** that fires on request bursts regardless
+   of remaining quota -- a 403 arrived with 23 of 30 units unspent. The budget
+   guard models the documented pools and structurally cannot see it.
+2. **`per_page=100` trips it on the FIRST request** for this query, reproducibly;
+   50 and 30 do not. GitHub weights by how expensive a query is to serve. At 100
+   the tracker returns an empty digest on every run.
+3. **Abandoning a throttled query costs most of the inventory.** A secondary
+   limit clears in minutes, so pages are retried with doubling backoff. Giving up
+   cost 420 of 520 candidates and produced a digest where 21 of 22 entries came
+   from one repo.
+4. **A throttle mid-search used to discard the pages already fetched**, so the
+   digest reported an empty world after collecting 150 real candidates.
+5. **Search result items carry no `repository` object**, only `repository_url` --
+   so `fork`/`archived` cost a core call and cannot be free rejects.
+6. **Search responses carry no ETag.** Incremental discovery diffs `updated_at`
+   against SQLite instead.
+
+### What the inventory actually looks like (measured 2026-08-09)
+
+1506 candidates seen, 738 live, but only **206 carry a readable amount, across 5
+repos**. Two of those five look like farms: `ClankerNation/OpenAgents` alone has
+188 live issues totalling $917,000, and `UnsafeLabs/Bounty-Hunters` tags COBOL
+work on a TypeScript repo. Scoring cannot tell a farm from a generous payer --
+`DIGEST_MAX_PER_REPO` caps any one repo at 3 slots so the rest stay visible.
+
 ## Multi-account (the coverage unlock)
 
 Most Expensify issues say "Login as User A ... then as User B". That is NOT a blocker.
@@ -197,7 +241,8 @@ Conclusion: MelvinBot is a lead, not a seed. Static analysis alone is ~1-in-4.
 
 - `sniper/similarity.py` (pre-post duplicate check against ProposalPolice)
 - auto-post step
-- cron/systemd scheduling on OCI
+- cron/systemd scheduling on OCI for `verify.py` (the bounty tracker `hunt.py`
+  is already scheduled: `deploy/install-hunt-cron.sh`, every 3 hours)
 - `AUTO_POST` default is `1` in config but nothing posts yet
 
 ## Running things
