@@ -837,3 +837,108 @@ def test_the_cli_actually_asks_for_silence(monkeypatch):
     seen.clear()
     assert hunt.main(["--watch"]) == 0
     assert seen["notify_when_empty"] is False
+
+
+def test_a_freshly_checked_timeline_is_not_read_again_next_sweep(tmp_path, fake_get):
+    """Stage 3 had no cache, no dedup and no per-source cap.
+
+    Measured 2026-08-10: Expensify's standing search returns all 83 open Help
+    Wanted issues on every sweep, every one of them survives free_reject
+    (Expensify is in ASSIGNEE_NOT_A_CLAIM) and repo_reject, and every one then
+    cost 1-3 core calls plus CORE_CALL_PAUSE_S. On the ten-MINUTE watch cron
+    that is 1.5-2.5 minutes of wall clock and 500-1500 guard-counted core units
+    an hour, against a guard that refuses to start a run above 3500.
+    """
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("randobot")])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
+    calls_after_first = len(fake_get.calls)
+    # The real clock, not NOW: reserve_or_wait reads time.time() itself, so the
+    # budget window a reservation lands in is the wall-clock one.
+    spent_after_first = store.spent(conn, "core")
+
+    # Only the repo-detail revalidation is queued. FakeGet raises on an
+    # unqueued request, so a second timeline read fails this test loudly.
+    fake_get.queue(304, None)
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW + 600, dry_run=True)
+
+    assert not any("timeline" in url
+                   for url, _ in fake_get.calls[calls_after_first:])
+    assert store.spent(conn, "core") == spent_after_first + 1  # repo detail only
+    # The stored count is REUSED, not silently reset to "uncontested".
+    row = conn.execute("SELECT open_pr_count, rejected, score FROM candidates"
+                       ).fetchone()
+    assert row["open_pr_count"] == 1
+    assert row["rejected"] is None
+    assert row["score"] is not None
+
+
+def test_a_candidate_never_checked_is_still_checked(tmp_path, fake_get):
+    """The TTL skips a check already made; it must never skip the first one."""
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("randobot")])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
+
+    fake_get.queue(304, None)
+    fake_get.queue(200, [])          # #2 has never been checked -- it must be
+    _run(conn, sources=[FakeSource("s", [_cand(1), _cand(2)])],
+         now=NOW + 600, dry_run=True)
+    counts = {r["number"]: r["open_pr_count"] for r in
+              conn.execute("SELECT number, open_pr_count FROM candidates")}
+    assert counts == {1: 1, 2: 0}
+
+
+def test_a_check_older_than_the_ttl_is_made_again(tmp_path, fake_get):
+    """A claim can land at any time, so this is a freshness trade, not a cache."""
+    from sniper import config
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
+
+    later = NOW + config.TIMELINE_RECHECK_S + 1
+    fake_get.queue(304, None)
+    fake_get.queue(200, [_open_pr_by("randobot"), _open_pr_by("other")])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=later, dry_run=True)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 2
+
+
+def test_a_reused_check_does_not_revive_a_candidate_it_had_rejected(tmp_path, fake_get):
+    """Stage 3's verdict is TWO facts: how many rivals, and whether an assignee
+    already owns the PR. Reusing only the count would clear the claim on the
+    very next sweep and put a bounty that has already been awarded back on the
+    board -- with no call made and nothing in the log to say why.
+    """
+    conn = _conn(tmp_path)
+    claimed = _cand(1, source="expensify", assignee={"login": "daledah"})
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("daledah")])
+    _run(conn, sources=[FakeSource("s", [claimed])], now=NOW, dry_run=True)
+    assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] \
+        == "claimed by assignee @daledah"
+
+    fake_get.queue(304, None)
+    _run(conn, sources=[FakeSource("s", [claimed])], now=NOW + 600, dry_run=True)
+    assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] \
+        == "claimed by assignee @daledah"
+
+
+def test_a_timeline_that_could_not_be_read_is_not_recorded_as_a_check(tmp_path, fake_get):
+    """"I could not look" must not start a TTL. Recording a failed read as a
+    check would suppress the retry for the whole window -- the one shape of
+    silence this pipeline exists to prevent, with a stopwatch attached.
+    """
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(500, {"message": "boom"})
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
+
+    fake_get.queue(304, None)
+    fake_get.queue(200, [_open_pr_by("randobot")])   # must be asked again
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW + 600, dry_run=True)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 1

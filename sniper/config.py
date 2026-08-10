@@ -348,6 +348,36 @@ CORE_CALL_PAUSE_S = float(os.environ.get("CORE_CALL_PAUSE_S", "0.5"))
 # since a kept candidate gets read by a human and a rejected one disappears.
 TIMELINE_MAX_PAGES = int(os.environ.get("TIMELINE_MAX_PAGES", "3"))
 
+# How long a stage-3 timeline verdict stays good enough to reuse.
+#
+# Stage 3 had no cache, no dedup against already-judged rows and no per-source
+# cap, so it re-read every survivor's timeline on every sweep. Measured
+# 2026-08-10: the standing Help Wanted search returns all 83 open issues each
+# time, all 83 survive free_reject (Expensify is in ASSIGNEE_NOT_A_CLAIM, so
+# the assignee rule that drops them elsewhere never fires) and repo_reject, and
+# each then costs 1-3 core calls plus CORE_CALL_PAUSE_S (0.5s). WATCH_SOURCES
+# puts that on the TEN-MINUTE cron: 1.5-2.5 minutes of wall clock per sweep and
+# 500-1500 guard-counted core units an hour, against a guard that refuses to
+# start a run once 3500 of CORE_QUOTA_PER_HOUR is spent. It fitted inside ten
+# minutes by luck, and `flock -n` turns an overrun into a silently skipped cycle.
+#
+# Six hours, and the number is a trade rather than a free win: a claim can land
+# at any moment, so reusing a verdict means a bounty awarded five hours ago can
+# still be on the board. That is the SAFE direction and the same one
+# TIMELINE_MAX_PAGES already takes -- a candidate we kept gets read by a human
+# who sees the assigned PR, while one we rejected disappears unseen.
+#
+# Six rather than three (the digest interval) so a watch sweep is not forced to
+# redo the whole standing list between digests, and rather than twenty-four so a
+# claimed issue never survives more than two digests. At 6h each standing
+# candidate costs at most 4 checks a day: 83 x 4 = 332 core units daily, against
+# the 12,000-36,000 the ten-minute re-read was spending.
+#
+# A candidate that has NEVER been checked is checked immediately, whatever this
+# is set to -- the label-event path stays as fast as it was. Set to 0 to
+# restore the old behaviour of re-reading every timeline every sweep.
+TIMELINE_RECHECK_S = float(os.environ.get("TIMELINE_RECHECK_S", str(6 * 3600)))
+
 # A secondary (burst) throttle clears in minutes, so a search page is worth
 # waiting out rather than abandoning: measured 2026-08-09, giving up on one cost
 # 420 of 520 candidates and produced a digest dominated by whichever repo filled

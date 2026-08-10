@@ -106,3 +106,43 @@ def test_reopening_a_database_that_actually_ran_the_alter_is_idempotent(tmp_path
     assert row["repo"] == "acme/w"
     assert row["amount_usd"] == 100
     assert row["open_pr_count"] is None
+
+
+def test_connect_adds_the_timeline_stamp_column_to_an_old_database(tmp_path):
+    """The second column added after release, and the one a live box needs most.
+
+    Without it the TTL that stops stage 3 re-reading the same 83 timelines every
+    ten minutes has nowhere to record that it looked -- and the failure would be
+    an OperationalError inside a cron run, after the sweep had already spent its
+    quota, not a startup error anyone would see.
+    """
+    db = tmp_path / "old.sqlite"
+    raw = sqlite3.connect(db)
+    raw.executescript(OLD_SCHEMA)
+    raw.commit()
+    raw.close()
+
+    conn = store.connect(db)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)")}
+    assert {"open_pr_count", "pr_checked_at"} <= columns
+
+
+def test_a_fresh_database_and_a_migrated_one_have_the_same_columns(tmp_path):
+    """ADDED_COLUMNS' own docstring promises this, and nothing checked it.
+
+    A column added to ADDED_COLUMNS but forgotten in SCHEMA gives a fresh box a
+    table the migrated box does not have -- and the two hosts then disagree
+    about what the tracker can remember, silently, until a query touches it.
+    """
+    old = tmp_path / "old.sqlite"
+    raw = sqlite3.connect(old)
+    raw.executescript(OLD_SCHEMA)
+    raw.commit()
+    raw.close()
+
+    migrated = {row["name"] for row in
+                store.connect(old).execute("PRAGMA table_info(candidates)")}
+    fresh = {row["name"] for row in
+             store.connect(tmp_path / "fresh.sqlite").execute(
+                 "PRAGMA table_info(candidates)")}
+    assert migrated == fresh

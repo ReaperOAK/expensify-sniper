@@ -43,6 +43,14 @@ SOURCE_CLASSES = {
     PayerWatchSource.name: PayerWatchSource,
 }
 
+# Stage 3's own reject reason, as a constant because TWO places now depend on
+# the exact spelling: the f-string that writes it, and the TTL reuse below that
+# has to recognise its own verdict in a stored row. A reword that touched only
+# one of them would clear every claim on the next sweep and put awarded
+# bounties back on the board, silently -- the same by-convention coupling that
+# store.bounty_inventory was carrying against payers' reason strings.
+CLAIM_PREFIX = "claimed by assignee @"
+
 
 def build_sources(names: list[str]) -> list[Source]:
     built = []
@@ -278,31 +286,56 @@ def run(
         else:
             still.append(cand)
 
-    # Stage 3 -- timeline, survivors only.
+    # Stage 3 -- timeline, survivors only, and only when the last look has aged out.
     for cand in still:
-        if not store.reserve_or_wait(conn, "core", 1):
-            warnings.append(
-                f"core budget exhausted -- {cand.repo}#{cand.number} timeline not checked")
-            break
-        if config.CORE_CALL_PAUSE_S:
-            time.sleep(config.CORE_CALL_PAUSE_S)
-        try:
-            linked = github_api.linked_pr_state(
-                cand.repo, cand.number, frozenset(cand.assignees))
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(f"timeline for {cand.repo}#{cand.number} failed: {exc}")
+        # Reuse before reserve: a check we are not going to make must not spend
+        # budget, and must not pace itself either. See config.TIMELINE_RECHECK_S
+        # for the measurement -- 83 standing Expensify issues re-read every ten
+        # minutes, at 1-3 core calls and half a second each.
+        prior = store.recent_pr_check(conn, cand.source, cand.repo, cand.number,
+                                      ttl=config.TIMELINE_RECHECK_S, now=stamp)
+        if prior is not None:
+            open_count = prior["open_pr_count"]
+            # Carry the CLAIM forward too, not just the count. Stage 3's verdict
+            # is two facts, and a reuse that dropped the second one would
+            # re-write a claimed candidate with rejected=NULL -- reviving an
+            # awarded bounty onto the board, with no call made to blame it on.
+            # Only stage 3's own reason is carried: every other stored reason
+            # came from a stage this sweep has already re-run and cleared, which
+            # is exactly what the full path does when it finds no claimant.
+            claim = (prior["rejected"]
+                     if (prior["rejected"] or "").startswith(CLAIM_PREFIX)
+                     else None)
+            checked_at = None  # the stored check stands; do not restart its clock
+        else:
+            if not store.reserve_or_wait(conn, "core", 1):
+                warnings.append(
+                    f"core budget exhausted -- {cand.repo}#{cand.number} timeline not checked")
+                break
+            if config.CORE_CALL_PAUSE_S:
+                time.sleep(config.CORE_CALL_PAUSE_S)
+            try:
+                linked = github_api.linked_pr_state(
+                    cand.repo, cand.number, frozenset(cand.assignees))
+            except Exception as exc:  # noqa: BLE001
+                # No upsert, so no stamp: a read that failed is not a check, and
+                # recording one would suppress the retry for a whole TTL window.
+                warnings.append(f"timeline for {cand.repo}#{cand.number} failed: {exc}")
+                continue
+            open_count = linked.open_count
+            # An open PR by someone already assigned is the one shape that means
+            # the work has been handed out -- true on Expensify, where a C+ picks
+            # a proposal and then assigns its author, and on Algora, where the
+            # winner is whoever merges. Every other open PR is a rival, and
+            # rivals are scored rather than rejected.
+            claim = f"{CLAIM_PREFIX}{linked.claimant}" if linked.claimant else None
+            checked_at = stamp
+
+        if claim:
+            store.upsert_candidate(conn, cand, rejected=claim, now=stamp,
+                                   pr_checked_at=checked_at)
             continue
-        # An open PR by someone already assigned is the one shape that means the
-        # work has been handed out -- true on Expensify, where a C+ picks a
-        # proposal and then assigns its author, and on Algora, where the winner
-        # is whoever merges. Every other open PR is a rival, and rivals are
-        # scored rather than rejected.
-        if linked.claimant:
-            store.upsert_candidate(
-                conn, cand, rejected=f"claimed by assignee @{linked.claimant}",
-                now=stamp)
-            continue
-        cand = cand.with_linked_prs(linked.open_count)
+        cand = cand.with_linked_prs(open_count)
         try:
             scored = cand.with_score(scoring.score(cand, now=stamp))
         except Exception as exc:  # noqa: BLE001 -- score() raises by contract on an
@@ -312,7 +345,7 @@ def run(
             # run: no digest, and every other warning in it lost too.
             warnings.append(f"scoring {cand.repo}#{cand.number} failed: {exc}")
             continue
-        store.upsert_candidate(conn, scored, now=stamp)
+        store.upsert_candidate(conn, scored, now=stamp, pr_checked_at=checked_at)
 
     # Stage 4 -- digest.
     if first_run:

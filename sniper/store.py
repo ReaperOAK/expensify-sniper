@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     stars         INTEGER,
     score         REAL,
     open_pr_count INTEGER,
+    pr_checked_at REAL,
     created_at    TEXT    NOT NULL,
     updated_at    TEXT    NOT NULL,
     first_seen_at REAL    NOT NULL,
@@ -92,7 +93,7 @@ CREATE TABLE IF NOT EXISTS rate_budget (
 # declarations identical to SCHEMA's, so a migrated database and a fresh one are
 # indistinguishable.
 ADDED_COLUMNS: dict[str, dict[str, str]] = {
-    "candidates": {"open_pr_count": "INTEGER"},
+    "candidates": {"open_pr_count": "INTEGER", "pr_checked_at": "REAL"},
 }
 
 
@@ -215,6 +216,7 @@ def upsert_candidate(
     *,
     rejected: str | None = None,
     now: float | None = None,
+    pr_checked_at: float | None = None,
 ) -> bool:
     """Record a candidate. Returns True if this is the first time we have seen it.
 
@@ -224,6 +226,13 @@ def upsert_candidate(
 
     A rejected candidate is still written, with its reason. Deleting it would
     make "filtered out" and "never discovered" look identical on the next run.
+
+    `pr_checked_at` is when stage 3 actually READ this issue's timeline, and
+    None means "not on this sweep", not "never" -- so on update it is COALESCEd
+    rather than overwritten. Every sighting rewrites the row, and a stamp that
+    travelled with the row would be refreshed by sweeps that made no call at
+    all, so the TTL in recent_pr_check would never expire and the check would
+    be made exactly once, ever.
     """
     stamp = time.time() if now is None else now
     source, repo, number = cand.key
@@ -241,13 +250,14 @@ def upsert_candidate(
         """
         INSERT OR IGNORE INTO candidates
             (source, repo, number, title, url, state, amount_usd, comments, labels,
-             language, stars, score, open_pr_count, created_at, updated_at,
-             first_seen_at, last_seen_at, rejected)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             language, stars, score, open_pr_count, pr_checked_at, created_at,
+             updated_at, first_seen_at, last_seen_at, rejected)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (source, repo, number, cand.title, cand.url, cand.state, cand.amount_usd,
          cand.comments, labels, cand.language, cand.stars, cand.score,
-         cand.open_pr_count, cand.created_at, cand.updated_at, stamp, stamp, rejected),
+         cand.open_pr_count, pr_checked_at, cand.created_at, cand.updated_at,
+         stamp, stamp, rejected),
     )
     is_new = cur.rowcount > 0
     if not is_new:
@@ -258,12 +268,13 @@ def upsert_candidate(
             UPDATE candidates SET
                 title = ?, url = ?, state = ?, amount_usd = ?, comments = ?,
                 labels = ?, language = ?, stars = ?, score = ?, open_pr_count = ?,
+                pr_checked_at = COALESCE(?, pr_checked_at),
                 updated_at = ?, last_seen_at = ?, rejected = ?
             WHERE source = ? AND repo = ? AND number = ?
             """,
             (cand.title, cand.url, cand.state, cand.amount_usd, cand.comments,
              labels, cand.language, cand.stars, cand.score, cand.open_pr_count,
-             cand.updated_at, stamp, rejected, source, repo, number),
+             pr_checked_at, cand.updated_at, stamp, rejected, source, repo, number),
         )
     conn.commit()
     return is_new
@@ -278,6 +289,40 @@ def known_updated_at(
         (source, repo, number),
     ).fetchone()
     return row["updated_at"] if row else None
+
+
+def recent_pr_check(
+    conn: sqlite3.Connection,
+    source: str,
+    repo: str,
+    number: int,
+    *,
+    ttl: float,
+    now: float | None = None,
+) -> sqlite3.Row | None:
+    """The stored stage-3 verdict, if it is younger than `ttl`. None = go and look.
+
+    Returns the two facts stage 3 produces -- `open_pr_count` (competition, and
+    it feeds the score) and `rejected` (whether an assignee already owned the
+    PR) -- so a caller reusing the check reuses BOTH. Reusing only the count
+    would silently clear a claim on the next sweep and put an awarded bounty
+    back on the board with no call made and nothing in the log.
+
+    None is returned for three different situations that all mean the same
+    thing to a caller -- no row, no stamp, or a stamp older than `ttl` -- and
+    also when `open_pr_count IS NULL`. That last one matters: every candidate
+    rejected before stage 3 is written with a NULL count, so the row existing is
+    not evidence anyone read its timeline. "I never looked" and "there are no
+    PRs" are different answers and must never share a value.
+    """
+    stamp = time.time() if now is None else now
+    return conn.execute(
+        "SELECT open_pr_count, pr_checked_at, rejected FROM candidates "
+        "WHERE source = ? AND repo = ? AND number = ? "
+        "  AND open_pr_count IS NOT NULL AND pr_checked_at IS NOT NULL "
+        "  AND pr_checked_at > ?",
+        (source, repo, number, stamp - ttl),
+    ).fetchone()
 
 
 def candidate_count(conn: sqlite3.Connection) -> int:

@@ -357,3 +357,56 @@ def test_the_comment_ceiling_reaches_rows_already_stored(tmp_path):
     assert rows[2] is None          # exactly at the ceiling is kept
     assert rows[3] is None
     assert rows[4] == "fork"        # an existing verdict is not overwritten
+
+
+def test_a_timeline_check_is_stamped_and_read_back_while_it_is_fresh(tmp_path):
+    """Stage 3 costs 1-3 core calls plus a pace, per candidate, per sweep.
+
+    Measured 2026-08-10: the standing Help Wanted search hands stage 3 all 83
+    open issues on EVERY watch sweep -- every ten minutes -- because nothing
+    recorded that the timeline had just been read. The stamp is what turns that
+    into a question with an answer already in hand.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    cand = replace(_candidate(number=1), open_pr_count=2)
+    store.upsert_candidate(conn, cand, now=1000.0, pr_checked_at=1000.0)
+
+    fresh = store.recent_pr_check(conn, "github-labels", "acme/widgets", 1,
+                                  ttl=600, now=1100.0)
+    assert fresh is not None
+    assert fresh["open_pr_count"] == 2
+    assert fresh["rejected"] is None
+
+
+def test_a_check_older_than_the_ttl_is_not_reusable(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, replace(_candidate(number=1), open_pr_count=2),
+                           now=1000.0, pr_checked_at=1000.0)
+    assert store.recent_pr_check(conn, "github-labels", "acme/widgets", 1,
+                                 ttl=600, now=2000.0) is None
+
+
+def test_a_candidate_never_checked_reports_no_check_rather_than_zero_prs(tmp_path):
+    """"I never looked" and "there are no PRs" are different answers.
+
+    upsert_candidate writes open_pr_count=None for every candidate rejected
+    before stage 3, so a row existing is not evidence its timeline was read.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), now=1000.0)
+    assert store.recent_pr_check(conn, "github-labels", "acme/widgets", 1,
+                                 ttl=600, now=1000.0) is None
+
+
+def test_the_check_stamp_survives_an_upsert_that_did_not_check(tmp_path):
+    """Every later sighting re-writes the row. If the stamp went with it, the
+    TTL would reset on a sweep that never read the timeline and the check would
+    never expire at all.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, replace(_candidate(number=1), open_pr_count=2),
+                           now=1000.0, pr_checked_at=1000.0)
+    store.upsert_candidate(conn, replace(_candidate(number=1), open_pr_count=2),
+                           now=1100.0)
+    row = conn.execute("SELECT pr_checked_at FROM candidates").fetchone()
+    assert row["pr_checked_at"] == 1000.0
