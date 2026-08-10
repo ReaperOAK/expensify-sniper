@@ -396,26 +396,44 @@ def get_repo(repo: str, etag: str | None = None) -> tuple[dict[str, Any] | None,
     return resp.json(), resp.headers.get("ETag"), True
 
 
-def iter_timeline(repo: str, number: int) -> Iterator[dict[str, Any]]:
+def _timeline_page(repo: str, number: int, page: int) -> list[dict[str, Any]]:
+    """One page of an issue's timeline. The single place that request is made."""
+    resp = _get(
+        f"/repos/{repo}/issues/{number}/timeline",
+        params={"per_page": 100, "page": page},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def iter_timeline(repo: str, number: int,
+                  max_pages: int | None = None) -> Iterator[dict[str, Any]]:
     """Yield timeline events for an issue, oldest first.
 
     Core quota (5000/hr), not search quota (30/min). That choice is the whole
     reason this uses /timeline rather than a `linked:pr` search.
+
+    STOPS after `max_pages` (config.TIMELINE_MAX_PAGES). Measured 2026-08-10 on
+    the live box: one candidate consumed 75 consecutive core calls -- 7,500+
+    timeline events on a single issue -- without the sweep advancing by one row,
+    because nothing bounded the paging. Stage 3 fell to roughly three candidates
+    a minute, which over 975 survivors is longer than the interval the cron that
+    calls it runs on.
+
+    The predecessor could not hit this: it short-circuited on the first open PR
+    and almost never left page one. Counting removed the short-circuit and
+    nothing replaced the bound.
+
+    The caller must ask whether it was truncated -- see linked_pr_state.
     """
-    page = 1
-    while True:
-        resp = _get(
-            f"/repos/{repo}/issues/{number}/timeline",
-            params={"per_page": 100, "page": page},
-        )
-        resp.raise_for_status()
-        batch = resp.json()
+    limit = config.TIMELINE_MAX_PAGES if max_pages is None else max_pages
+    for page in range(1, limit + 1):
+        batch = _timeline_page(repo, number, page)
         if not batch:
             return
         yield from batch
         if len(batch) < 100:
             return
-        page += 1
 
 
 @dataclass(frozen=True)
@@ -432,6 +450,13 @@ class LinkedPRs:
 
     open_count: int
     claimant: str | None
+    # False when the timeline was truncated by TIMELINE_MAX_PAGES, which makes
+    # open_count a FLOOR rather than a total. Truncation is safe in both
+    # directions and that is why a cap is acceptable at all: a claimant we DID
+    # find is positive evidence and still rejects, and a claimant we did not
+    # find leaves the candidate live -- which is the safe error, since a kept
+    # candidate gets read by a human while a rejected one disappears.
+    complete: bool = True
 
 
 def linked_pr_state(repo: str, number: int, assignees: frozenset[str]) -> LinkedPRs:
@@ -447,20 +472,36 @@ def linked_pr_state(repo: str, number: int, assignees: frozenset[str]) -> Linked
     the author's login as GitHub spelled it, so the reject reason names the real
     account.
 
-    This reads the WHOLE timeline. The predecessor short-circuited on the first
-    open PR, which a count cannot do without under-reporting competition.
+    Reads the timeline up to config.TIMELINE_MAX_PAGES. The predecessor
+    short-circuited on the first open PR, which a count cannot do without
+    under-reporting competition -- but removing the short-circuit left the
+    paging unbounded, and one issue then consumed 75 consecutive core calls
+    (measured 2026-08-10). `complete` says whether the whole timeline was seen.
     """
     lowered = {login.lower() for login in assignees}
     open_count = 0
     claimant: str | None = None
-    for event in iter_timeline(repo, number):
-        if event.get("event") != "cross-referenced":
-            continue
-        source = (event.get("source") or {}).get("issue") or {}
-        if not source.get("pull_request") or source.get("state") != "open":
-            continue
-        open_count += 1
-        author = (source.get("user") or {}).get("login") or ""
-        if claimant is None and author.lower() in lowered:
-            claimant = author
-    return LinkedPRs(open_count=open_count, claimant=claimant)
+    complete = True
+
+    # Pages itself rather than going through iter_timeline, so truncation is
+    # known from the loop that stopped rather than from a second request asking
+    # whether it should have.
+    for page in range(1, config.TIMELINE_MAX_PAGES + 1):
+        batch = _timeline_page(repo, number, page)
+        for event in batch:
+            if event.get("event") != "cross-referenced":
+                continue
+            source = (event.get("source") or {}).get("issue") or {}
+            if not source.get("pull_request") or source.get("state") != "open":
+                continue
+            open_count += 1
+            author = (source.get("user") or {}).get("login") or ""
+            if claimant is None and author.lower() in lowered:
+                claimant = author
+        if len(batch) < 100:
+            break
+    else:
+        # Every allowed page came back full, so there is more we did not read.
+        complete = False
+
+    return LinkedPRs(open_count=open_count, claimant=claimant, complete=complete)

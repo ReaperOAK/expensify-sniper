@@ -120,3 +120,51 @@ def test_real_recorded_timeline_counts_open_prs(fake_get):
     state = github_api.linked_pr_state("arakoodev/EdgeChains", 279, frozenset())
     assert state.open_count > 0
     assert state.claimant is None
+
+
+def test_paging_is_bounded_so_one_issue_cannot_eat_a_sweep(fake_get):
+    """Measured 2026-08-10 on the live box, and it stopped a production sweep.
+
+    With no bound, ONE candidate consumed 75 consecutive core calls -- 7,500+
+    timeline events on a single issue -- while `open_pr_count` did not advance
+    by a single row. Stage 3 fell to roughly three candidates a minute, which
+    over 975 survivors is longer than the interval of the cron that calls it.
+
+    The predecessor could not hit this: it stopped at the first open PR and
+    almost never left page one. Counting removed that stop and nothing replaced
+    the bound.
+    """
+    from sniper import config
+
+    for _ in range(config.TIMELINE_MAX_PAGES + 5):
+        fake_get.queue(200, [{"event": "commented"}] * 100)
+
+    state = github_api.linked_pr_state("acme/widgets", 1, frozenset())
+
+    assert len(fake_get.calls) == config.TIMELINE_MAX_PAGES
+    assert state.complete is False
+
+
+def test_a_timeline_that_ends_within_the_cap_is_complete(fake_get):
+    fake_get.queue(200, [_xref(True, "open", "randobot")])
+    state = github_api.linked_pr_state("acme/widgets", 1, frozenset())
+    assert state.complete is True
+    assert state.open_count == 1
+
+
+def test_a_truncated_read_still_reports_the_claimant_it_did_find(fake_get):
+    """Truncation is safe in both directions, which is why the cap is allowed.
+
+    A claimant found is positive evidence and still rejects. A claimant NOT
+    found leaves the candidate live, which is the safe error: a kept candidate
+    gets read by a human, a rejected one disappears.
+    """
+    from sniper import config
+
+    fake_get.queue(200, [_xref(True, "open", "alice")] + [{"event": "c"}] * 99)
+    for _ in range(config.TIMELINE_MAX_PAGES):
+        fake_get.queue(200, [{"event": "c"}] * 100)
+
+    state = github_api.linked_pr_state("acme/widgets", 1, frozenset({"alice"}))
+    assert state.claimant == "alice"
+    assert state.complete is False

@@ -344,12 +344,22 @@ def test_gist_calls_carry_the_gist_credential_not_the_read_one(monkeypatch):
 
 
 def test_the_gist_token_falls_back_to_the_read_token(monkeypatch):
-    """One sufficiently-scoped token must still work; two is an option, not a rule."""
+    """One sufficiently-scoped token must still work; two is an option, not a rule.
+
+    Sets BOUNTY_GIST_TOKEN to the EMPTY string rather than deleting it. Deleting
+    it made this test depend on the developer's own .env: `_load_env` fills gaps
+    with `os.environ.setdefault`, so once a real BOUNTY_GIST_TOKEN existed on
+    disk the reload picked it up and the fallback was never exercised. It went
+    green everywhere until the day the credential was actually configured, and
+    then failed for a reason that had nothing to do with the code. An empty
+    value survives setdefault and reaches the `or GITHUB_TOKEN` branch, which is
+    the branch under test.
+    """
     import importlib
 
     from sniper import config
 
-    monkeypatch.delenv("BOUNTY_GIST_TOKEN", raising=False)
+    monkeypatch.setenv("BOUNTY_GIST_TOKEN", "")
     monkeypatch.setenv("GITHUB_TOKEN", "only-one-token")
     reloaded = importlib.reload(config)
     try:

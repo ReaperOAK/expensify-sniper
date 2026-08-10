@@ -272,6 +272,25 @@ SEARCH_PAGE_PAUSE_S = float(os.environ.get("SEARCH_PAGE_PAUSE_S", "3"))
 # Smaller than the search pause because core requests are individually cheap.
 CORE_CALL_PAUSE_S = float(os.environ.get("CORE_CALL_PAUSE_S", "0.5"))
 
+# How many 100-event pages of one issue's timeline stage 3 will read.
+#
+# Measured 2026-08-10 on the live box: with no bound at all, ONE candidate
+# consumed 75 consecutive core calls -- 7,500+ timeline events on a single
+# issue -- while the sweep did not advance by a single row. Stage 3 fell to
+# about three candidates a minute, which over 975 survivors is longer than the
+# interval of the cron that calls it.
+#
+# The predecessor of linked_pr_state could not hit this because it stopped at
+# the first open PR and almost never left page one. Counting removed that stop
+# and nothing replaced the bound.
+#
+# 3 pages is 300 events, which covers every real bounty issue; anything past it
+# is pathological. Truncating is safe in BOTH directions, which is why a cap is
+# acceptable here at all: a claimant found is positive evidence and still
+# rejects, and a claimant not found leaves the candidate live -- the safe error,
+# since a kept candidate gets read by a human and a rejected one disappears.
+TIMELINE_MAX_PAGES = int(os.environ.get("TIMELINE_MAX_PAGES", "3"))
+
 # A secondary (burst) throttle clears in minutes, so a search page is worth
 # waiting out rather than abandoning: measured 2026-08-09, giving up on one cost
 # 420 of 520 candidates and produced a digest dominated by whichever repo filled
