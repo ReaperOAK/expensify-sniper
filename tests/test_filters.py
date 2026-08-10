@@ -219,9 +219,24 @@ def test_a_bounty_nobody_has_touched_in_a_week_is_rejected():
     board of everything rankable.
     """
     assert filters.free_reject(_cand(updated_at="2026-01-01T00:00:00Z"),
-                               now=_NOW) == "no activity in 221d"
+                               now=_NOW) == "no activity in over 7d"
     assert filters.free_reject(_cand(updated_at="2026-08-09T00:00:00Z"),
                                now=_NOW) is None
+
+
+def test_the_staleness_reason_does_not_interpolate_the_idle_count():
+    """It used to read "no activity in 221d", so every candidate produced a
+    different spelling of the same verdict.
+
+    The board groups its reject table by the exact string and clear_rejections
+    matches it exactly, so an interpolated count turned one big rule into
+    dozens of one-row reasons that nothing could see or reverse -- and it made
+    it impossible for store.apply_staleness to write text the free path would
+    ever agree with.
+    """
+    a = filters.free_reject(_cand(updated_at="2026-01-01T00:00:00Z"), now=_NOW)
+    b = filters.free_reject(_cand(updated_at="2026-07-01T00:00:00Z"), now=_NOW)
+    assert a == b == filters.stale_reason()
 
 
 def test_staleness_is_not_measured_on_creation_date():

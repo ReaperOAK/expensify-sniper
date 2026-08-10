@@ -1073,3 +1073,27 @@ def test_a_dry_run_does_not_burn_the_heartbeat(tmp_path, fake_get, monkeypatch):
     _run(conn, sources=[FakeSource("s", [])], now=NOW + 3660, dry_run=False,
          notify_when_empty=False)
     assert len(sent) == 1
+
+
+def test_a_row_that_went_stale_after_being_stored_is_dropped_by_the_run(
+        tmp_path, fake_get):
+    """The candidate was fresh when it was discovered and idle three weeks
+    later. Nothing rediscovers it -- BountyLabelSource sorts by `updated`, so a
+    row this idle is on the last page it reaches, if any -- so without a
+    retroactive pass it stays on the board for as long as GitHub leaves it
+    alone, which is precisely as long as it deserves to be off it.
+    """
+    from sniper import filters
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
+    assert store.live_candidates(conn, limit=10) != []
+
+    text = _run(conn, sources=[FakeSource("s", [])], now=NOW + 21 * 86400,
+                dry_run=True)
+    assert store.live_candidates(conn, limit=10) == []
+    row = conn.execute("SELECT rejected FROM candidates").fetchone()
+    assert row["rejected"] == filters.stale_reason()
+    assert "1 candidates dropped as stale" in text

@@ -481,3 +481,81 @@ def test_a_repo_is_flagged_algora_for_all_its_rows_when_any_one_wears_the_label(
         now=1.0)
 
     assert store.algora_repos(conn) == {"acme/widgets"}
+
+
+def test_the_staleness_rule_reaches_rows_already_stored(tmp_path):
+    """The comment ceiling got a retroactive half in 149f5c0/1d5852d; the
+    staleness rule shipped without one, so rows already in the table stayed
+    live however idle they were until a source rediscovered them.
+
+    The argument is STRONGER here than for the ceiling: a stale issue is by
+    definition one nothing is happening to, and BountyLabelSource sorts by
+    `updated`, so the stalest rows are the ones its pages reach last and its
+    stop() reaches never.
+    """
+    from sniper import filters
+
+    now = 1786000000.0
+    day = 86400.0
+    conn = store.connect(tmp_path / "s.sqlite")
+
+    def at(offset_days):
+        import datetime as dt
+        moment = dt.datetime.fromtimestamp(now - offset_days * day,
+                                           tz=dt.timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    store.upsert_candidate(conn, replace(_candidate(number=1), updated_at=at(30)),
+                           now=1.0)
+    store.upsert_candidate(conn, replace(_candidate(number=2), updated_at=at(2)),
+                           now=1.0)
+    store.upsert_candidate(conn, replace(_candidate(number=3), updated_at=at(30)),
+                           rejected="fork", now=1.0)
+
+    changed = store.apply_staleness(conn, 7, now=now)
+
+    assert changed == 1
+    rows = {r["number"]: r["rejected"] for r in
+            conn.execute("SELECT number, rejected FROM candidates")}
+    assert rows[1] == filters.stale_reason(7)
+    assert rows[2] is None
+    assert rows[3] == "fork"       # an existing verdict is not overwritten
+
+
+def test_the_retroactive_staleness_cutoff_matches_the_free_rule_exactly(tmp_path):
+    """free_reject rejects on `idle > days`, and timedelta.days truncates -- so
+    the line is at EIGHT whole days for STALE_AFTER_DAYS=7. A cutoff that drew
+    it anywhere else would have the same rule keep a candidate at stage 1 and
+    reject it retroactively on the same sweep, or the reverse.
+    """
+    import datetime as dt
+
+    from sniper import filters
+    from sniper.models import Candidate
+
+    now = 1786000000.0
+    conn = store.connect(tmp_path / "s.sqlite")
+    for number, offset in ((1, 7.9), (2, 8.0), (3, 8.1)):
+        moment = dt.datetime.fromtimestamp(now - offset * 86400, tz=dt.timezone.utc)
+        store.upsert_candidate(
+            conn,
+            replace(_candidate(number=number),
+                    updated_at=moment.strftime("%Y-%m-%dT%H:%M:%SZ")),
+            now=1.0)
+    store.apply_staleness(conn, 7, now=now)
+
+    stored = {r["number"]: r["rejected"] for r in
+              conn.execute("SELECT number, rejected FROM candidates")}
+    free = {}
+    for number, row in zip(stored, conn.execute("SELECT * FROM candidates")):
+        cand = Candidate(
+            source=row["source"], repo=row["repo"], number=row["number"],
+            title=row["title"], url=row["url"], state="open", comments=0,
+            labels=(), created_at=row["created_at"], updated_at=row["updated_at"],
+            has_assignee=False, amount_usd=100, amounts_seen=(100,))
+        free[row["number"]] = filters.free_reject(cand, now=now)
+
+    assert stored == free
+    assert stored[1] is None                      # 7.9 days -> 7 whole days, kept
+    assert stored[2] == filters.stale_reason(7)   # 8.0 days -> rejected
+    assert stored[3] == filters.stale_reason(7)

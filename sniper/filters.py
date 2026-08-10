@@ -17,6 +17,24 @@ from . import config
 from .models import Candidate, _now_utc, parse_iso
 
 
+def stale_reason(days: int | None = None) -> str:
+    """The one spelling of the staleness verdict, for both paths that emit it.
+
+    It used to interpolate the MEASURED idle count -- "no activity in 221d" --
+    so every candidate produced a different spelling of the same rule. The
+    board groups its reject table by the exact string and clear_rejections
+    matches it exactly, so that turned one big rule into dozens of one-row
+    reasons nothing could see the size of or reverse. It also made it
+    impossible for store.apply_staleness to write anything free_reject would
+    agree with, since the retroactive pass judges in SQL and has no per-row
+    idle count to interpolate.
+
+    The threshold, not the measurement: "over 7d" is the whole content of the
+    verdict, and 221 was decoration.
+    """
+    return f"no activity in over {config.STALE_AFTER_DAYS if days is None else days}d"
+
+
 def free_reject(
     cand: Candidate,
     *,
@@ -70,7 +88,7 @@ def free_reject(
     # config.STALE_AFTER_DAYS for why that would have emptied the board.
     idle = (_now_utc(now) - parse_iso(cand.updated_at)).days
     if idle > config.STALE_AFTER_DAYS:
-        return f"no activity in {idle}d"
+        return stale_reason()
     if cand.amount_usd is not None and cand.amount_usd < minimum:
         return f"below ${minimum} floor"
     return None

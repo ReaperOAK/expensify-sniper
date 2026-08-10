@@ -9,13 +9,14 @@ silently dropped any second issue labelled inside the same poll window.
 original three tables are untouched: verify.py's state must keep working.
 """
 
+import datetime as dt
 import json
 import sqlite3
 import time
 from typing import Any
 from pathlib import Path
 
-from . import config
+from . import config, filters
 from .models import Candidate
 
 SCHEMA = """
@@ -794,5 +795,45 @@ def apply_comment_ceiling(conn: sqlite3.Connection, ceiling: int) -> int:
     cur = conn.execute(
         "UPDATE candidates SET rejected = comments || ' comments -- too contested' "
         "WHERE rejected IS NULL AND comments > ?", (ceiling,))
+    conn.commit()
+    return cur.rowcount
+
+
+def apply_staleness(conn: sqlite3.Connection, days: int, *,
+                    now: float | None = None) -> int:
+    """Reject stored candidates nothing has touched in `days`. Rows changed.
+
+    The retroactive half of filters.free_reject's staleness rule, mirroring
+    apply_comment_ceiling. The comment ceiling got one in 149f5c0/1d5852d and
+    the staleness rule shipped in e785fef without, so rows already in the table
+    stayed live however idle they were until a source happened to rediscover
+    them -- which for a months-old bounty is never.
+
+    The argument is STRONGER here than for the ceiling. A stale issue is by
+    definition one nothing is happening to, and BountyLabelSource sorts by
+    `updated`, so the stalest rows are exactly the ones its pages reach last
+    and its stop() reaches never. The rule that most needs a retroactive pass
+    was the one that did not have it.
+
+    The comparison is lexicographic on GitHub's own timestamp format
+    ("2026-08-05T06:20:46Z"): fixed width, always UTC, so string order IS
+    chronological order and no per-row parse is needed.
+
+    An EMPTY updated_at is skipped rather than swept up. It sorts before every
+    real timestamp, so a row that never carried one would be rejected as stale
+    on the strength of a missing value -- "I do not know when" read as "a long
+    time ago", which is the one substitution this codebase does not make.
+    """
+    stamp = time.time() if now is None else now
+    # free_reject rejects on `idle > days` where idle is timedelta.days, which
+    # TRUNCATES -- so the real line is at eight whole days for days=7, not
+    # seven. Drawing it anywhere else would let the same rule keep a candidate
+    # at stage 1 and reject it retroactively on the same sweep.
+    cutoff = dt.datetime.fromtimestamp(stamp - (days + 1) * 86400,
+                                       tz=dt.timezone.utc)
+    cur = conn.execute(
+        "UPDATE candidates SET rejected = ? "
+        "WHERE rejected IS NULL AND updated_at != '' AND updated_at <= ?",
+        (filters.stale_reason(days), cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")))
     conn.commit()
     return cur.rowcount

@@ -200,6 +200,16 @@ def run(
         warnings.append(f"{contested} candidates dropped as too contested "
                         f"(over {config.COMMENT_CEILING} comments)")
 
+    # Same reason, and the argument is stronger: a stale issue is by definition
+    # one nothing is happening to, and BountyLabelSource sorts by `updated`, so
+    # the stalest rows are the ones its pages reach last and its stop() reaches
+    # never. e785fef gave this rule no retroactive half at all, so a row that
+    # went idle after being stored stayed live indefinitely.
+    stale = store.apply_staleness(conn, config.STALE_AFTER_DAYS, now=stamp)
+    if stale:
+        warnings.append(f"{stale} candidates dropped as stale "
+                        f"({filters.stale_reason()})")
+
     revived = store.clear_rejections(conn, "open linked PR")
     if revived:
         warnings.append(f"{revived} candidates re-judged: an open PR is no longer "
