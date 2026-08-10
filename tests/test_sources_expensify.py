@@ -217,3 +217,64 @@ def test_the_stored_watermark_is_replayed_as_since_event_id(tmp_path, fake_get):
     fake_get.queue(200, [_event(800, 1, label="Reviewing")], {"ETag": 'W/"a"'})
     ExpensifySource().discover(conn)
     assert store.get_cache(conn, ExpensifySource.WATERMARK_KEY)[1] == "800"
+
+
+# --- reserving what a call may actually spend --------------------------------
+
+
+def test_the_standing_search_reserves_every_page_it_may_read(tmp_path, fake_get):
+    """It reserved ONE unit and then asked for EXPENSIFY_STANDING_MAX_PAGES.
+
+    Two requests were made today at 83 results and SEARCH_PER_PAGE 50, growing
+    to four. Every other caller reserves up front -- BountyLabelSource reserves
+    self.max_pages, known_payers reserves `pages`, ever_closed_with reserves 2
+    for 2 requests -- and the reservation guard is the only thing standing
+    between a throttle and a digest that reports the world as empty.
+    """
+    from sniper import config
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, {"total_count": 0, "incomplete_results": False, "items": []})
+    fake_get.queue(200, [], {"ETag": 'W/"a"'})
+    ExpensifySource().discover(conn)
+    assert store.spent(conn, "search") == config.EXPENSIFY_STANDING_MAX_PAGES
+
+
+def test_the_standing_search_is_skipped_when_its_pages_cannot_be_reserved(
+        tmp_path, fake_get):
+    from sniper import config
+
+    conn = _conn(tmp_path)
+    store.reserve(conn, "search",
+                  store.QUOTA_LIMIT["search"] - config.EXPENSIFY_STANDING_MAX_PAGES + 1)
+    fake_get.queue(200, [], {"ETag": 'W/"a"'})
+    result = ExpensifySource().discover(conn)
+    assert any("search budget exhausted" in w for w in result.warnings)
+    assert not any("/search/issues" in url for url, _ in fake_get.calls)
+
+
+def test_the_event_poll_reserves_every_page_deep_paging_may_read(tmp_path, fake_get):
+    """poll_label_events pages up to EVENT_MAX_PAGES extra times when it has a
+    watermark to page toward, and those calls were made against a reservation
+    of one.
+    """
+    from sniper import config
+
+    conn = _conn(tmp_path)
+    store.set_cache(conn, ExpensifySource.WATERMARK_KEY, None, "700")
+    _no_standing(fake_get)
+    fake_get.queue(200, [_event(800, 1, label="Reviewing")], {"ETag": 'W/"a"'})
+    ExpensifySource().discover(conn)
+    assert store.spent(conn, "core") == config.EVENT_MAX_PAGES
+
+
+def test_the_event_poll_reserves_one_page_when_it_has_no_watermark(tmp_path, fake_get):
+    """No watermark means since_event_id is None, which means the paging block
+    never runs -- so reserving the cap would be spending against the guard for
+    requests that cannot happen.
+    """
+    conn = _conn(tmp_path)
+    _no_standing(fake_get)
+    fake_get.queue(200, [], {"ETag": 'W/"a"'})
+    ExpensifySource().discover(conn)
+    assert store.spent(conn, "core") == 1

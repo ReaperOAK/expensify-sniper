@@ -38,12 +38,20 @@ class ExpensifySource:
         # standing inventory visible only on sweeps where something else changed.
         result.candidates.extend(self._standing(conn, result))
 
-        if not store.reserve_or_wait(conn, "core", 1):
+        etag, _ = store.get_cache(conn, self.CACHE_KEY)
+        _, watermark = store.get_cache(conn, self.WATERMARK_KEY)
+        # Reserve what the poll MAY spend, not what it usually does -- the same
+        # up-front shape as BountyLabelSource (max_pages), known_payers (pages)
+        # and ever_closed_with (2 for 2 requests). A watermark is what turns the
+        # deep-paging block on, and that block called _get up to
+        # EVENT_MAX_PAGES-1 extra times against a reservation of one. The guard
+        # is the only thing between a throttle and a digest reporting an empty
+        # world, so a call it has not counted is a hole in it.
+        pages = config.EVENT_MAX_PAGES if watermark else 1
+        if not store.reserve_or_wait(conn, "core", pages):
             result.warnings.append("core budget exhausted -- Expensify poll skipped")
             return result
 
-        etag, _ = store.get_cache(conn, self.CACHE_KEY)
-        _, watermark = store.get_cache(conn, self.WATERMARK_KEY)
         try:
             events, new_etag, changed, newest = github_api.poll_help_wanted_events(
                 self.repo, etag,
@@ -122,7 +130,12 @@ class ExpensifySource:
         row. Whether any of these are actually AVAILABLE is not decided here --
         stage 3's claim test and the comment ceiling do that, on evidence.
         """
-        if not store.reserve_or_wait(conn, "search", 1):
+        # EXPENSIFY_STANDING_MAX_PAGES, not 1: search_issues is asked for that
+        # many pages and reserving one unit for four requests undercounts the
+        # 30/min pool by three every sweep. Two requests are made today at 83
+        # results and SEARCH_PER_PAGE 50, and the cap exists because that grows.
+        if not store.reserve_or_wait(conn, "search",
+                                     config.EXPENSIFY_STANDING_MAX_PAGES):
             result.warnings.append(
                 "search budget exhausted -- standing Help Wanted issues not listed")
             return []
