@@ -155,6 +155,27 @@ def test_a_young_well_starred_project_is_not_a_farm():
     assert scoring.farm_penalty(cand, now=NOW) == pytest.approx(1.0)
 
 
+def test_the_farm_thresholds_are_pinned_exactly_where_they_sit():
+    """The three comparisons are deliberately asymmetric and unguessable.
+
+    stars uses `>=` (20 stars is enough to be spared), age uses `<` (a repo
+    exactly 90 days old is not young), backlog uses `>` (exactly 200 open
+    issues is not huge). bounty-plaza sat at 5 / 32 / 526, well clear of all
+    three, so nothing in the measured example pins the edges -- and a later
+    reader tuning FEW_STARS has no way to tell which side of each line the
+    boundary value falls on without this.
+    """
+    assert scoring.farm_penalty(
+        _cand(stars=20, repo_age_days=32, repo_open_issues=526),
+        now=NOW) == pytest.approx(1.0)      # >= FEW_STARS: spared entirely
+    assert scoring.farm_penalty(
+        _cand(stars=5, repo_age_days=90, repo_open_issues=526),
+        now=NOW) == pytest.approx(0.6)      # 90 days is not < YOUNG_REPO_DAYS
+    assert scoring.farm_penalty(
+        _cand(stars=5, repo_age_days=32, repo_open_issues=200),
+        now=NOW) == pytest.approx(0.6)      # 200 is not > HUGE_BACKLOG
+
+
 def test_an_unenriched_repo_takes_no_penalty():
     # Missing fields mean the detail call never returned them, not that the repo
     # is clean. Penalising absent data punishes a failed API call, not a farm.

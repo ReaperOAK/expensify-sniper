@@ -260,8 +260,15 @@ HUNT_ENABLED_SOURCES = [
 # Whether such a job has actually been awarded is answered in stage 3 instead:
 # once a C+ picks a proposal, its author is assigned AND opens the PR, which is
 # exactly what github_api.linked_pr_state calls a claim.
+# Lowercased, and matched against a lowercased source name, exactly as
+# PAID_LABELS is three sections above. Without it `ASSIGNEE_NOT_A_CLAIM=Expensify`
+# in .env -- the obvious spelling, since that is how the project is written --
+# exempts nothing at all, the blanket assignee reject drops 100% of Expensify
+# candidates at stage 1 again, and the $250 channel goes dark for the second
+# time with no error anywhere. Silent-no-match is the failure this whole setting
+# exists to undo.
 ASSIGNEE_NOT_A_CLAIM = frozenset(
-    name.strip()
+    name.strip().lower()
     for name in os.environ.get("ASSIGNEE_NOT_A_CLAIM", "expensify").split(",")
     if name.strip()
 )

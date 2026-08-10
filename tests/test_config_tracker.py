@@ -24,6 +24,17 @@ def test_paid_labels_are_lowercased_for_case_insensitive_matching():
     assert all(label == label.lower() for label in config.PAID_LABELS)
 
 
+def test_assignee_exemptions_are_lowercased_like_paid_labels():
+    """`ASSIGNEE_NOT_A_CLAIM=Expensify` must not silently exempt nothing.
+
+    That spelling is the obvious one -- it is how the project writes its own
+    name -- and an un-normalised set would match no source, restore the blanket
+    assignee reject, and take the whole $250 channel dark again with no error
+    anywhere. Exactly the failure this setting was added to undo.
+    """
+    assert all(name == name.lower() for name in config.ASSIGNEE_NOT_A_CLAIM)
+
+
 def test_bounty_queries_include_the_verified_label_and_sort_nothing_itself():
     assert any("💎 Bounty" in q for q in config.BOUNTY_QUERIES)
     # sort/order are search_issues() parameters, never baked into the query text.

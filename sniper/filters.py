@@ -41,7 +41,9 @@ def free_reject(
     # assigns an internal engineer at posting time. See config.ASSIGNEE_NOT_A_CLAIM.
     # Those sources are judged by stage 3's claim test instead, which is the
     # sharper question everywhere: is an assignee also the author of an open PR?
-    if cand.has_assignee and cand.source not in config.ASSIGNEE_NOT_A_CLAIM:
+    # Lowered on both sides: config normalises its entries, so a source named
+    # "Expensify" must not miss an exemption spelled "expensify".
+    if cand.has_assignee and cand.source.lower() not in config.ASSIGNEE_NOT_A_CLAIM:
         return "assigned"
     if any(label.strip().lower() in paid for label in cand.labels):
         return "already rewarded"

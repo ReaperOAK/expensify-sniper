@@ -144,6 +144,14 @@ def test_an_assigned_expensify_issue_is_not_rejected():
     assert filters.free_reject(cand) is None
 
 
+def test_the_exemption_matches_regardless_of_how_the_source_is_capitalised():
+    # config lowercases its entries; the comparison lowercases the source. Get
+    # one side wrong and the exemption silently matches nothing, which is the
+    # state that darkened the $250 channel in the first place.
+    assert filters.free_reject(
+        _cand("Expensify", assignee={"login": "stitesExpensify"})) is None
+
+
 def test_an_assigned_issue_on_every_other_source_is_still_rejected():
     assert filters.free_reject(
         _cand("github-labels", assignee={"login": "x"})) == "assigned"
