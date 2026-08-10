@@ -213,6 +213,10 @@ STALE_AFTER_DAYS = int(os.environ.get("STALE_AFTER_DAYS", "7"))
 # only for the first run, when nothing is known and there is no stopping point.
 EVENT_MAX_PAGES = int(os.environ.get("EVENT_MAX_PAGES", "5"))
 
+# Pages of the standing Help Wanted list. 83 open on 2026-08-10 at
+# SEARCH_PER_PAGE (50), so two pages covers it with room to grow.
+EXPENSIFY_STANDING_MAX_PAGES = int(os.environ.get("EXPENSIFY_STANDING_MAX_PAGES", "4"))
+
 # Expensify Help Wanted issues pay a flat rate; there is no $-label to parse.
 EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
 

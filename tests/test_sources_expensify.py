@@ -10,6 +10,19 @@ from sniper import store
 from sniper.sources.expensify import ExpensifySource
 
 
+def _no_standing(fake_get):
+    """Queue the standing Help Wanted search as empty.
+
+    ExpensifySource has two discovery paths and every test here is about the
+    EVENT one. The standing search runs first on every sweep -- deliberately,
+    since the event poll returns early on a 304 -- so it always consumes the
+    first queued response. Queueing it empty keeps these tests about the path
+    they were written for, and tests/test_sources_expensify_standing.py owns
+    the other.
+    """
+    fake_get.queue(200, {"total_count": 0, "incomplete_results": False, "items": []})
+
+
 def _conn(tmp_path):
     return store.connect(tmp_path / "t.sqlite")
 
@@ -34,6 +47,7 @@ def _issue(number, comments=3):
 
 
 def test_new_help_wanted_event_becomes_a_candidate_at_the_flat_rate(tmp_path, fake_get):
+    _no_standing(fake_get)
     from sniper import config
 
     fake_get.queue(200, [_event(1, 96348)], {"ETag": 'W/"a"'})
@@ -50,6 +64,7 @@ def test_new_help_wanted_event_becomes_a_candidate_at_the_flat_rate(tmp_path, fa
 
 
 def test_the_etag_is_stored_and_replayed(tmp_path, fake_get):
+    _no_standing(fake_get)
     conn = _conn(tmp_path)
     fake_get.queue(200, [], {"ETag": 'W/"a"'})
     ExpensifySource().discover(conn)
@@ -61,18 +76,24 @@ def test_the_etag_is_stored_and_replayed(tmp_path, fake_get):
 
 
 def test_an_already_seen_event_does_not_cost_an_issue_fetch(tmp_path, fake_get):
+    _no_standing(fake_get)
     conn = _conn(tmp_path)
     fake_get.queue(200, [_event(1, 96348)], {"ETag": 'W/"a"'})
     fake_get.queue(200, _issue(96348))
     ExpensifySource().discover(conn)
     calls_after_first = len(fake_get.calls)
+    _no_standing(fake_get)          # second sweep runs the standing search again
     fake_get.queue(200, [_event(1, 96348)], {"ETag": 'W/"b"'})
     result = ExpensifySource().discover(conn)
     assert result.candidates == []
-    assert len(fake_get.calls) == calls_after_first + 1  # only the poll
+    # +2, not +1: the standing search then the event poll. The point of the
+    # assertion is unchanged -- a already-seen event costs no ISSUE fetch.
+    assert len(fake_get.calls) == calls_after_first + 2
+    assert not any("/issues/96348" in url for url, _ in fake_get.calls[-2:])
 
 
 def test_a_failed_poll_becomes_a_warning_not_an_empty_success(tmp_path, fake_get):
+    _no_standing(fake_get)
     fake_get.queue(403, {"message": "API rate limit exceeded"},
                    {"X-RateLimit-Reset": "1"})
     result = ExpensifySource().discover(_conn(tmp_path))
@@ -81,6 +102,7 @@ def test_a_failed_poll_becomes_a_warning_not_an_empty_success(tmp_path, fake_get
 
 
 def test_a_failed_issue_fetch_warns_and_the_other_events_still_land(tmp_path, fake_get):
+    _no_standing(fake_get)
     fake_get.queue(200, [_event(1, 1), _event(2, 2)], {"ETag": 'W/"a"'})
     fake_get.queue(500, {"message": "boom"})
     fake_get.queue(200, _issue(2))
@@ -90,12 +112,15 @@ def test_a_failed_issue_fetch_warns_and_the_other_events_still_land(tmp_path, fa
 
 
 def test_an_exhausted_core_budget_warns_and_makes_no_call(tmp_path, fake_get):
+    _no_standing(fake_get)
     conn = _conn(tmp_path)
     store.reserve(conn, "core", 5000)
     result = ExpensifySource().discover(conn)
     assert result.candidates == []
     assert any("core budget" in w for w in result.warnings)
-    assert fake_get.calls == []
+    # The standing search still runs -- it spends SEARCH budget, and it is the
+    # CORE pool that is exhausted here. What must not happen is the events poll.
+    assert not any("issues/events" in url for url, _ in fake_get.calls)
 
 
 def test_a_fetch_failure_leaves_the_event_unseen_so_it_is_retried(tmp_path, fake_get):
@@ -105,6 +130,7 @@ def test_a_fetch_failure_leaves_the_event_unseen_so_it_is_retried(tmp_path, fake
     skipped as "already handled" on every later run. A warning would make that
     visible but not recoverable -- a $250 bounty silently dropped.
     """
+    _no_standing(fake_get)
     conn = _conn(tmp_path)
     fake_get.queue(200, [_event(1, 96348)], {"ETag": 'W/"a"'})
     fake_get.queue(500, {"message": "boom"})
@@ -114,6 +140,7 @@ def test_a_fetch_failure_leaves_the_event_unseen_so_it_is_retried(tmp_path, fake
     assert store.event_seen(conn, 1) is False
 
     # Next run: same event, this time the fetch works.
+    _no_standing(fake_get)
     fake_get.queue(200, [_event(1, 96348)], {"ETag": 'W/"b"'})
     fake_get.queue(200, _issue(96348))
     second = ExpensifySource().discover(conn)
@@ -122,6 +149,7 @@ def test_a_fetch_failure_leaves_the_event_unseen_so_it_is_retried(tmp_path, fake
 
 
 def test_budget_exhausted_mid_loop_leaves_the_event_unseen(tmp_path, fake_get):
+    _no_standing(fake_get)
     conn = _conn(tmp_path)
     fake_get.queue(200, [_event(1, 1), _event(2, 2)], {"ETag": 'W/"a"'})
     fake_get.queue(200, _issue(1))
@@ -135,6 +163,7 @@ def test_budget_exhausted_mid_loop_leaves_the_event_unseen(tmp_path, fake_get):
 
 
 def test_a_malformed_issue_payload_warns_without_discarding_the_others(tmp_path, fake_get):
+    _no_standing(fake_get)
     conn = _conn(tmp_path)
     fake_get.queue(200, [_event(1, 1), _event(2, 2)], {"ETag": 'W/"a"'})
     fake_get.queue(200, {"title": "no number key"})  # Candidate.from_issue will raise

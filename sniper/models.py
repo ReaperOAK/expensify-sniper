@@ -226,8 +226,10 @@ class Candidate:
         )
 
     @classmethod
-    def from_search_item(cls, source: str, item: dict[str, Any]) -> Candidate:
-        return cls.from_issue(source, repo_from_url(item["repository_url"]), item)
+    def from_search_item(cls, source: str, item: dict[str, Any], *,
+                         amount_usd: int | None = None) -> Candidate:
+        return cls.from_issue(source, repo_from_url(item["repository_url"]), item,
+                              amount_usd=amount_usd)
 
     def with_repo_detail(self, payload: dict[str, Any]) -> Candidate:
         return replace(
