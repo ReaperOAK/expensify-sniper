@@ -137,3 +137,96 @@ def test_render_agrees_with_the_real_sqlite3_row_not_only_the_dict_fixtures(tmp_
     assert text.count("PRs") == 1
     assert "### acme/widgets" in text and "[#3](" in text
     assert "| 1 | fork |" in text
+
+
+def test_a_first_ever_board_counts_as_changed():
+    assert board.has_changed(None, {"count": 5, "repos": ["a/b"]}, pct=5.0) is True
+
+
+def test_a_new_repo_in_the_unrankable_set_counts_as_changed():
+    before = {"count": 100, "repos": ["a/b"]}
+    after = {"count": 100, "repos": ["a/b", "c/d"]}
+    assert board.has_changed(before, after, pct=5.0) is True
+
+
+def test_a_small_count_drift_is_not_worth_a_message():
+    # 144 links a day trains the reader to ignore the channel, which is the
+    # failure the digest's own silence rule already guards against.
+    before = {"count": 529, "repos": ["a/b"]}
+    after = {"count": 540, "repos": ["a/b"]}   # +2.1%
+    assert board.has_changed(before, after, pct=5.0) is False
+
+
+def test_a_large_count_move_is_worth_a_message():
+    before = {"count": 529, "repos": ["a/b"]}
+    after = {"count": 600, "repos": ["a/b"]}   # +13.4%
+    assert board.has_changed(before, after, pct=5.0) is True
+
+
+def test_a_set_emptying_out_is_always_worth_a_message():
+    before = {"count": 529, "repos": ["a/b"]}
+    after = {"count": 0, "repos": []}
+    assert board.has_changed(before, after, pct=5.0) is True
+
+
+def test_signature_records_the_count_and_the_repos():
+    rows = [_row(repo="b/two", amount_usd=None), _row(repo="a/one", amount_usd=None),
+            _row(repo="b/two", amount_usd=None)]
+    assert board.signature(rows) == {"count": 3, "repos": ["a/one", "b/two"]}
+
+
+class _FakePost:
+    def __init__(self, status=200, body=None):
+        self.calls = []
+        self._status = status
+        self._body = body or {"html_url": "https://gist.github.com/abc123"}
+
+    def __call__(self, url, json=None, headers=None, timeout=None):
+        self.calls.append((url, json, headers))
+
+        class Resp:
+            status_code = self._status
+            def json(_self):
+                return self._body
+            def raise_for_status(_self):
+                if self._status >= 400:
+                    raise AssertionError(f"HTTP {self._status}")
+        return Resp()
+
+
+def test_publish_patches_the_configured_gist(monkeypatch):
+    from sniper import config
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+    post = _FakePost()
+    url = board.publish("# board", post=post)
+    called_url, payload, _ = post.calls[0]
+    assert called_url == "https://api.github.com/gists/abc123"
+    assert payload["files"]["bounties.md"]["content"] == "# board"
+    assert url == "https://gist.github.com/abc123"
+
+
+def test_publish_returns_none_when_no_gist_is_configured(monkeypatch):
+    from sniper import config
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "", raising=False)
+    post = _FakePost()
+    assert board.publish("# board", post=post) is None
+    assert post.calls == []
+
+
+def test_publish_never_creates_a_second_gist(monkeypatch):
+    # The whole point of one gist is a link that keeps working. Creating a new
+    # one each sweep would hand the operator a dead bookmark every ten minutes.
+    from sniper import config
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+    post = _FakePost()
+    board.publish("# board", post=post)
+    assert all("/gists/abc123" in url for url, _, _ in post.calls)
+
+
+def test_create_gist_makes_it_private(monkeypatch):
+    post = _FakePost(body={"id": "newid", "html_url": "https://gist.github.com/newid"})
+    gist_id, url = board.create_gist("# board", post=post)
+    _, payload, _ = post.calls[0]
+    assert payload["public"] is False
+    assert gist_id == "newid"
+    assert url == "https://gist.github.com/newid"

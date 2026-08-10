@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import json
 import sqlite3
 import sys
 import time
@@ -28,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sniper import config, filters, github_api, notify, payers
+from sniper import board, config, filters, github_api, notify, payers
 from sniper import score as scoring, store  # noqa: E402
 from sniper.models import Candidate  # noqa: E402
 from sniper.sources.base import Source, SourceResult  # noqa: E402
@@ -283,6 +284,50 @@ def run(
     text = notify.format_digest(new_rows, standing_rows, warnings,
                                 first_run=first_run, now=stamp,
                                 held_back=held_back)
+
+    # The board: everything, always, at a stable url. Written before the
+    # "nothing to say" short-circuit, because the board is the thing that must
+    # NOT go quiet -- it is where the 529 unrankable candidates and the reject
+    # reasons live, and both matter most on a sweep with no news.
+    unrankable = store.held_back_candidates(conn, config.BOARD_UNRANKABLE_N)
+    rejections = store.rejection_counts(conn)
+    board_text = board.render(
+        store.live_candidates(conn, config.DIGEST_TOP_N, require_amount=True),
+        unrankable,
+        rejections,
+        now=stamp, warnings=warnings,
+        totals={"live": len(new_rows) + len(standing_rows),
+                "unranked": held_back,
+                "rejected": sum(count for _, count in rejections)})
+    try:
+        config.BOARD_PATH.write_text(board_text, encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001
+        warnings.append(f"could not write {config.BOARD_PATH}: {exc}")
+
+    board_url = None
+    if not dry_run:
+        try:
+            board_url = board.publish(board_text)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"board publish failed: {exc}")
+        if board_url is None and not config.BOUNTY_GIST_ID:
+            print("⚠ board not published: BOUNTY_GIST_ID unset "
+                  "(run `python3 hunt.py --init-gist` once)", file=sys.stderr)
+
+    # Link the board only when the unrankable set actually moved. Sending it
+    # every sweep is 144 links a day, which trains the reader to ignore the
+    # channel -- the exact failure the digest's own silence rule guards against.
+    current = board.signature(unrankable)
+    _, previous_body = store.get_cache(conn, "board-signature")
+    try:
+        previous = json.loads(previous_body) if previous_body else None
+    except ValueError:
+        previous = None
+    if board_url and board.has_changed(previous, current,
+                                       pct=config.BOARD_CHANGE_PCT):
+        text += f"\n\n📋 board updated: {board_url}"
+    store.set_cache(conn, "board-signature", None, json.dumps(current))
+
     # A sweep that found nothing and hit no trouble is not news. The watch runs
     # every ten minutes: delivering "nothing new" each time is 144 messages a
     # day, which does not merely annoy -- it trains the reader to ignore the
@@ -335,7 +380,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sources", default=None,
                         help="comma-separated source names "
                              f"(default: {','.join(config.HUNT_ENABLED_SOURCES)})")
+    parser.add_argument("--init-gist", action="store_true",
+                        help="create the private gist the board lives in, once, "
+                             "and print the id to put in .env as BOUNTY_GIST_ID")
     args = parser.parse_args(argv)
+
+    if args.init_gist:
+        gist_id, url = board.create_gist("# Bounty board\n\n_not swept yet_\n")
+        print(f"created {url}\n\nadd this line to .env on BOTH hosts:\n"
+              f"BOUNTY_GIST_ID={gist_id}")
+        return 0
 
     conn = store.connect()
 

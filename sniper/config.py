@@ -53,6 +53,16 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+# The board lives in ONE private gist so the operator has a stable bookmark.
+# Create it once with `python3 hunt.py --init-gist` and paste the id here.
+BOUNTY_GIST_ID = os.environ.get("BOUNTY_GIST_ID", "").strip()
+BOARD_PATH = Path(os.environ.get("BOARD_PATH", ROOT / "bounties.md"))
+# How many amountless candidates the board lists. 529 on 2026-08-09, so this is
+# a page-size guard rather than a filter; the footer says when it truncates.
+BOARD_UNRANKABLE_N = int(os.environ.get("BOARD_UNRANKABLE_N", "600"))
+# Percentage move in the unrankable count that is worth a Discord link.
+BOARD_CHANGE_PCT = float(os.environ.get("BOARD_CHANGE_PCT", "5"))
+
 # --- repo / runtime ----------------------------------------------------------
 REPO = "Expensify/App"
 APP_REPO_PATH = Path(os.environ.get("APP_REPO_PATH", Path.home() / "Documents" / "App"))

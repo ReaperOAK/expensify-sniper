@@ -23,10 +23,14 @@ network, or a filesystem.
 
 from __future__ import annotations
 
-from . import notify
+import requests
+
+from . import config, notify
 from .models import _now_utc, parse_iso
 
 TITLE_CHARS = 90
+GIST_FILENAME = "bounties.md"
+GIST_API = "https://api.github.com/gists"
 
 
 def _get(row, key):
@@ -113,3 +117,71 @@ def render(rankable, unrankable, rejection_counts, *, now: float | None,
     parts.append("---")
     parts.append(f"_Swept {swept}{' · ' + summary if summary else ''}_")
     return "\n".join(parts)
+
+
+def signature(unrankable_rows) -> dict:
+    """A cheap fingerprint of the unrankable set: how many, and from where."""
+    repos = sorted({row["repo"] for row in unrankable_rows})
+    return {"count": len(unrankable_rows), "repos": repos}
+
+
+def has_changed(previous: dict | None, current: dict, *, pct: float) -> bool:
+    """Is this board worth putting a link in front of the operator for?
+
+    The digest already refuses to say "nothing new" every ten minutes, for a
+    reason that applies here too: a channel that speaks constantly stops being
+    read, and the one message that matters then arrives somewhere nobody looks.
+
+    So a link is worth sending when a repo appears that was not there before --
+    genuinely new inventory -- or when the count moves by more than `pct`.
+    Everything else is drift.
+    """
+    if previous is None:
+        return True
+    if set(current["repos"]) - set(previous.get("repos") or []):
+        return True
+    before = previous.get("count") or 0
+    if before == 0:
+        return current["count"] > 0
+    return abs(current["count"] - before) / before * 100.0 > pct
+
+
+def _headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {config.GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def create_gist(text: str, *, post=None) -> tuple[str, str]:
+    """Create the private gist this board lives in. Returns (id, url).
+
+    Run once by hand via `hunt.py --init-gist`; the id then goes in .env as
+    BOUNTY_GIST_ID so every later sweep updates the SAME url. A gist created per
+    sweep would hand the operator a bookmark that dies every ten minutes.
+    """
+    poster = requests.post if post is None else post
+    resp = poster(GIST_API, json={
+        "description": "expensify-sniper bounty board",
+        "public": False,
+        "files": {GIST_FILENAME: {"content": text}},
+    }, headers=_headers(), timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload["id"], payload["html_url"]
+
+
+def publish(text: str, *, post=None) -> str | None:
+    """Update the configured gist. Returns its url, or None if none is set.
+
+    None is a real answer and the caller must say it out loud. An unset gist id
+    silently succeeding is the same failure mode as an unset Discord webhook:
+    every run reports success while nothing reaches anybody.
+    """
+    if not config.BOUNTY_GIST_ID:
+        return None
+    patcher = requests.patch if post is None else post
+    resp = patcher(f"{GIST_API}/{config.BOUNTY_GIST_ID}",
+                   json={"files": {GIST_FILENAME: {"content": text}}},
+                   headers=_headers(), timeout=30)
+    resp.raise_for_status()
+    return resp.json()["html_url"]

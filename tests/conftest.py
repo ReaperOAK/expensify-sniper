@@ -105,3 +105,21 @@ def no_budget_waiting(monkeypatch):
     # a throttle to surface immediately, exactly as it did before retries existed.
     monkeypatch.setattr(config, "SEARCH_MAX_RETRIES", 0, raising=False)
     monkeypatch.setattr(config, "SEARCH_RETRY_BACKOFF_S", 0, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def board_path_in_sandbox(tmp_path, monkeypatch):
+    """Keep hunt.run()'s board file inside the test sandbox, not the real repo.
+
+    hunt.run() writes config.BOARD_PATH on every call, dry_run or not -- the
+    board must not go quiet on a no-news sweep, so its write happens before that
+    branch. DB_PATH gets the same isolation by every test passing an explicit
+    tmp_path to store.connect(); BOARD_PATH has no such per-call argument, so it
+    needs this instead. Without it, every test that calls hunt.run() (dozens, in
+    tests/test_hunt.py) overwrites the operator's real bounties.md and leaves an
+    untracked file in the working tree -- confirmed by running the suite once
+    without this fixture and finding it sitting in the repo root afterward.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "BOARD_PATH", tmp_path / "bounties.md", raising=False)
