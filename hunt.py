@@ -364,11 +364,19 @@ def run(
             claim = f"{CLAIM_PREFIX}{linked.claimant}" if linked.claimant else None
             checked_at = stamp
 
+        cand = cand.with_linked_prs(open_count)
         if claim:
+            # with_linked_prs BEFORE the claim branch, not only after it. A
+            # claimed candidate used to be stored with open_pr_count NULL,
+            # which Candidate's own docstring defines as "the timeline was
+            # never read" -- false here, we read it and found the assignee's
+            # PR. It also made recent_pr_check refuse to reuse the row, so
+            # every claimed candidate was re-read on every sweep: the exact
+            # cost this TTL exists to remove, left in place for the rows most
+            # certain not to have changed.
             store.upsert_candidate(conn, cand, rejected=claim, now=stamp,
                                    pr_checked_at=checked_at)
             continue
-        cand = cand.with_linked_prs(open_count)
         try:
             scored = cand.with_score(scoring.score(cand, now=stamp))
         except Exception as exc:  # noqa: BLE001 -- score() raises by contract on an

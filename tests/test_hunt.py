@@ -921,10 +921,21 @@ def test_a_reused_check_does_not_revive_a_candidate_it_had_rejected(tmp_path, fa
     assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] \
         == "claimed by assignee @daledah"
 
+    calls_after_first = len(fake_get.calls)
     fake_get.queue(304, None)
-    _run(conn, sources=[FakeSource("s", [claimed])], now=NOW + 600, dry_run=True)
-    assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] \
-        == "claimed by assignee @daledah"
+    text = _run(conn, sources=[FakeSource("s", [claimed])], now=NOW + 600,
+                dry_run=True)
+
+    # No timeline call at all -- not a call that failed and left the verdict
+    # standing by accident, which is how this test first passed.
+    assert not any("timeline" in url
+                   for url, _ in fake_get.calls[calls_after_first:])
+    assert "timeline" not in text
+    row = conn.execute("SELECT rejected, open_pr_count FROM candidates").fetchone()
+    assert row["rejected"] == "claimed by assignee @daledah"
+    # Stored, so the row is reusable at all: a NULL count means "never read",
+    # and recent_pr_check would send the next sweep back to the API for it.
+    assert row["open_pr_count"] == 1
 
 
 def test_a_timeline_that_could_not_be_read_is_not_recorded_as_a_check(tmp_path, fake_get):
@@ -932,16 +943,32 @@ def test_a_timeline_that_could_not_be_read_is_not_recorded_as_a_check(tmp_path, 
     check would suppress the retry for the whole window -- the one shape of
     silence this pipeline exists to prevent, with a stopwatch attached.
     """
+    from sniper import config
+
     conn = _conn(tmp_path)
     fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
-    fake_get.queue(500, {"message": "boom"})
+    fake_get.queue(200, [])                          # checked, and stamped
     _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
 
+    # The stamp has aged out, so this sweep asks -- and the ask fails.
+    expired = NOW + config.TIMELINE_RECHECK_S + 1
     fake_get.queue(304, None)
-    fake_get.queue(200, [_open_pr_by("randobot")])   # must be asked again
-    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW + 600, dry_run=True)
-    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    fake_get.queue(500, {"message": "boom"})
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], now=expired,
+                dry_run=True)
+    assert "timeline for acme/widgets#1 failed" in text
+    assert conn.execute("SELECT pr_checked_at FROM candidates").fetchone()[0] == NOW
+
+    # A minute later, still expired: it must ask again rather than sit out a
+    # fresh six-hour window on the strength of a failure.
+    fake_get.queue(304, None)
+    fake_get.queue(200, [_open_pr_by("randobot")])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=expired + 60,
+         dry_run=True)
+    row = conn.execute("SELECT open_pr_count, pr_checked_at FROM candidates"
+                       ).fetchone()
     assert row["open_pr_count"] == 1
+    assert row["pr_checked_at"] == expired + 60
 
 
 # --- the heartbeat: the one thing allowed to ignore the silence rule ---------
