@@ -39,12 +39,22 @@
 #
 # -n, not -w: a sweep that cannot get the lock should SKIP, not queue. Queueing
 # would build a backlog of sweeps racing to report the same inventory, and the
-# next scheduled run is only minutes away. Skipping is silent by design here;
-# each job's own log records every run it does make, so liveness stays provable.
+# next scheduled run is only minutes away.
+#
+# A skipped run LEAVES A LINE. It used to be silent, and combined with
+# notify_when_empty=False that made Discord silence mean five different things:
+# a quiet market, a hung job holding this lock, a dead box, a lost .env, a
+# removed crontab. The log is where the second one is distinguishable, and it
+# was the only one of the five leaving no trace anywhere.
+#
+# -E 99, and the `[ $? -eq 99 ]` test, so the line says only what is true.
+# flock without it exits 1 for a held lock and passes the command's own status
+# through otherwise, so a bare `|| echo skipped` would report a python
+# traceback as a lock conflict -- swapping one wrong story for another.
 PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
 DIGEST_LOCK=/tmp/expensify-sniper-digest.lock
 WATCH_LOCK=/tmp/expensify-sniper-watch.lock
-0 */3 * * * cd $HOME/expensify-sniper && /usr/bin/flock -n $DIGEST_LOCK /usr/bin/python3 hunt.py >> $HOME/expensify-sniper/hunt.log 2>&1
+0 */3 * * * cd $HOME/expensify-sniper && /usr/bin/flock -n -E 99 $DIGEST_LOCK /usr/bin/python3 hunt.py >> $HOME/expensify-sniper/hunt.log 2>&1 || { [ $? -eq 99 ] && echo "$(date -Is) skipped: lock held" >> $HOME/expensify-sniper/hunt.log; }
 
 # Payer watch -- every 10 minutes.
 #
@@ -58,4 +68,4 @@ WATCH_LOCK=/tmp/expensify-sniper-watch.lock
 # a 304 leaves the quota untouched, so a quiet repo costs nothing. Ten minutes
 # is not a preference -- one events page holds 100 entries and covered a single
 # DAY on go-gitea/gitea, so a slower sweep loses labels silently.
-*/10 * * * * cd $HOME/expensify-sniper && /usr/bin/flock -n $WATCH_LOCK /usr/bin/python3 hunt.py --watch >> $HOME/expensify-sniper/watch.log 2>&1
+*/10 * * * * cd $HOME/expensify-sniper && /usr/bin/flock -n -E 99 $WATCH_LOCK /usr/bin/python3 hunt.py --watch >> $HOME/expensify-sniper/watch.log 2>&1 || { [ $? -eq 99 ] && echo "$(date -Is) skipped: lock held" >> $HOME/expensify-sniper/watch.log; }

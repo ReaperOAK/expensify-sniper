@@ -220,6 +220,24 @@ EXPENSIFY_STANDING_MAX_PAGES = int(os.environ.get("EXPENSIFY_STANDING_MAX_PAGES"
 # Expensify Help Wanted issues pay a flat rate; there is no $-label to parse.
 EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
 
+# How often the digest speaks even with nothing to say.
+#
+# main() passes notify_when_empty=False for both jobs, and that is right: 144
+# "nothing new" messages a day trains the reader to ignore the channel, so the
+# one message that matters lands somewhere nobody looks. But combined with
+# `flock -n`, which exits 1 and prints NOTHING, silence in Discord became
+# indistinguishable between a healthy quiet market, a hung job holding its
+# lock, a dead box, a lost .env and a removed crontab. That is the same
+# collision this pipeline exists to prevent, moved one layer out.
+#
+# The cron logs now record a skipped run, which covers the lock; this covers
+# the rest, because a log on a box nobody can reach is not evidence anyone can
+# read. Once a day, so it stays a reading rather than a flood: at ten-minute
+# sweeps this is 1 message per 144, and it carries the sweep count precisely so
+# a HALF-dead deployment is visible too -- a heartbeat saying 6 sweeps when it
+# should say 144 is a watch cron that stopped, reported by the job still alive.
+HEARTBEAT_S = float(os.environ.get("HEARTBEAT_S", str(24 * 3600)))
+
 DIGEST_TOP_N = int(os.environ.get("DIGEST_TOP_N", "25"))
 DIGEST_STANDING_N = int(os.environ.get("DIGEST_STANDING_N", "5"))
 

@@ -93,10 +93,13 @@ print('  sources build ok')
 PY"
 
 echo "==> preflight: flock, which both cron jobs depend on"
-# Both jobs share one lock and one database. Installing a crontab that calls a
-# missing flock would make EVERY sweep fail with 127 into a log nobody reads --
-# a tracker that reports nothing looks exactly like a market with nothing in it,
-# which is the failure this whole project is built against.
+# One lock each, one database between them (they stopped sharing a lock four
+# commits ago -- the digest was starving 2-4 watch cycles per run). Installing
+# a crontab that calls a missing flock would make EVERY sweep fail with 127
+# into a log nobody reads -- a tracker that reports nothing looks exactly like
+# a market with nothing in it, which is the failure this project is built
+# against. -E is used below and needs util-linux 2.24+ (2013), which any box
+# old enough to matter already has.
 ssh "$HOST" "test -x /usr/bin/flock || { echo '  MISSING /usr/bin/flock -- install util-linux'; exit 1; }
              echo '  flock ok'"
 
@@ -106,14 +109,25 @@ echo "==> installing crontab entry"
 # backwards: the watch exists to catch a label before it rolls off a page that
 # covered 27 minutes when measured, so starving it loses labels permanently.
 # -n rather than -w: a sweep that cannot get its lock skips, since queueing
-# would build a backlog racing to report the same inventory.
+# would build a backlog racing to report the same inventory. A skip LEAVES A
+# LINE in the job's own log -- it used to leave nothing, which made "the job is
+# wedged holding its lock" indistinguishable from "the market was quiet" in
+# both channels at once. -E 99 plus the `[ $? -eq 99 ]` test so the line is
+# only written for an actual lock conflict: flock otherwise passes the
+# command's own exit status through, and a bare `|| echo skipped` would file
+# every python traceback as a lock conflict.
+#
+# The heredoc is quoted ('CRON'), so nothing expands REMOTELY; the backslashes
+# are for the local double-quoted string wrapping the whole ssh argument, and
+# \$(date -Is) / \$? need them for exactly the same reason \$HOME does. Keep
+# any '%' out of these lines -- cron rewrites an unescaped one as a newline.
 ssh "$HOST" "crontab -l 2>/dev/null | grep -v 'hunt.py' > /tmp/ct.\$\$ || true
              cat >> /tmp/ct.\$\$ <<'CRON'
 PATH=/usr/local/bin:/usr/bin:/bin:\$HOME/.local/bin
 DIGEST_LOCK=/tmp/expensify-sniper-digest.lock
 WATCH_LOCK=/tmp/expensify-sniper-watch.lock
-0 */3 * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$DIGEST_LOCK /usr/bin/python3 hunt.py >> \$HOME/expensify-sniper/hunt.log 2>&1
-*/10 * * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$WATCH_LOCK /usr/bin/python3 hunt.py --watch >> \$HOME/expensify-sniper/watch.log 2>&1
+0 */3 * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n -E 99 \$DIGEST_LOCK /usr/bin/python3 hunt.py >> \$HOME/expensify-sniper/hunt.log 2>&1 || { [ \$? -eq 99 ] && echo \"\$(date -Is) skipped: lock held\" >> \$HOME/expensify-sniper/hunt.log; }
+*/10 * * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n -E 99 \$WATCH_LOCK /usr/bin/python3 hunt.py --watch >> \$HOME/expensify-sniper/watch.log 2>&1 || { [ \$? -eq 99 ] && echo \"\$(date -Is) skipped: lock held\" >> \$HOME/expensify-sniper/watch.log; }
 CRON
              crontab /tmp/ct.\$\$ && rm -f /tmp/ct.\$\$"
 

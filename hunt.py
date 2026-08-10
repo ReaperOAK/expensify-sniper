@@ -51,6 +51,29 @@ SOURCE_CLASSES = {
 # store.bounty_inventory was carrying against payers' reason strings.
 CLAIM_PREFIX = "claimed by assignee @"
 
+# Where the heartbeat clock lives, stored the way board-signature is: one
+# http_cache row carrying when the last one was DELIVERED and how many sweeps
+# have run since. See config.HEARTBEAT_S.
+HEARTBEAT_KEY = "heartbeat"
+
+
+def _heartbeat_state(conn: sqlite3.Connection) -> tuple[float | None, int]:
+    """(when the last heartbeat was delivered, sweeps since). None = never.
+
+    An unreadable or absent row reads as never-delivered, which makes the next
+    sweep beat. That is the safe direction: an extra heartbeat is one message,
+    a missed one is a day of silence that means nothing.
+    """
+    _, body = store.get_cache(conn, HEARTBEAT_KEY)
+    try:
+        payload = json.loads(body) if body else {}
+    except ValueError:
+        payload = {}
+    at = payload.get("at") if isinstance(payload, dict) else None
+    sweeps = payload.get("sweeps") if isinstance(payload, dict) else None
+    return (at if isinstance(at, (int, float)) else None,
+            sweeps if isinstance(sweeps, int) else 0)
+
 
 def build_sources(names: list[str]) -> list[Source]:
     built = []
@@ -464,6 +487,26 @@ def run(
     if board_url is not None:
         store.set_cache(conn, "board-signature", None, json.dumps(current))
 
+    # The heartbeat. Counted on every sweep, spoken once every HEARTBEAT_S.
+    #
+    # This is the one thing allowed through the silence rule below with nothing
+    # to report, because `flock -n` prints NOTHING when it skips and Discord
+    # silence therefore meant five things at once: a quiet market, a hung job
+    # holding its lock, a dead box, a lost .env, a removed crontab. The sweep
+    # count is what separates the last four from the first -- a heartbeat
+    # reading 6 sweeps where 144 belong is a watch cron that has stopped, said
+    # out loud by the digest cron that has not.
+    last_beat_at, sweeps = _heartbeat_state(conn)
+    sweeps += 1
+    store.set_cache(conn, HEARTBEAT_KEY, None,
+                    json.dumps({"at": last_beat_at, "sweeps": sweeps}))
+    beat_due = (last_beat_at is None
+                or stamp - last_beat_at >= config.HEARTBEAT_S)
+    if beat_due:
+        text += (f"\n\n💓 alive: {sweeps} sweeps since the last heartbeat · "
+                 f"{counts['live']} live "
+                 f"({counts['rankable']} rankable, {counts['unranked']} unranked)")
+
     # A sweep that found nothing and hit no trouble is not news. The watch runs
     # every ten minutes: delivering "nothing new" each time is 144 messages a
     # day, which does not merely annoy -- it trains the reader to ignore the
@@ -475,7 +518,7 @@ def run(
     # nothing. watch.log records every sweep either way, so liveness is provable
     # without spending the reader's attention.
     nothing_to_say = not new_rows and not run_hit_trouble and not first_run
-    if nothing_to_say and not notify_when_empty:
+    if nothing_to_say and not notify_when_empty and not beat_due:
         return text
 
     if not dry_run:
@@ -495,6 +538,15 @@ def run(
                       "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)"
                       if channel == "none" else "delivery raised")
             print(f"⚠ digest was NOT delivered: {reason}", file=sys.stderr)
+        # Only a heartbeat that actually REACHED someone restarts the clock,
+        # for the same reason only a published board advances its signature: a
+        # recorded-but-undelivered beat buys another whole HEARTBEAT_S of
+        # silence out of a failure, which is precisely what the beat exists to
+        # break. `--dry-run` never records for the same reason -- "print the
+        # digest, send nothing" must not spend the next real run's heartbeat.
+        if beat_due and channel not in ("none", "failed"):
+            store.set_cache(conn, HEARTBEAT_KEY, None,
+                            json.dumps({"at": stamp, "sweeps": 0}))
     return text
 
 

@@ -942,3 +942,134 @@ def test_a_timeline_that_could_not_be_read_is_not_recorded_as_a_check(tmp_path, 
     _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW + 600, dry_run=True)
     row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
     assert row["open_pr_count"] == 1
+
+
+# --- the heartbeat: the one thing allowed to ignore the silence rule ---------
+
+
+def _sent_to(monkeypatch):
+    from sniper import notify
+
+    sent: list[str] = []
+    monkeypatch.setattr(notify, "send",
+                        lambda text, **kw: sent.append(text) or "discord")
+    return sent
+
+
+def _first_sweep(conn, fake_get, monkeypatch):
+    """One delivered sweep, so the heartbeat clock starts from a known point."""
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+
+def test_a_quiet_sweep_still_speaks_once_the_heartbeat_comes_due(
+        tmp_path, fake_get, monkeypatch):
+    """notify_when_empty=False plus `flock -n` (which exits 1 and prints
+    NOTHING) left Discord silence meaning five different things at once: a
+    healthy quiet market, a hung job holding its lock, a dead box, a lost .env
+    and a removed crontab. Once a day the digest says which.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "HEARTBEAT_S", 3600.0, raising=False)
+    sent = _sent_to(monkeypatch)
+    conn = _conn(tmp_path)
+    _first_sweep(conn, fake_get, monkeypatch)
+    sent.clear()
+
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False,
+         notify_when_empty=False)
+    assert sent == []                       # inside the window: still silent
+
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 3600, dry_run=False,
+         notify_when_empty=False)
+    assert len(sent) == 1
+    assert "💓" in sent[0]
+
+
+def test_the_heartbeat_is_periodic_rather_than_every_run(
+        tmp_path, fake_get, monkeypatch):
+    """Every run would be 144 messages a day out of the watch cron -- the exact
+    flood the silence rule exists to prevent, arriving through a new door.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "HEARTBEAT_S", 3600.0, raising=False)
+    sent = _sent_to(monkeypatch)
+    conn = _conn(tmp_path)
+    _first_sweep(conn, fake_get, monkeypatch)
+    sent.clear()
+
+    for minute in range(10, 130, 10):       # two hours of ten-minute sweeps
+        _run(conn, sources=[FakeSource("s", [])], now=NOW + minute * 60,
+             dry_run=False, notify_when_empty=False)
+    assert len(sent) == 2                   # one an hour, not twelve
+
+
+def test_the_heartbeat_carries_the_sweep_count_and_the_live_totals(
+        tmp_path, fake_get, monkeypatch):
+    """"I am alive" on its own is a ping. The numbers are what make it a
+    reading: a heartbeat that says 6 sweeps when it should say 144 is a watch
+    cron that has stopped, reported by the job that is still running.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "HEARTBEAT_S", 1800.0, raising=False)
+    sent = _sent_to(monkeypatch)
+    conn = _conn(tmp_path)
+    _first_sweep(conn, fake_get, monkeypatch)
+    sent.clear()
+
+    for offset in (600, 1200, 1800):
+        _run(conn, sources=[FakeSource("s", [])], now=NOW + offset,
+             dry_run=False, notify_when_empty=False)
+    assert len(sent) == 1
+    assert "3 sweeps" in sent[0]
+    assert "1 live" in sent[0]
+
+
+def test_a_heartbeat_nobody_received_is_not_recorded_as_sent(
+        tmp_path, fake_get, monkeypatch):
+    """Same reasoning as the board signature: recording a delivery that did not
+    happen buys another full window of silence out of a failure.
+    """
+    from sniper import config, notify
+
+    monkeypatch.setattr(config, "HEARTBEAT_S", 3600.0, raising=False)
+    conn = _conn(tmp_path)
+    sent = _sent_to(monkeypatch)
+    _first_sweep(conn, fake_get, monkeypatch)
+    sent.clear()
+
+    def boom(*a, **k):
+        raise RuntimeError("webhook revoked")
+
+    monkeypatch.setattr(notify, "send", boom)
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 3600, dry_run=False,
+         notify_when_empty=False)
+
+    monkeypatch.setattr(notify, "send",
+                        lambda text, **kw: sent.append(text) or "discord")
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 3660, dry_run=False,
+         notify_when_empty=False)
+    assert len(sent) == 1
+    assert "💓" in sent[0]
+
+
+def test_a_dry_run_does_not_burn_the_heartbeat(tmp_path, fake_get, monkeypatch):
+    """--dry-run promises "print the digest, send nothing"."""
+    from sniper import config
+
+    monkeypatch.setattr(config, "HEARTBEAT_S", 3600.0, raising=False)
+    sent = _sent_to(monkeypatch)
+    conn = _conn(tmp_path)
+    _first_sweep(conn, fake_get, monkeypatch)
+    sent.clear()
+
+    text = _run(conn, sources=[FakeSource("s", [])], now=NOW + 3600, dry_run=True,
+                notify_when_empty=False)
+    assert "💓" in text
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 3660, dry_run=False,
+         notify_when_empty=False)
+    assert len(sent) == 1
