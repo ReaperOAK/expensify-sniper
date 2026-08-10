@@ -804,3 +804,32 @@ def test_an_assignee_who_opened_the_pr_is_a_claim(tmp_path, fake_get):
         dry_run=True)
     row = conn.execute("SELECT rejected FROM candidates").fetchone()
     assert row["rejected"] == "claimed by assignee @daledah"
+
+
+def test_the_cli_actually_asks_for_silence(monkeypatch):
+    """The silence rule above is worth nothing if main() never turns it on.
+
+    Measured 2026-08-10: run() defaults notify_when_empty=True so the test suite
+    can assert on a digest without wiring a fake channel, and main() never passed
+    anything else -- so `nothing_to_say and not notify_when_empty` was
+    `True and False` on every real invocation and the branch was dead. The watch
+    cron had been posting to Discord every ten minutes regardless of news, which
+    is the exact 144-messages-a-day failure the rule exists to prevent.
+
+    This asserts the wiring, not the rule. test_a_quiet_watch_sweep_says_nothing
+    owns the rule itself.
+    """
+    seen = {}
+
+    def fake_run(conn, **kwargs):
+        seen.update(kwargs)
+        return "digest"
+
+    monkeypatch.setattr(hunt, "run", fake_run)
+    monkeypatch.setattr(hunt.store, "connect", lambda *a, **k: None)
+    assert hunt.main([]) == 0
+    assert seen["notify_when_empty"] is False
+
+    seen.clear()
+    assert hunt.main(["--watch"]) == 0
+    assert seen["notify_when_empty"] is False

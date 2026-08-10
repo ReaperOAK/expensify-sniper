@@ -491,7 +491,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         names = (args.sources.split(",") if args.sources
                  else config.HUNT_ENABLED_SOURCES)
-    text = run(conn, sources=build_sources(names), dry_run=args.dry_run)
+    # notify_when_empty=False is the whole point of the silence rule, and it has
+    # to be asked for here: run() defaults it True so the suite can assert on a
+    # digest without wiring a fake channel. Measured 2026-08-10, main() never
+    # passed anything, so `nothing_to_say and not notify_when_empty` was
+    # `True and False` on every real invocation and the branch was dead code --
+    # the watch cron had been posting every ten minutes regardless of news.
+    text = run(conn, sources=build_sources(names), dry_run=args.dry_run,
+               notify_when_empty=False)
     print(text)
     return 0
 
