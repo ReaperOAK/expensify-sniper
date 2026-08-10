@@ -499,6 +499,88 @@ def test_a_quiet_sweep_with_a_WARNING_still_speaks(tmp_path, fake_get, monkeypat
     assert "⚠" in sent[0]
 
 
+def test_the_board_is_written_published_and_linked_only_when_it_moves(
+    tmp_path, fake_get, monkeypatch
+):
+    """hunt.run()'s board wiring end to end: the file gets written, the gist
+    gets published every sweep, the board-signature cache round-trips through
+    store, and the digest carries a link only once has_changed() says the
+    unrankable set's move is worth it -- not on a sweep where it stayed the
+    same.
+
+    board.publish is replaced wholesale rather than given a post= fake,
+    mirroring how notify.send is replaced above: hunt.run() calls both as bare
+    module functions with no transport seam of its own, so replacing the
+    function is the seam a caller of run() actually has.
+    """
+    import json
+
+    from sniper import board, config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+    published = []
+    monkeypatch.setattr(
+        board, "publish",
+        lambda text: published.append(text) or "https://gist.github.com/abc123")
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    # First-ever board: has_changed(None, ...) is unconditionally True, so the
+    # very first sweep links regardless of what the unrankable set contains.
+    assert config.BOARD_PATH.exists()
+    board_text = config.BOARD_PATH.read_text(encoding="utf-8")
+    assert "# Bounty board" in board_text
+    assert published == [board_text]
+    assert "📋 board updated: https://gist.github.com/abc123" in text
+
+    # The signature cache round-tripped through store.
+    _, cached = store.get_cache(conn, "board-signature")
+    assert json.loads(cached) == {"count": 0, "repos": []}
+
+    # Second sweep, nothing new: the SAME (empty) unrankable set is not a
+    # change, so the board still gets published (every sweep, unconditionally)
+    # but the digest carries no link this time.
+    text2 = _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False)
+    assert len(published) == 2
+    assert "board updated" not in text2
+
+
+def test_a_board_publish_failure_reaches_the_digest_and_stderr(
+    tmp_path, fake_get, monkeypatch, capsys
+):
+    """A configured gist that fails to publish (revoked token, deleted gist,
+    timeout, 5xx) must not look like an ordinary quiet sweep.
+
+    The board block runs BEFORE notify.format_digest(), so its warning is
+    already in the list format_digest() renders into the delivered digest --
+    not appended afterward, where it would be recorded but never actually seen.
+    The stderr line fires too, regardless of whether an id was configured,
+    mirroring the digest-delivery failure handling further down in run().
+    """
+    from sniper import board, config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+
+    def boom(text):
+        raise RuntimeError("gist gone")
+
+    monkeypatch.setattr(board, "publish", boom)
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    assert "board publish failed: gist gone" in text
+    err = capsys.readouterr().err
+    assert "board was NOT published: publish raised" in err
+
+
 def test_a_proven_payer_may_offer_tiered_amounts(tmp_path, fake_get):
     """go-gitea/gitea#1872 carries $250, $50 and $500 and is a real bounty.
 

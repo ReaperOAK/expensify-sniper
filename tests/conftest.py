@@ -108,18 +108,37 @@ def no_budget_waiting(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def board_path_in_sandbox(tmp_path, monkeypatch):
-    """Keep hunt.run()'s board file inside the test sandbox, not the real repo.
+def board_stays_in_the_sandbox(tmp_path, monkeypatch):
+    """Keep hunt.run()'s board wiring off the real filesystem AND the real gist.
 
-    hunt.run() writes config.BOARD_PATH on every call, dry_run or not -- the
-    board must not go quiet on a no-news sweep, so its write happens before that
-    branch. DB_PATH gets the same isolation by every test passing an explicit
-    tmp_path to store.connect(); BOARD_PATH has no such per-call argument, so it
-    needs this instead. Without it, every test that calls hunt.run() (dozens, in
-    tests/test_hunt.py) overwrites the operator's real bounties.md and leaves an
-    untracked file in the working tree -- confirmed by running the suite once
-    without this fixture and finding it sitting in the repo root afterward.
+    Two separate leaks, one fixture, because both come from the same cause:
+    hunt.run() reaches board.py's outward-facing calls directly, with no post=
+    seam of its own for a caller of run() to inject.
+
+    * config.BOARD_PATH. hunt.run() writes it on every call, dry_run or not --
+      the board must not go quiet on a no-news sweep, so its write happens
+      before that branch. DB_PATH gets the same isolation by every test passing
+      an explicit tmp_path to store.connect(); BOARD_PATH has no such per-call
+      argument, so it needs this instead. Without it, every test that calls
+      hunt.run() (dozens, in tests/test_hunt.py) overwrites the operator's real
+      bounties.md and leaves an untracked file in the working tree -- confirmed
+      by running the suite once without this fixture and finding it sitting in
+      the repo root afterward.
+
+    * config.BOUNTY_GIST_ID. hunt.run() calls board.publish(board_text) with no
+      post= of its own on every dry_run=False call (six of them in
+      tests/test_hunt.py, none mentioning board at all). That is dormant only
+      because THIS worktree's .env happens to have BOUNTY_GIST_ID unset -- the
+      exact same shape of risk GITHUB_TOKEN is force-overridden against at
+      module load, above. The moment an operator runs --init-gist and adds a
+      real id to .env (which this worktree's .env symlinks to), every one of
+      those six tests would PATCH the operator's live gist with fixture
+      content on the next local `pytest` run. Forcing it empty here means a
+      test that wants the real publish path has to opt in explicitly --
+      test_board.py's publish tests already do, via their own monkeypatch,
+      which runs after and overrides this default.
     """
     from sniper import config
 
     monkeypatch.setattr(config, "BOARD_PATH", tmp_path / "bounties.md", raising=False)
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "", raising=False)

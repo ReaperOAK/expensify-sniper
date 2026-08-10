@@ -17,15 +17,18 @@ because two things were invisible from the digest alone.
     quietly grown to 562 -- larger than everything the tracker was keeping --
     and only a hand-written SQL query against the production database found it.
 
-Rendering is a pure function of rows so it can be tested without a database, a
-network, or a filesystem.
+Rendering (`render`, `signature`, `has_changed`) is pure -- rows and dicts in,
+a string or a bool out -- so it is tested without a database, a network, or a
+filesystem. `create_gist` and `publish`, added later, are not: they are this
+module's one outward-facing edge, and every call site that isn't a test-owned
+fake goes to the real GitHub Gists API.
 """
 
 from __future__ import annotations
 
 import requests
 
-from . import config, notify
+from . import config, github_api, notify
 from .models import _now_utc, parse_iso
 
 TITLE_CHARS = 90
@@ -135,6 +138,13 @@ def has_changed(previous: dict | None, current: dict, *, pct: float) -> bool:
     So a link is worth sending when a repo appears that was not there before --
     genuinely new inventory -- or when the count moves by more than `pct`.
     Everything else is drift.
+
+    The asymmetry is deliberate, not an oversight: a NEW repo always links,
+    unconditionally, but a repo dropping out of the set does not -- it only
+    links if the resulting count move clears `pct`. A new repo is new
+    inventory, worth a look regardless of size. A repo disappearing is
+    something going away, and only the count check downstream of it can say
+    whether that was one issue or four hundred.
     """
     if previous is None:
         return True
@@ -146,25 +156,25 @@ def has_changed(previous: dict | None, current: dict, *, pct: float) -> bool:
     return abs(current["count"] - before) / before * 100.0 > pct
 
 
-def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {config.GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"}
-
-
 def create_gist(text: str, *, post=None) -> tuple[str, str]:
     """Create the private gist this board lives in. Returns (id, url).
 
     Run once by hand via `hunt.py --init-gist`; the id then goes in .env as
     BOUNTY_GIST_ID so every later sweep updates the SAME url. A gist created per
     sweep would hand the operator a bookmark that dies every ten minutes.
+
+    Headers come from github_api._headers() rather than a second copy: that
+    function already carries the User-Agent GitHub's API expects, and a header
+    change (an API-version bump, an auth scheme change) applied to one copy and
+    not the other is exactly the kind of drift a shared helper exists to
+    prevent.
     """
     poster = requests.post if post is None else post
     resp = poster(GIST_API, json={
         "description": "expensify-sniper bounty board",
         "public": False,
         "files": {GIST_FILENAME: {"content": text}},
-    }, headers=_headers(), timeout=30)
+    }, headers=github_api._headers(), timeout=30)
     resp.raise_for_status()
     payload = resp.json()
     return payload["id"], payload["html_url"]
@@ -182,6 +192,6 @@ def publish(text: str, *, post=None) -> str | None:
     patcher = requests.patch if post is None else post
     resp = patcher(f"{GIST_API}/{config.BOUNTY_GIST_ID}",
                    json={"files": {GIST_FILENAME: {"content": text}}},
-                   headers=_headers(), timeout=30)
+                   headers=github_api._headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()["html_url"]

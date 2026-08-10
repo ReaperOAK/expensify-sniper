@@ -163,6 +163,15 @@ def test_a_large_count_move_is_worth_a_message():
     assert board.has_changed(before, after, pct=5.0) is True
 
 
+def test_a_move_sitting_exactly_on_the_threshold_is_still_drift():
+    # Pins strict > over >= at the boundary: a move landing EXACTLY on `pct`
+    # is drift, same as anything smaller. Only a move that clears the line
+    # earns a message.
+    before = {"count": 100, "repos": ["a/b"]}
+    after = {"count": 105, "repos": ["a/b"]}   # exactly +5.0%
+    assert board.has_changed(before, after, pct=5.0) is False
+
+
 def test_a_set_emptying_out_is_always_worth_a_message():
     before = {"count": 529, "repos": ["a/b"]}
     after = {"count": 0, "repos": []}

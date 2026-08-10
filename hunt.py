@@ -281,13 +281,18 @@ def run(
     held_back = conn.execute(
         "SELECT COUNT(*) FROM candidates WHERE rejected IS NULL AND amount_usd IS NULL"
     ).fetchone()[0]
-    text = notify.format_digest(new_rows, standing_rows, warnings,
-                                first_run=first_run, now=stamp,
-                                held_back=held_back)
 
-    # The board: everything, always, at a stable url. Written before the
-    # "nothing to say" short-circuit, because the board is the thing that must
-    # NOT go quiet -- it is where the 529 unrankable candidates and the reject
+    # The board: everything, always, at a stable url. Rendered, written and
+    # published BEFORE notify.format_digest(), not after -- a failure here (a
+    # full disk, a revoked token, a deleted gist) has to land as a ⚠ line in
+    # THIS sweep's digest, same as any other warning. Appending it to `text`
+    # after format_digest() already ran would mean the failure is recorded but
+    # never actually reaches anyone: "the board is current" and "I could not
+    # publish it" must never look the same, which is the exact collision this
+    # whole pipeline is built against, just relocated to a second delivery
+    # path. The board is also written before the "nothing to say"
+    # short-circuit further down, because it is the thing that must NOT go
+    # quiet -- it is where the 529 unrankable candidates and the reject
     # reasons live, and both matter most on a sweep with no news.
     unrankable = store.held_back_candidates(conn, config.BOARD_UNRANKABLE_N)
     rejections = store.rejection_counts(conn)
@@ -310,9 +315,20 @@ def run(
             board_url = board.publish(board_text)
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"board publish failed: {exc}")
-        if board_url is None and not config.BOUNTY_GIST_ID:
-            print("⚠ board not published: BOUNTY_GIST_ID unset "
-                  "(run `python3 hunt.py --init-gist` once)", file=sys.stderr)
+        if board_url is None:
+            # Visible on stderr either way -- a human watching watch.log has to
+            # see this regardless of WHICH of the two ways publishing came back
+            # empty, mirroring the digest-delivery failure handling below: an
+            # unset id and a live exception both mean the board did not update,
+            # and "did not update" must never look like ordinary success.
+            reason = ("BOUNTY_GIST_ID unset (run `python3 hunt.py --init-gist` once)"
+                      if not config.BOUNTY_GIST_ID
+                      else "publish raised (see the ⚠ warning above)")
+            print(f"⚠ board was NOT published: {reason}", file=sys.stderr)
+
+    text = notify.format_digest(new_rows, standing_rows, warnings,
+                                first_run=first_run, now=stamp,
+                                held_back=held_back)
 
     # Link the board only when the unrankable set actually moved. Sending it
     # every sweep is 144 links a day, which trains the reader to ignore the
