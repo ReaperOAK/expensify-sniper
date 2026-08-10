@@ -336,15 +336,58 @@ def test_a_cache_hit_pays_no_pause_because_it_makes_no_request(fake_get, tmp_pat
     assert slept == [3.0, 3.0]  # the second call answered from cache, paid nothing
 
 
-def test_label_to_check_returns_the_label_payout_reject_would_judge():
-    assert payers.label_to_check("farm/repo", ("Bounty", "$500"), 526,
-                                 {"real/payer"}) == "Bounty"
+def test_evidence_to_check_returns_the_label_payout_reject_would_judge():
+    evidence = payers.evidence_to_check("farm/repo", ("Bounty", "$500"), 526,
+                                        {"real/payer"})
+    assert evidence.closed_label == "Bounty"
+    assert evidence.check_rewarded is False  # no exact Algora label here
 
 
-def test_label_to_check_abstains_on_exactly_what_payout_reject_abstains_on():
+def test_evidence_to_check_flags_the_rewarded_lookup_for_the_exact_algora_label():
+    """`check_rewarded` is keyed on the EXACT `payers.ALGORA_LABEL` string, not
+    on bounty_label_of's looser "contains bounty" match -- microG's plain
+    "bounty" label must never trigger a query whose only justification is
+    Algora's own ledger, since microG never opted into Algora at all.
+    """
+    evidence = payers.evidence_to_check(
+        "SecureBananaLabs/bug-bounty", ("💎 Bounty", "$9000"), 31, {"real/payer"})
+    assert evidence.check_rewarded is True
+
+    evidence = payers.evidence_to_check(
+        "microg/GmsCore", ("enhancement", "bounty"), 1, {"real/payer"})
+    assert evidence.check_rewarded is False
+
+
+def test_evidence_to_check_flags_the_rewarded_lookup_below_the_open_count_threshold():
+    """UnsafeLabs/Bounty-Hunters, measured 2026-08-10: 9 live candidates, one
+    under UNPAID_REPO_THRESHOLD(10). The closed-ratio path abstains here (as
+    it always did for a repo this size), but the Algora rewarded check is not
+    gated on open_bounties_here at all -- it asks the repo directly, not a
+    sample -- so it must still fire.
+    """
+    evidence = payers.evidence_to_check(
+        "UnsafeLabs/Bounty-Hunters", ("💎 Bounty", "AI Agent friendly"), 9,
+        {"real/payer"})
+    assert evidence.closed_label is None
+    assert evidence.check_rewarded is True
+
+
+def test_evidence_to_check_flags_the_rewarded_lookup_even_with_no_roster():
+    """The Algora rewarded check reads the REPO's own ledger, not the payer
+    roster sample -- so unlike the closed-ratio path, it does not wait for
+    known_payers to have succeeded at all.
+    """
+    evidence = payers.evidence_to_check(
+        "SecureBananaLabs/bug-bounty", ("💎 Bounty",), 31, set())
+    assert evidence.closed_label is None  # roster unavailable: ratio path abstains
+    assert evidence.check_rewarded is True  # but this does not depend on the roster
+
+
+def test_evidence_to_check_abstains_on_exactly_what_payout_reject_abstains_on():
     """One gate, two callers. A copy that drifted more RESTRICTIVE would hand
-    payout_reject closed=None where a real count was needed, and silently
-    keep a farm -- which is why the conditions live in one function.
+    payout_reject closed=None (or rewarded=None) where a real count was
+    needed, and silently keep a farm -- which is why the conditions live in
+    one function.
     """
     cases = [
         ("farm/repo", ("Bounty",), 526, set()),            # roster unavailable
@@ -353,7 +396,9 @@ def test_label_to_check_abstains_on_exactly_what_payout_reject_abstains_on():
         ("small/repo", ("Bounty",), 2, {"real/payer"}),    # under the threshold
     ]
     for repo, labels, open_here, roster in cases:
-        assert payers.label_to_check(repo, labels, open_here, roster) is None
+        evidence = payers.evidence_to_check(repo, labels, open_here, roster)
+        assert evidence.closed_label is None
+        assert evidence.check_rewarded is False  # none of these carry the Algora label
         # ... and payout_reject abstains on the same input even when handed the
         # most damning closed evidence there is.
         assert payers.payout_reject(repo, labels, open_here, roster,
@@ -400,22 +445,21 @@ def test_zero_closed_never_divides_by_zero(fake_get, tmp_path):
     assert reason == "no payout history (526 open bounties here, 0 ever closed)"
 
 
-def test_a_single_unlinked_closure_is_the_weakest_evidence_and_is_rejected():
-    """Design decision (see farm-ratio-report.md): no minimum-sample carve-out.
+def test_a_single_unlinked_closure_is_too_small_a_sample_and_abstains():
+    """Reverses the OLD "no minimum-sample carve-out" decision.
 
-    payout_reject only ever runs once a repo already clears
-    UNPAID_REPO_THRESHOLD (10) open bounties -- label_to_check's own gate is
-    already the "benefit of the doubt" boundary for a small/new project. Once a
-    repo is advertising ten-plus unclaimed bounties, one closure with no linked
-    PR is not stronger evidence of a real programme than zero closures would be
-    -- it is a single unmerged bulk-close away from looking exactly like
-    bounty-plaza. The module's own asymmetric-risk framing (permissive drift
-    wastes quota; restrictive drift only shrinks the board for a repo already
-    shaped like a farm) says reject.
+    That decision assumed a farm past UNPAID_REPO_THRESHOLD had nothing left
+    to hide behind -- but measured 2026-08-10, SecureBananaLabs/bug-bounty
+    proved the opposite: ONE closed issue with a linked PR (1/1 = 100%) sailed
+    straight through the old ratio-only check while the repo had 0 issues ever
+    marked 💰 Rewarded and 31 other open bounties untouched. A single closure,
+    in either direction, is not a sample -- it is a coin flip. Below
+    config.CLOSED_SAMPLE_MIN(5), payout_reject now abstains rather than trust
+    a ratio this thin, same as it always abstained on closed=None.
     """
     reason = payers.payout_reject("farm/repo", ("Bounty",), 526, {"real/payer"},
                                   closed=ClosedBounties(1, 0))
-    assert reason == "no payout history (1 closed here, only 0 with any linked PR)"
+    assert reason is None
 
 
 def test_the_ratio_floor_is_a_strict_less_than():
@@ -454,3 +498,232 @@ def test_abstains_when_the_payer_roster_is_unavailable():
     # An empty roster means the lookup failed, not that nobody pays.
     assert payers.payout_reject("farm/repo", ("Bounty",), 526, set(),
                                 closed=ClosedBounties(0, 0)) is None
+
+
+# --- Algora's own ledger: a repo's rewarded count, direct not sampled -------
+#
+# known_payers is a SAMPLE: the 43 most-recent payers across all of Algora, so
+# a repo's absence from it is weak evidence -- it may simply not have paid
+# RECENTLY. rewarded_count asks GitHub about ONE repo directly, so a zero here
+# is not a sample running dry, it is the platform's own record saying nobody
+# was ever paid. Measured 2026-08-10:
+#
+#   repo                            live   💎 Bounty  0 rewarded  closed w/PR
+#   SecureBananaLabs/bug-bounty       31       yes         yes        1 of 1
+#   UnsafeLabs/Bounty-Hunters          9       yes         yes        0 of 0
+#
+# SecureBananaLabs passed the OLD ratio check at a meaningless 1/1 = 100%.
+# UnsafeLabs sat one candidate under UNPAID_REPO_THRESHOLD(10), so the OLD
+# gate abstained before ever asking. Both wear Algora's exact label; both have
+# never been rewarded once.
+
+
+def test_securebananalabs_shape_is_rejected_despite_the_ratio_looking_perfect():
+    """31 live candidates, 0 issues ever marked 💰 Rewarded, one closed 💎
+    Bounty issue with a linked PR -- 1/1 = 100%, which is exactly why a ratio
+    alone was not enough. Algora's own ledger overrides it.
+    """
+    reason = payers.payout_reject(
+        "SecureBananaLabs/bug-bounty", ("💎 Bounty", "$9000"), 31,
+        {"some/other-payer"}, closed=ClosedBounties(1, 1), rewarded=0)
+    assert reason is not None
+    assert "Rewarded" in reason
+
+
+def test_unsafelabs_shape_is_rejected_below_the_open_count_threshold():
+    """9 live candidates -- one under UNPAID_REPO_THRESHOLD(10) -- carrying
+    💎 Bounty among labels that also include 'AI Agent friendly' and 'AI only
+    allowed - no humans', and 0 issues ever marked 💰 Rewarded. The OLD gate
+    abstained purely because 9 < 10; the Algora rewarded check does not wait
+    for that threshold at all, because it reads the repo directly rather than
+    comparing it against a sample.
+    """
+    reason = payers.payout_reject(
+        "UnsafeLabs/Bounty-Hunters",
+        ("💎 Bounty", "AI Agent friendly", "AI only allowed - no humans"),
+        9, {"some/other-payer"}, closed=None, rewarded=0)
+    assert reason is not None
+
+
+def test_microg_shape_is_kept_it_never_wears_the_algora_label():
+    """microg/GmsCore: 14,170 stars, labels ['enhancement', 'bounty'], a real
+    $1,340 bounty, 0 issues ever marked 💰 Rewarded -- but it never wears
+    Algora's exact 💎 Bounty label, so its silence on Algora's own platform
+    means nothing at all: it never opted in. Only one bounty is open here,
+    well under UNPAID_REPO_THRESHOLD, so the closed-ratio path abstains too.
+    This is the asymmetry the whole rule depends on: absence of the label
+    means absence of a record to be silent about.
+    """
+    reason = payers.payout_reject(
+        "microg/GmsCore", ("enhancement", "bounty"), 1, {"some/other-payer"},
+        closed=None, rewarded=0)
+    assert reason is None
+
+
+def test_activepieces_shape_is_kept_when_rewarded_is_nonzero():
+    """activepieces/activepieces: wears 💎 Bounty, rewarded 150 times overall.
+    Even off the payer-roster sample and past UNPAID_REPO_THRESHOLD, a nonzero
+    rewarded count keeps it -- and its closed ratio (170/173, 98%) keeps it on
+    that ground too.
+    """
+    reason = payers.payout_reject(
+        "activepieces/activepieces", ("💎 Bounty", "$200"), 173,
+        {"some/other-payer"}, closed=ClosedBounties(173, 170), rewarded=150)
+    assert reason is None
+
+
+def test_opendbc_shape_is_kept_above_the_sample_minimum():
+    """commaai/opendbc: no Algora label anywhere, runs its own programme -- 7
+    closed bounties including a $4,000 port, 4 with a linked PR (57%). 7 is at
+    or above config.CLOSED_SAMPLE_MIN(5), so the ratio is trusted outright and
+    clears CLOSED_PR_RATIO_FLOOR (0.34) comfortably. This is the shape the
+    sample floor exists NOT to catch -- see
+    test_a_tiny_closed_sample_abstains_rather_than_rejects for the boundary
+    case where the floor itself has to fire.
+    """
+    assert payers.payout_reject(
+        "commaai/opendbc", ("Bounty",), 30, {"some/other-payer"},
+        closed=ClosedBounties(7, 4)) is None
+
+
+def test_a_tiny_closed_sample_abstains_rather_than_rejects():
+    """Get the direction right, and this is the important part: BELOW
+    config.CLOSED_SAMPLE_MIN(5), payout_reject must abstain, not reject,
+    however bad the ratio looks. SecureBananaLabs/bug-bounty is exactly why a
+    minimum that rejected small samples would be dangerous -- 1/1 (100%)
+    sailed through the OLD ratio-only check, so flipping straight to "reject
+    every tiny sample" would only trade one false verdict for its opposite.
+    This uses a synthetic 0-with-PR closure at total=4 (still below the
+    floor) to prove the abstain branch fires even when the ratio, if it were
+    trusted, would look damning.
+    """
+    reason = payers.payout_reject(
+        "small-sample/repo", ("Bounty",), 526, {"some/other-payer"},
+        closed=ClosedBounties(4, 0))
+    assert reason is None
+
+
+def test_bounty_plaza_shape_is_still_rejected_above_the_sample_minimum():
+    """zhangjiayang6835-cyber/bounty-plaza: 198 closed, 23 with a linked PR
+    (12%) -- 198 is far above config.CLOSED_SAMPLE_MIN(5), so the sample
+    floor does not shield it; the ratio, well below CLOSED_PR_RATIO_FLOOR,
+    rejects exactly as before the floor existed.
+    """
+    reason = payers.payout_reject(
+        "zhangjiayang6835-cyber/bounty-plaza", ("Bounty",), 527,
+        {"some/other-payer"}, closed=ClosedBounties(198, 23))
+    assert reason == "no payout history (198 closed here, only 23 with any linked PR)"
+
+
+def test_a_failed_rewarded_lookup_abstains():
+    """rewarded=None means the lookup could not run (budget exhausted, the
+    request failed, or it was simply never bought) -- exactly like closed=None
+    above, this must never be read as "zero", or a throttled rewarded_count
+    call would reject every 💎 Bounty repo in a sweep whenever search quota
+    ran thin.
+    """
+    assert payers.payout_reject(
+        "SecureBananaLabs/bug-bounty", ("💎 Bounty",), 31,
+        {"some/other-payer"}, closed=ClosedBounties(1, 1), rewarded=None) is None
+
+
+# --- rewarded_count: Algora's own ledger for one repo, one search -----------
+
+
+def _rewarded_page(total_count: int):
+    return {"total_count": total_count, "incomplete_results": False, "items": []}
+
+
+def test_rewarded_count_returns_the_repos_own_rewarded_total(fake_get, tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, _rewarded_page(150))
+    assert payers.rewarded_count(
+        conn, "activepieces/activepieces", now=100.0) == 150
+
+
+def test_rewarded_count_of_zero_is_a_real_zero_not_a_failure(fake_get, tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, _rewarded_page(0))
+    assert payers.rewarded_count(
+        conn, "SecureBananaLabs/bug-bounty", now=100.0) == 0
+
+
+def test_rewarded_count_asks_for_the_rewarded_label_in_that_repo(fake_get, tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, _rewarded_page(0))
+    payers.rewarded_count(conn, "UnsafeLabs/Bounty-Hunters", now=100.0)
+    _, params = fake_get.calls[0]
+    assert params["q"] == 'repo:UnsafeLabs/Bounty-Hunters is:issue label:"💰 Rewarded"'
+    assert params["per_page"] == 1
+
+
+def test_rewarded_count_a_failure_is_none_not_zero(fake_get, tmp_path):
+    # "I could not look" must never render as "there are none" -- the same
+    # distinction ever_closed_with exists to protect.
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(403, {"message": "rate limited"})
+    assert payers.rewarded_count(conn, "acme/widgets", now=100.0) is None
+
+
+def test_rewarded_count_is_cached_so_a_second_call_makes_no_request(fake_get, tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, _rewarded_page(0))
+    assert payers.rewarded_count(conn, "acme/widgets", now=100.0) == 0
+    assert payers.rewarded_count(conn, "acme/widgets", now=200.0) == 0
+    assert len(fake_get.calls) == 1
+
+
+def test_rewarded_count_cache_expires(fake_get, tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, _rewarded_page(0))
+    payers.rewarded_count(conn, "acme/widgets", now=100.0)
+    fake_get.queue(200, _rewarded_page(3))
+    later = 100.0 + config.PAYER_CACHE_S + 1
+    assert payers.rewarded_count(conn, "acme/widgets", now=later) == 3
+
+
+def test_rewarded_count_reserves_one_search_unit_and_refuses_when_the_pool_is_spent(
+        fake_get, tmp_path):
+    import time as time_mod
+
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.reserve(conn, "search", 30, now=time_mod.time())  # pool is empty
+    assert payers.rewarded_count(conn, "acme/widgets", now=100.0) is None
+    assert fake_get.calls == []  # refused before any request went out
+
+
+def test_rewarded_count_does_not_buy_the_discovery_retry_ladder(
+        fake_get, tmp_path, monkeypatch):
+    """retries=0, deliberately, same reasoning as ever_closed_with: abandoning
+    this one costs an abstain on one repo, not a whole discovery page.
+    """
+    from sniper import github_api
+
+    seen = []
+    monkeypatch.setattr(
+        github_api, "search_issues",
+        lambda query, **kw: seen.append((query, kw)) or github_api.SearchResult(
+            items=[], total_count=0, incomplete=False, pages_fetched=1))
+    conn = store.connect(tmp_path / "s.sqlite")
+    payers.rewarded_count(conn, "acme/widgets", now=100.0)
+    assert len(seen) == 1
+    assert seen[0][1]["retries"] == 0
+
+
+def test_rewarded_count_is_paced_like_a_search_page(fake_get, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 3.0)
+    slept = []
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, _rewarded_page(0))
+    payers.rewarded_count(conn, "acme/widgets", now=100.0, sleep=slept.append)
+    assert slept == [3.0]
+
+
+def test_rewarded_count_a_cache_hit_pays_no_pause(fake_get, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 3.0)
+    slept = []
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, _rewarded_page(4))
+    payers.rewarded_count(conn, "a/b", now=100.0, sleep=slept.append)
+    payers.rewarded_count(conn, "a/b", now=200.0, sleep=slept.append)
+    assert slept == [3.0]  # the second call answered from cache, paid nothing

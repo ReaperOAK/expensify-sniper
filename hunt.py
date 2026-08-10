@@ -191,8 +191,18 @@ def run(
             closed_memo[key] = payers.ever_closed_with(conn, repo, label, now=stamp)
         return closed_memo[key]
 
+    # Same memo discipline, one key narrower: Algora's ledger is per-repo, not
+    # per-label. Failures are remembered too -- a throttle answered once must
+    # not be re-paid on every candidate in a 296-row repo.
+    rewarded_memo: dict[str, int | None] = {}
+
+    def rewarded_for(repo: str) -> int | None:
+        if repo not in rewarded_memo:
+            rewarded_memo[repo] = payers.rewarded_count(conn, repo, now=stamp)
+        return rewarded_memo[repo]
+
     store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
-                                  closed_for)
+                                  closed_for, rewarded_for)
 
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []
@@ -225,11 +235,14 @@ def run(
         # farm. closed_for is memoised per (repo, label) for the whole run,
         # failures included, so a repo holding 296 candidates costs one call and
         # one throttle rather than 296.
-        label = payers.label_to_check(cand.repo, cand.labels,
-                                      open_here[cand.repo], payer_repos)
-        closed = closed_for(cand.repo, label) if label else None
+        evidence = payers.evidence_to_check(cand.repo, cand.labels,
+                                            open_here[cand.repo], payer_repos)
+        closed = (closed_for(cand.repo, evidence.closed_label)
+                  if evidence.closed_label else None)
+        rewarded = rewarded_for(cand.repo) if evidence.check_rewarded else None
         reason = payers.payout_reject(
-            cand.repo, cand.labels, open_here[cand.repo], payer_repos, closed)
+            cand.repo, cand.labels, open_here[cand.repo], payer_repos,
+            closed=closed, rewarded=rewarded)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:

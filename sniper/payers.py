@@ -126,7 +126,8 @@ def payout_reject(
     labels: tuple[str, ...],
     open_bounties_here: int,
     payers: set[str],
-    closed: ClosedBounties | None,
+    closed: ClosedBounties | None = None,
+    rewarded: int | None = None,
 ) -> str | None:
     """Reason to drop a candidate on payout history. None = keep.
 
@@ -173,13 +174,32 @@ def payout_reject(
     RESTRICTIVE passes closed=None where real evidence was needed and
     silently keeps a farm.
     """
-    if label_to_check(repo, labels, open_bounties_here, payers) is None:
+    evidence = evidence_to_check(repo, labels, open_bounties_here, payers)
+
+    # Algora's own ledger first, and independently of the open count. This repo
+    # wears Algora's label, so a payout would have been stamped `💰 Rewarded`;
+    # zero of them is the platform's record, not an inference from a sample.
+    # Measured 2026-08-10: SecureBananaLabs/bug-bounty had 31 live candidates,
+    # 0 rewarded, and ONE closed `💎 Bounty` issue carrying a linked PR -- 1/1 =
+    # 100%, sailing past the ratio. UnsafeLabs/Bounty-Hunters had 9 live, one
+    # under the threshold, and 0 rewarded. Neither was reachable before this.
+    if evidence.check_rewarded and rewarded == 0:
+        return (f"never paid through Algora (wears {ALGORA_LABEL}, "
+                f"0 issues ever marked {REWARDED_LABEL})")
+
+    if evidence.closed_label is None:
         return None
     if closed is None:
         return None
     if closed.total == 0:
         return (f"no payout history ({open_bounties_here} open bounties here, "
                 f"0 ever closed)")
+    # A ratio needs a sample. BELOW the minimum this ABSTAINS rather than
+    # rejects, and the direction is the whole point: commaai/opendbc is a
+    # genuine payer with only 7 closed bounties (4 with PRs), so rejecting on a
+    # short track record would kill exactly the repos this tool exists to find.
+    if closed.total < config.CLOSED_SAMPLE_MIN:
+        return None
     # total > 0 is checked above precisely so this division never sees a zero
     # denominator -- a repo with 0 closed never reaches this line.
     if (closed.with_pr / closed.total) < config.CLOSED_PR_RATIO_FLOOR:
@@ -188,16 +208,42 @@ def payout_reject(
     return None
 
 
-def label_to_check(
+@dataclass(frozen=True)
+class Evidence:
+    """Which lookups could still change payout_reject's verdict for this repo.
+
+    Two independent questions, because they rest on different things.
+
+    `closed_label` drives the closed-bounty ratio, and it is gated on the payer
+    ROSTER -- a sample of the 43 most-recent payers. Absence from a sample is
+    weak, so that path abstains generously.
+
+    `check_rewarded` drives Algora's own ledger for this one repo, and it is
+    gated on nothing but the label. That is not a sample: `💰 Rewarded` is the
+    stamp Algora puts on an issue when it releases money, so for a repo wearing
+    Algora's own `💎 Bounty` label, zero rewarded issues is the platform's own
+    record saying nobody was ever paid. It therefore does NOT wait for
+    UNPAID_REPO_THRESHOLD, and that matters: measured 2026-08-10,
+    UnsafeLabs/Bounty-Hunters sat at NINE live candidates -- one under the
+    threshold -- with 0 rewarded and labels including 'AI only allowed - no
+    humans', and the old gate abstained purely on the count.
+    """
+
+    closed_label: str | None
+    check_rewarded: bool
+
+
+def evidence_to_check(
     repo: str,
     labels: tuple[str, ...],
     open_bounties_here: int,
     payers: set[str],
-) -> str | None:
-    """The label to ask `ever_closed_with` about, or None to spend nothing.
+) -> Evidence:
+    """What is worth buying before judging this repo. See Evidence.
 
     This is `payout_reject`'s gate, hoisted so a caller can ask it BEFORE
-    buying the evidence. None means the answer cannot change the verdict:
+    buying the evidence. A None closed_label means that answer cannot change
+    the verdict:
 
       * the payer roster is empty, so the lookup FAILED and payout_reject's
         first check abstains unconditionally -- this one bit us, and asking
@@ -214,16 +260,30 @@ def label_to_check(
     Returning the label rather than a bool means the caller never recomputes
     bounty_label_of, so the two can never disagree about WHICH label was judged.
     """
+    # Keyed on the EXACT Algora string, not bounty_label_of's looser "contains
+    # bounty" match. microg/GmsCore carries a plain 'bounty' label, 14,170 stars
+    # and a real $1,340 bounty, and has 0 rewarded issues -- because it never
+    # opted into Algora at all. Its silence is about a ledger it is not in, so
+    # it must never be read as evidence. Absence of the label is absence of a
+    # record to be silent about, and that asymmetry is what makes this rule safe
+    # enough to skip the open-count threshold.
+    check_rewarded = (repo not in payers
+                      and any(label.strip() == ALGORA_LABEL for label in labels))
+
     if not payers:
-        return None  # roster unavailable: abstain rather than reject the world
+        # Roster unavailable: the ratio path abstains rather than rejecting the
+        # world. check_rewarded is deliberately unaffected -- it reads the repo,
+        # not the roster.
+        return Evidence(None, check_rewarded)
     if repo in payers:
-        return None
+        return Evidence(None, False)
     label = bounty_label_of(labels)
     if label is None:
-        return None  # nothing marks this as a bounty; its silence says nothing
+        # Nothing marks this as a bounty; its silence says nothing.
+        return Evidence(None, check_rewarded)
     if open_bounties_here < config.UNPAID_REPO_THRESHOLD:
-        return None
-    return label
+        return Evidence(None, check_rewarded)
+    return Evidence(label, check_rewarded)
 
 
 def bounty_label_of(labels: tuple[str, ...]) -> str | None:
@@ -371,3 +431,66 @@ def ever_closed_with(
                     json.dumps({"fetched_at": stamp, "closed": result.total,
                                 "closed_with_pr": result.with_pr}))
     return result
+
+
+REWARDED_CACHE_PREFIX = "rewarded-count"
+
+
+def rewarded_count(
+    conn: sqlite3.Connection,
+    repo: str,
+    *,
+    now: float | None = None,
+    sleep=time.sleep,
+) -> int | None:
+    """How many issues in `repo` Algora has ever stamped `💰 Rewarded`. None = unknown.
+
+    This is the one signal here that is not an inference from a sample. The
+    payer roster is the 43 most-recent payers, so absence from it is weak
+    evidence and every rule built on it abstains generously. This reads the
+    REPO's own ledger, so a zero is not "we did not see them pay", it is
+    "Algora never recorded a payout here".
+
+    That strength is why the caller may act on it below UNPAID_REPO_THRESHOLD.
+    Measured 2026-08-10: UnsafeLabs/Bounty-Hunters sat at NINE live candidates,
+    one under the threshold, with 0 rewarded and 182 open bounties earlier the
+    same week; SecureBananaLabs/bug-bounty had 31 live and 0 rewarded while its
+    single closed bounty carried a PR, giving a perfect 1/1 ratio.
+
+    It is only ever asked about a repo wearing Algora's own label -- see
+    evidence_to_check. A repo that never opted into Algora has no ledger to be
+    silent about, and reading its silence would drop microg/GmsCore: 14,170
+    stars, a real $1,340 bounty, 0 rewarded, no Algora label anywhere.
+
+    One search unit, cached for config.PAYER_CACHE_S, paced and retry-free for
+    the same reasons ever_closed_with is. Returns None on failure, never 0, and
+    a failure is NOT cached -- so a caller in a loop must memoise the None or
+    one throttle is re-paid per candidate.
+    """
+    stamp = time.time() if now is None else now
+    key = f"{REWARDED_CACHE_PREFIX}:{repo}"
+    _, body = store.get_cache(conn, key)
+    if body:
+        try:
+            payload = json.loads(body)
+            if stamp - payload["fetched_at"] < config.PAYER_CACHE_S:
+                return payload["rewarded"]
+        except (ValueError, KeyError, TypeError):
+            pass  # unreadable cache is just a miss
+
+    if not store.reserve_or_wait(conn, "search", 1):
+        return None
+
+    if config.SEARCH_PAGE_PAUSE_S:
+        sleep(config.SEARCH_PAGE_PAUSE_S)
+    try:
+        found = github_api.search_issues(
+            f'repo:{repo} is:issue label:"{REWARDED_LABEL}"',
+            per_page=1, max_pages=1, retries=0)
+    except Exception:  # noqa: BLE001 -- unknown, and the caller abstains on it
+        return None
+
+    store.set_cache(conn, key, None,
+                    json.dumps({"fetched_at": stamp,
+                                "rewarded": found.total_count}))
+    return found.total_count

@@ -496,7 +496,7 @@ def apply_dismissals(conn: sqlite3.Connection) -> int:
 
 
 def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
-                            threshold: int, closed_for) -> int:
+                            threshold: int, closed_for, rewarded_for=None) -> int:
     """Re-judge STORED candidates against payout history. Returns rows changed.
 
     Filters that arrive later must reach the rows already in the table, for the
@@ -530,19 +530,31 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
         "SELECT repo, number, labels FROM candidates WHERE rejected IS NULL").fetchall()
     for row in rows:
         repo = row["repo"]
-        if repo in payers or counts.get(repo, 0) < threshold:
-            continue
         try:
             labels = tuple(str(name) for name in json.loads(row["labels"]))
         except (ValueError, TypeError):
             continue
-        label = payers_module.bounty_label_of(labels)
-        if label is None:
+        # evidence_to_check rather than a local copy of its conditions. There
+        # used to be one here -- `repo in payers or counts < threshold` -- and
+        # it was the third copy of the same gate. It also carried the hole the
+        # Algora rule exists to close: measured 2026-08-10,
+        # UnsafeLabs/Bounty-Hunters sat at 9 live rows, one under the threshold,
+        # so a stored row was skipped before anything could judge it.
+        evidence = payers_module.evidence_to_check(
+            repo, labels, counts.get(repo, 0), payers)
+        if evidence.closed_label is None and not evidence.check_rewarded:
             continue
-        if (repo, label) not in closed_cache:
-            closed_cache[(repo, label)] = closed_for(repo, label)
+        closed = None
+        if evidence.closed_label is not None:
+            key = (repo, evidence.closed_label)
+            if key not in closed_cache:
+                closed_cache[key] = closed_for(repo, evidence.closed_label)
+            closed = closed_cache[key]
+        rewarded = (rewarded_for(repo)
+                    if evidence.check_rewarded and rewarded_for else None)
         reason = payers_module.payout_reject(
-            repo, labels, counts[repo], payers, closed_cache[(repo, label)])
+            repo, labels, counts.get(repo, 0), payers,
+            closed=closed, rewarded=rewarded)
         if reason is None:
             continue
         conn.execute(

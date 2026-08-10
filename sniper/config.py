@@ -220,6 +220,20 @@ UNPAID_REPO_THRESHOLD = int(os.environ.get("UNPAID_REPO_THRESHOLD", "10"))
 # assignee -- so it is not part of either query. `linked:pr` does work.
 CLOSED_PR_RATIO_FLOOR = float(os.environ.get("CLOSED_PR_RATIO_FLOOR", "0.34"))
 
+# A ratio computed on a handful of closures is not evidence, it is noise that
+# happens to look like evidence. Measured 2026-08-10, SecureBananaLabs/
+# bug-bounty had closed exactly ONE 💎 Bounty issue, with a linked PR -- 1/1 =
+# 100%, sailing straight past CLOSED_PR_RATIO_FLOOR while the repo had 0
+# issues ever marked 💰 Rewarded and 31 other open bounties sitting unclaimed.
+# Below this many closed issues, payout_reject abstains on the ratio rather
+# than trusting it. `closed.total == 0` is untouched by this floor and keeps
+# rejecting outright -- "never closed one" needs no sample size to be
+# damning, only the RATIO does. commaai/opendbc (7 closed, 4 with PR, 57%) is
+# the repo this floor must never catch: getting the direction backwards
+# (reject-below instead of abstain-below) would kill a genuine payer for
+# having too small a track record, which is exactly backwards.
+CLOSED_SAMPLE_MIN = int(os.environ.get("CLOSED_SAMPLE_MIN", "5"))
+
 # --- payer watch --------------------------------------------------------------
 # How many proven-payer repos to watch. Each costs one core request per sweep,
 # and nothing at all when the repo is unchanged (a 304 leaves the quota
