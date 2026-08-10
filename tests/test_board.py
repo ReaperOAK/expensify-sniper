@@ -6,7 +6,8 @@ board is the whole table, and it exists because two things were invisible: the
 which had quietly grown larger than everything being kept.
 """
 
-from sniper import board
+from sniper import board, store
+from sniper.models import Candidate
 
 
 def _row(**kwargs):
@@ -75,3 +76,64 @@ def test_the_footer_carries_the_sweep_time_and_totals():
                         totals={"live": 536, "held_back": 529, "rejected": 970})
     assert "2026-08-09" in text
     assert "536" in text and "529" in text and "970" in text
+
+
+def _stored(number, amount_usd, *, repo="acme/widgets"):
+    """A Candidate shaped for store.upsert_candidate, not for render() directly.
+
+    Every test above this one passes render() a plain dict, because a dict
+    fixture is what keeps render() a pure function -- testable with no
+    database, no filesystem, no network. That is the right design and stays.
+    But dict and sqlite3.Row disagree about what a MISSING key does (KeyError
+    vs IndexError), which is precisely the seam _get() exists to paper over,
+    and a dict-only suite can never exercise the real type on the other side
+    of that seam.
+    """
+    return Candidate(source="github-labels", repo=repo, number=number,
+                      title=f"issue {number}",
+                      url=f"https://github.com/{repo}/issues/{number}",
+                      state="open", comments=1, labels=(),
+                      created_at="2026-08-01T00:00:00Z",
+                      updated_at="2026-08-01T00:00:00Z", has_assignee=False,
+                      amount_usd=amount_usd,
+                      amounts_seen=(amount_usd,) if amount_usd else ())
+
+
+def test_render_agrees_with_the_real_sqlite3_row_not_only_the_dict_fixtures(tmp_path):
+    """The dict fixtures above test the renderer. This one tests that the
+    renderer and the real row type still agree -- because a change that swapped
+    _get()'s try/except for row.get(key), which dict supports and sqlite3.Row
+    does not, would sail through every dict-based test in this file and break
+    only on the box, against the real database, in production.
+
+    Writes through store.upsert_candidate, reads back through the three real
+    query functions, and feeds those rows -- untouched -- straight into
+    render(). One rankable row carries open_pr_count; a second does not, so
+    both branches of the _get() lookup that renders (or omits) the "PRs"
+    marker run against an actual sqlite3.Row, not a dict standing in for one.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(
+        conn, _stored(1, 250).with_linked_prs(2), now=1.0)   # open_pr_count set
+    store.upsert_candidate(
+        conn, _stored(2, 300), now=1.0)                      # open_pr_count NULL
+    store.upsert_candidate(
+        conn, _stored(3, None), now=1.0)                     # held back: no amount
+    store.upsert_candidate(
+        conn, _stored(4, None), rejected="fork", now=1.0)    # rejected
+
+    rankable = store.live_candidates(conn, limit=10, require_amount=True)
+    held_back = store.held_back_candidates(conn, 10)
+    rejections = store.rejection_counts(conn)
+    assert all(type(row).__name__ == "Row" for row in rankable + held_back)
+
+    text = board.render(rankable, held_back, rejections,
+                        now=_NOW, warnings=[], totals={})
+
+    assert "acme/widgets#1" in text and "$250" in text and "2 PRs" in text
+    assert "acme/widgets#2" in text and "$300" in text
+    # #2's open_pr_count is NULL -- the marker must not appear for it, so the
+    # only "PRs" in the whole page is #1's.
+    assert text.count("PRs") == 1
+    assert "### acme/widgets" in text and "[#3](" in text
+    assert "| 1 | fork |" in text
