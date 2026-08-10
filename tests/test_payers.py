@@ -187,6 +187,80 @@ def test_the_query_asks_for_closed_issues_in_that_repo_with_that_label(
     assert params["per_page"] == 1
 
 
+def test_the_farm_check_does_not_buy_the_discovery_retry_ladder(fake_get, tmp_path,
+                                                                monkeypatch):
+    """retries=0, deliberately, and NOT the SEARCH_MAX_RETRIES default.
+
+    The 60/120/240s ladder exists because abandoning a discovery page cost 420
+    of 520 candidates. Abandoning a farm check costs one abstain on one repo,
+    and 14 repos qualify once the 'open linked PR' rows are revived -- 14 x 420s
+    is 98 minutes of a 3-hourly sweep spent buying nothing.
+    """
+    from sniper import github_api
+
+    seen = {}
+    monkeypatch.setattr(github_api, "search_issues",
+                        lambda query, **kw: seen.update(kw) or github_api.SearchResult(
+                            items=[], total_count=0, incomplete=False, pages_fetched=1))
+    conn = store.connect(tmp_path / "s.sqlite")
+    payers.ever_closed_with(conn, "farm/repo", "Bounty", now=100.0)
+    assert seen["retries"] == 0
+
+
+def test_the_farm_check_is_paced_like_a_search_page(fake_get, tmp_path, monkeypatch):
+    """apply_payout_rejections fires one of these per qualifying repo, and 14
+    qualify post-revive. Ten back-to-back requests tripped GitHub's secondary
+    limit with 23 of 30 primary units unspent (measured 2026-08-08), and
+    search_issues only paces between PAGES -- this asks for exactly one.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 3.0)
+    slept = []
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, {"total_count": 0, "incomplete_results": False, "items": []})
+    payers.ever_closed_with(conn, "farm/repo", "Bounty", now=100.0,
+                            sleep=slept.append)
+    assert slept == [3.0]
+
+
+def test_a_cache_hit_pays_no_pause_because_it_makes_no_request(fake_get, tmp_path,
+                                                                monkeypatch):
+    from sniper import config
+
+    monkeypatch.setattr(config, "SEARCH_PAGE_PAUSE_S", 3.0)
+    slept = []
+    conn = store.connect(tmp_path / "s.sqlite")
+    fake_get.queue(200, {"total_count": 4, "incomplete_results": False, "items": []})
+    payers.ever_closed_with(conn, "a/b", "Bounty", now=100.0, sleep=slept.append)
+    payers.ever_closed_with(conn, "a/b", "Bounty", now=200.0, sleep=slept.append)
+    assert slept == [3.0]  # the second call answered from cache
+
+
+def test_label_to_check_returns_the_label_payout_reject_would_judge():
+    assert payers.label_to_check("farm/repo", ("Bounty", "$500"), 526,
+                                 {"real/payer"}) == "Bounty"
+
+
+def test_label_to_check_abstains_on_exactly_what_payout_reject_abstains_on():
+    """One gate, two callers. A copy that drifted more RESTRICTIVE would hand
+    payout_reject closed_count=None where a real count was needed, and silently
+    keep a farm -- which is why the conditions live in one function.
+    """
+    cases = [
+        ("farm/repo", ("Bounty",), 526, set()),            # roster unavailable
+        ("real/payer", ("Bounty",), 999, {"real/payer"}),  # proven payer
+        ("some/repo", ("bug",), 526, {"real/payer"}),      # nothing marks a bounty
+        ("small/repo", ("Bounty",), 2, {"real/payer"}),    # under the threshold
+    ]
+    for repo, labels, open_here, roster in cases:
+        assert payers.label_to_check(repo, labels, open_here, roster) is None
+        # ... and payout_reject abstains on the same input even when handed the
+        # most damning closed_count there is.
+        assert payers.payout_reject(repo, labels, open_here, roster,
+                                    closed_count=0) is None
+
+
 def test_rejects_a_farm_using_its_own_label():
     reason = payers.payout_reject("farm/repo", ("Bounty",), 526, {"real/payer"},
                                   closed_count=0)

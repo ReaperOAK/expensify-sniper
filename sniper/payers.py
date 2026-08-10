@@ -138,19 +138,60 @@ def payout_reject(
     `closed_count` of None means the question could not be answered, and this
     abstains. A repo running its own programme, or a small repo with one or two
     genuine bounties, is never touched.
+
+    The first four conditions live in `label_to_check`, not here, because every
+    caller has to evaluate them BEFORE calling this -- they decide whether
+    spending a search unit on `closed_count` can possibly change the answer.
+    Two copies of that reasoning is the shape of the bug fixed in 441d2ed, and
+    the risk is asymmetric: a copy that drifts more PERMISSIVE only wastes
+    quota, since this function re-validates, while one that drifts more
+    RESTRICTIVE passes closed_count=None where a real count was needed and
+    silently keeps a farm.
     """
-    if not payers:
-        return None  # roster unavailable: abstain rather than reject the world
-    if repo in payers:
-        return None
-    if bounty_label_of(labels) is None:
-        return None  # nothing marks this as a bounty; its silence says nothing
-    if open_bounties_here < config.UNPAID_REPO_THRESHOLD:
+    if label_to_check(repo, labels, open_bounties_here, payers) is None:
         return None
     if closed_count is None or closed_count > 0:
         return None
     return (f"no payout history ({open_bounties_here} open bounties here, "
             f"0 ever closed)")
+
+
+def label_to_check(
+    repo: str,
+    labels: tuple[str, ...],
+    open_bounties_here: int,
+    payers: set[str],
+) -> str | None:
+    """The label to ask `ever_closed_with` about, or None to spend nothing.
+
+    This is `payout_reject`'s gate, hoisted so a caller can ask it BEFORE
+    buying the evidence. None means the answer cannot change the verdict:
+
+      * the payer roster is empty, so the lookup FAILED and payout_reject's
+        first check abstains unconditionally -- this one bit us, and asking
+        anyway spends a search unit per candidate on an answer already
+        guaranteed to be discarded. Worse than wasted: once the 30/min pool is
+        gone, reserve_or_wait blocks for up to BUDGET_WAIT_S, and the roster
+        fetch usually fails from that same rate pressure;
+      * the repo is already a proven payer;
+      * nothing on the candidate marks it as a bounty, so the repo's silence
+        says nothing;
+      * the repo is under UNPAID_REPO_THRESHOLD open bounties, which is a new
+        project rather than a farm.
+
+    Returning the label rather than a bool means the caller never recomputes
+    bounty_label_of, so the two can never disagree about WHICH label was judged.
+    """
+    if not payers:
+        return None  # roster unavailable: abstain rather than reject the world
+    if repo in payers:
+        return None
+    label = bounty_label_of(labels)
+    if label is None:
+        return None  # nothing marks this as a bounty; its silence says nothing
+    if open_bounties_here < config.UNPAID_REPO_THRESHOLD:
+        return None
+    return label
 
 
 def bounty_label_of(labels: tuple[str, ...]) -> str | None:
@@ -192,6 +233,7 @@ def ever_closed_with(
     label: str,
     *,
     now: float | None = None,
+    sleep=time.sleep,
 ) -> int | None:
     """How many issues `repo` has ever CLOSED carrying `label`. None = unknown.
 
@@ -208,7 +250,11 @@ def ever_closed_with(
     programme from a wall of adverts.
 
     Costs one search unit, cached for config.PAYER_CACHE_S. Returns None on any
-    failure, and the caller MUST abstain rather than read that as zero.
+    failure, and the caller MUST abstain rather than read that as zero. A
+    failure is NOT written to the cache -- it is not an answer about the repo --
+    so every caller in a loop must memoise the None itself, or one throttle is
+    re-paid once per candidate. hunt.run and store.apply_payout_rejections both
+    do.
     """
     stamp = time.time() if now is None else now
     key = f"{CLOSED_CACHE_PREFIX}:{repo}:{label}"
@@ -223,10 +269,26 @@ def ever_closed_with(
 
     if not store.reserve_or_wait(conn, "search", 1):
         return None
+    # Pace this like a search PAGE, because to GitHub's burst guard that is
+    # exactly what it is. search_issues only pauses between pages and this asks
+    # for exactly one, so without this the calls go out back to back:
+    # apply_payout_rejections fires one per qualifying repo, and reviving the
+    # 446 'open linked PR' rows takes qualifying repos from 4 to 14. Measured
+    # 2026-08-08, TEN back-to-back requests tripped the secondary limit with 23
+    # of 30 primary units still unspent. Same pattern, new call site.
+    if config.SEARCH_PAGE_PAUSE_S:
+        sleep(config.SEARCH_PAGE_PAUSE_S)
     try:
         found = github_api.search_issues(
             f'repo:{repo} is:issue is:closed label:"{label}"',
-            per_page=1, max_pages=1)
+            per_page=1, max_pages=1,
+            # No retry ladder here, unlike discovery. The default is 3 attempts
+            # at 60/120/240s, which exists because abandoning a DISCOVERY page
+            # cost 420 of 520 candidates -- a whole run's inventory. Abandoning
+            # a FARM CHECK costs one abstain on one repo, and the caller is
+            # built to abstain. Paying 420 seconds for that, per repo, with 14
+            # repos qualifying, is how a 3-hourly sweep stops finishing at all.
+            retries=0)
     except Exception:  # noqa: BLE001 -- unknown, and the caller abstains on it
         return None
 

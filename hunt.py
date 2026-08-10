@@ -165,8 +165,24 @@ def run(
     payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
     warnings.extend(payer_warnings)
 
+    # Memoised for the WHOLE run, failures included. ever_closed_with caches a
+    # successful answer in the database but records nothing when it fails --
+    # correctly, since a throttle says nothing about the repo -- so without this
+    # every caller re-asks. That is not one wasted call: reviving the 446 'open
+    # linked PR' rows takes repos over UNPAID_REPO_THRESHOLD from 4 to 14, and
+    # the largest of them holds 296 candidates. Under a secondary throttle each
+    # ask is a wait-then-raise, so 296 uncached asks is a sweep that never ends
+    # -- and the 10-minute watch cron piles up behind a 3-hourly run that never
+    # exits. `None` here means "already asked, could not tell", which is a real
+    # answer and is cached exactly like any other; store.apply_payout_rejections
+    # has always done this internally, and stage 1 had no such memo at all.
+    closed_memo: dict[tuple[str, str], int | None] = {}
+
     def closed_for(repo: str, label: str) -> int | None:
-        return payers.ever_closed_with(conn, repo, label, now=stamp)
+        key = (repo, label)
+        if key not in closed_memo:
+            closed_memo[key] = payers.ever_closed_with(conn, repo, label, now=stamp)
+        return closed_memo[key]
 
     store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
                                   closed_for)
@@ -193,23 +209,18 @@ def run(
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
     kept: list[Candidate] = []
     for cand in survivors:
-        # The guard matters: without it every candidate costs a search unit,
-        # and payout_reject would abstain on nearly all of them anyway (below
-        # threshold, already on the payer roster, or -- this one bit us --
-        # roster fetch FAILED). An empty payer_repos means known_payers could
-        # not look, not that nobody pays, and payout_reject's very first check
-        # abstains on that unconditionally; asking closed_for anyway would
-        # spend search units on an answer already guaranteed to be thrown
-        # away. Worse than wasted: reserve_or_wait blocks for up to
-        # BUDGET_WAIT_S once the pool is spent, and the roster fetch usually
-        # fails from that same rate pressure, so this would stall the run for
-        # minutes buying nothing. ever_closed_with caches per (repo, label),
-        # so repeated candidates in one repo cost one call.
-        label = payers.bounty_label_of(cand.labels)
-        closed = (closed_for(cand.repo, label)
-                  if label and payer_repos and cand.repo not in payer_repos
-                  and open_here[cand.repo] >= config.UNPAID_REPO_THRESHOLD
-                  else None)
+        # The guard matters: without it every candidate costs a search unit for
+        # an answer payout_reject would discard anyway. It is payers'
+        # label_to_check rather than a copy of its conditions here, because two
+        # copies of the same four-way gate is the bug already fixed once on this
+        # branch (441d2ed) -- and a copy that drifted more RESTRICTIVE would
+        # pass closed=None where a real count was needed and silently keep a
+        # farm. closed_for is memoised per (repo, label) for the whole run,
+        # failures included, so a repo holding 296 candidates costs one call and
+        # one throttle rather than 296.
+        label = payers.label_to_check(cand.repo, cand.labels,
+                                      open_here[cand.repo], payer_repos)
+        closed = closed_for(cand.repo, label) if label else None
         reason = payers.payout_reject(
             cand.repo, cand.labels, open_here[cand.repo], payer_repos, closed)
         if reason:

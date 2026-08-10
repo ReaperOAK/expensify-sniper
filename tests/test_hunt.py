@@ -459,6 +459,46 @@ def test_an_empty_roster_never_reaches_closed_for(tmp_path, fake_get, monkeypatc
     assert calls == []
 
 
+def test_a_failing_closed_for_is_asked_once_per_repo_and_label_not_once_per_candidate(
+        tmp_path, fake_get, monkeypatch):
+    """A FAILED payout check must be remembered, exactly as a successful one is.
+
+    ever_closed_with writes its cache only on success, so a throttled answer
+    leaves nothing behind and the next candidate asks again. Measured against
+    the live database: reviving the 446 'open linked PR' rows takes repos with
+    >=10 live candidates from 4 to 14, and one of those repos holds 296 rows.
+    Without a memo that remembers failures, stage 1 asks 296 times -- and each
+    ask, under a secondary throttle, is a 60+120+240s backoff ladder before it
+    raises. That is the 3-hourly sweep never finishing and the 10-minute watch
+    cron piling up behind it, with no digest to say why.
+
+    'I could not look' is an ANSWER here, not the absence of one, and it has to
+    be cached like any other. store.apply_payout_rejections already does this
+    with its own closed_cache; hunt's stage 1 relied on a DB cache the failure
+    path never writes.
+    """
+    from sniper import payers as payers_mod
+
+    calls: list[tuple[str, str]] = []
+
+    def always_fails(conn, repo, label, **kwargs):
+        calls.append((repo, label))
+        return None  # throttled: unknown, and every caller must abstain
+
+    monkeypatch.setattr(payers_mod, "ever_closed_with", always_fails)
+
+    conn = _conn(tmp_path, payers=("someone/else",))
+    # 12 candidates in one repo: over UNPAID_REPO_THRESHOLD(10), off the roster,
+    # each carrying the same $780 label -- one question, twelve askers.
+    source = FakeSource("s", [_cand(n, repo="farm/repo") for n in range(12)])
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    for _ in range(12):
+        fake_get.queue(200, [])
+    _run(conn, sources=[source], dry_run=True)
+
+    assert calls == [("farm/repo", "$780")]
+
+
 def test_a_quiet_watch_sweep_says_nothing(tmp_path, fake_get, monkeypatch, capsys):
     """The watch runs every ten minutes: 144 'nothing new' messages a day.
 
