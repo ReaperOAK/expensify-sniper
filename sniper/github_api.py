@@ -116,6 +116,7 @@ def poll_label_events(
     repo: str,
     etag: str | None,
     matches: Callable[[str], bool],
+    since_event_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], str | None, bool]:
     """Return (label events whose label `matches`, newest-first, new etag, changed).
 
@@ -135,8 +136,37 @@ def poll_label_events(
         return [], etag, False
     resp.raise_for_status()
 
+    # Page BACKWARDS past the first 100 until `seen` recognises something, so a
+    # busy hour cannot roll a label off between polls. Measured 2026-08-10 on
+    # Expensify/App, one 100-event page covered 27 MINUTES -- against a 10-minute
+    # poll that is 2.7x of margin, and it was 2h52m the day before, so the
+    # velocity swings by 6x. A fixed one-page read is a bet on the repo being
+    # quiet, and losing that bet is silent: the label is simply never seen.
+    #
+    # A WATERMARK, not a per-event "have I handled this" test. Only a matching
+    # label ever gets recorded as handled, and matching labels are a tiny
+    # minority of the feed -- so a seen-test would almost never recognise
+    # anything and would page the full cap on every single poll. Event ids
+    # increase monotonically, so "we have reached an id we already passed" is
+    # the honest stopping point. On the first run there is no watermark, which
+    # is what the page cap is for.
+    payload = list(resp.json())
+    if since_event_id is not None:
+        page = 1
+        while (page < config.EVENT_MAX_PAGES
+               and len(payload) >= 100 * page
+               and all(int(e.get("id", 0)) > since_event_id for e in payload)):
+            page += 1
+            more = _get(f"/repos/{repo}/issues/events",
+                        params={"per_page": 100, "page": page})
+            more.raise_for_status()
+            batch = more.json()
+            if not batch:
+                break
+            payload.extend(batch)
+
     events = []
-    for event in resp.json():
+    for event in payload:
         if event.get("event") != "labeled":
             continue
         label_name = (event.get("label") or {}).get("name")
@@ -159,9 +189,12 @@ def poll_label_events(
     return events, resp.headers.get("ETag"), True
 
 
-def poll_help_wanted_events(repo: str, etag: str | None) -> tuple[list[dict[str, Any]], str | None, bool]:
+def poll_help_wanted_events(
+    repo: str, etag: str | None, since_event_id: int | None = None,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
     """Expensify's Help Wanted watch. Unchanged contract; now one case of many."""
-    return poll_label_events(repo, etag, lambda name: name == config.HELP_WANTED)
+    return poll_label_events(repo, etag, lambda name: name == config.HELP_WANTED,
+                             since_event_id=since_event_id)
 
 
 def get_issue(repo: str, number: int) -> dict[str, Any]:

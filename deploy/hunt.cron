@@ -14,8 +14,22 @@
 # the nvm prefix (HANDOFF.md trap #8). hunt.py itself needs only system python3
 # and requests.
 #
-# Both jobs take a LOCK, and they take the SAME one, because they share a
-# SQLite file and neither is as short as its schedule assumes. Measured
+# Each job takes its OWN lock, so a job can never overlap ITSELF -- and just as
+# importantly, the digest can never block the watch.
+#
+# They shared one lock for a few hours on 2026-08-10 and that was wrong. A full
+# sweep spends ~20 minutes in the timeline stage alone, which is twice the watch
+# job's entire interval, so a shared lock starved two to four watch cycles every
+# digest. That is the opposite of the priority: the watch is the time-critical
+# one. Its whole reason for existing is to catch a label BEFORE it rolls off the
+# 100-event page, and that page covered just 27 minutes on Expensify/App when
+# measured the same day -- so a starved watch loses labels permanently, while a
+# skipped digest merely reports the same inventory three hours later.
+#
+# They do both write the same SQLite file, which is what the shared lock was
+# reaching for. That concern is already handled a layer down: connect() opens
+# with timeout=30 and upsert_candidate was hardened for concurrent writers after
+# measuring 8 of 10 racing writers collide. Measured
 # 2026-08-10: a full sweep of 975 survivors spends ~20 minutes in the timeline
 # stage alone at one core call per candidate, which is longer than the watch
 # job's entire interval -- so without this the 10-minute watch would start on
@@ -28,8 +42,9 @@
 # next scheduled run is only minutes away. Skipping is silent by design here;
 # each job's own log records every run it does make, so liveness stays provable.
 PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
-LOCK=/tmp/expensify-sniper.lock
-0 */3 * * * cd $HOME/expensify-sniper && /usr/bin/flock -n $LOCK /usr/bin/python3 hunt.py >> $HOME/expensify-sniper/hunt.log 2>&1
+DIGEST_LOCK=/tmp/expensify-sniper-digest.lock
+WATCH_LOCK=/tmp/expensify-sniper-watch.lock
+0 */3 * * * cd $HOME/expensify-sniper && /usr/bin/flock -n $DIGEST_LOCK /usr/bin/python3 hunt.py >> $HOME/expensify-sniper/hunt.log 2>&1
 
 # Payer watch -- every 10 minutes.
 #
@@ -43,4 +58,4 @@ LOCK=/tmp/expensify-sniper.lock
 # a 304 leaves the quota untouched, so a quiet repo costs nothing. Ten minutes
 # is not a preference -- one events page holds 100 entries and covered a single
 # DAY on go-gitea/gitea, so a slower sweep loses labels silently.
-*/10 * * * * cd $HOME/expensify-sniper && /usr/bin/flock -n $LOCK /usr/bin/python3 hunt.py --watch >> $HOME/expensify-sniper/watch.log 2>&1
+*/10 * * * * cd $HOME/expensify-sniper && /usr/bin/flock -n $WATCH_LOCK /usr/bin/python3 hunt.py --watch >> $HOME/expensify-sniper/watch.log 2>&1

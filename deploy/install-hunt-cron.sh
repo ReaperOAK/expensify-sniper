@@ -101,18 +101,19 @@ ssh "$HOST" "test -x /usr/bin/flock || { echo '  MISSING /usr/bin/flock -- insta
              echo '  flock ok'"
 
 echo "==> installing crontab entry"
-# Both jobs take the SAME lock. Measured 2026-08-10: a full sweep of 975
-# survivors spends ~20 minutes in the timeline stage alone, which is twice the
-# watch job's whole interval, so unlocked they would overlap and write the same
-# SQLite file. -n rather than -w: a sweep that cannot get the lock skips, since
-# queueing would build a backlog racing to report the same inventory and the
-# next run is minutes away.
+# One lock PER JOB, so a job cannot overlap itself and the digest cannot block
+# the watch. A shared lock starved 2-4 watch cycles per digest, which is exactly
+# backwards: the watch exists to catch a label before it rolls off a page that
+# covered 27 minutes when measured, so starving it loses labels permanently.
+# -n rather than -w: a sweep that cannot get its lock skips, since queueing
+# would build a backlog racing to report the same inventory.
 ssh "$HOST" "crontab -l 2>/dev/null | grep -v 'hunt.py' > /tmp/ct.\$\$ || true
              cat >> /tmp/ct.\$\$ <<'CRON'
 PATH=/usr/local/bin:/usr/bin:/bin:\$HOME/.local/bin
-LOCK=/tmp/expensify-sniper.lock
-0 */3 * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$LOCK /usr/bin/python3 hunt.py >> \$HOME/expensify-sniper/hunt.log 2>&1
-*/10 * * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$LOCK /usr/bin/python3 hunt.py --watch >> \$HOME/expensify-sniper/watch.log 2>&1
+DIGEST_LOCK=/tmp/expensify-sniper-digest.lock
+WATCH_LOCK=/tmp/expensify-sniper-watch.lock
+0 */3 * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$DIGEST_LOCK /usr/bin/python3 hunt.py >> \$HOME/expensify-sniper/hunt.log 2>&1
+*/10 * * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$WATCH_LOCK /usr/bin/python3 hunt.py --watch >> \$HOME/expensify-sniper/watch.log 2>&1
 CRON
              crontab /tmp/ct.\$\$ && rm -f /tmp/ct.\$\$"
 

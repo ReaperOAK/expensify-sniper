@@ -22,6 +22,9 @@ from .base import SourceResult
 class ExpensifySource:
     name = "expensify"
     CACHE_KEY = "expensify-help-wanted-events"
+    # Highest event id already paged past. See poll_label_events: this is
+    # what lets a busy hour page deeper instead of losing a label.
+    WATERMARK_KEY = "expensify-events-watermark"
 
     def __init__(self, repo: str | None = None):
         self.repo = config.REPO if repo is None else repo
@@ -35,7 +38,10 @@ class ExpensifySource:
 
         etag, _ = store.get_cache(conn, self.CACHE_KEY)
         try:
-            events, new_etag, changed = github_api.poll_help_wanted_events(self.repo, etag)
+            _, watermark = store.get_cache(conn, self.WATERMARK_KEY)
+            events, new_etag, changed = github_api.poll_help_wanted_events(
+                self.repo, etag,
+                since_event_id=int(watermark) if watermark else None)
         except github_api.RateLimited as exc:
             result.warnings.append(f"Expensify event poll rate limited: {exc}")
             return result
@@ -46,6 +52,9 @@ class ExpensifySource:
         if not changed:
             return result
         store.set_cache(conn, self.CACHE_KEY, new_etag, "")
+        if events:
+            newest = max(int(e["event_id"]) for e in events)
+            store.set_cache(conn, self.WATERMARK_KEY, None, str(newest))
 
         for event in events:
             # Check-then-mark, deliberately not mark-then-work. mark_event_seen()

@@ -206,6 +206,13 @@ COMMENT_CEILING = int(os.environ.get("COMMENT_CEILING", "100"))
 # market has already looked at and declined.
 STALE_AFTER_DAYS = int(os.environ.get("STALE_AFTER_DAYS", "7"))
 
+# How far back the label watch will page when it has not yet recognised an
+# event. One page is 100 events; measured 2026-08-10 that covered 27 minutes on
+# Expensify/App and 2h52m the day before -- a 6x swing, against a 10-minute
+# poll. Paging until a known event appears removes the bet entirely; this cap is
+# only for the first run, when nothing is known and there is no stopping point.
+EVENT_MAX_PAGES = int(os.environ.get("EVENT_MAX_PAGES", "5"))
+
 # Expensify Help Wanted issues pay a flat rate; there is no $-label to parse.
 EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
 
