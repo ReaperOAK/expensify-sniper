@@ -92,12 +92,27 @@ hunt.build_sources(config.HUNT_ENABLED_SOURCES)
 print('  sources build ok')
 PY"
 
+echo "==> preflight: flock, which both cron jobs depend on"
+# Both jobs share one lock and one database. Installing a crontab that calls a
+# missing flock would make EVERY sweep fail with 127 into a log nobody reads --
+# a tracker that reports nothing looks exactly like a market with nothing in it,
+# which is the failure this whole project is built against.
+ssh "$HOST" "test -x /usr/bin/flock || { echo '  MISSING /usr/bin/flock -- install util-linux'; exit 1; }
+             echo '  flock ok'"
+
 echo "==> installing crontab entry"
+# Both jobs take the SAME lock. Measured 2026-08-10: a full sweep of 975
+# survivors spends ~20 minutes in the timeline stage alone, which is twice the
+# watch job's whole interval, so unlocked they would overlap and write the same
+# SQLite file. -n rather than -w: a sweep that cannot get the lock skips, since
+# queueing would build a backlog racing to report the same inventory and the
+# next run is minutes away.
 ssh "$HOST" "crontab -l 2>/dev/null | grep -v 'hunt.py' > /tmp/ct.\$\$ || true
              cat >> /tmp/ct.\$\$ <<'CRON'
 PATH=/usr/local/bin:/usr/bin:/bin:\$HOME/.local/bin
-0 */3 * * * cd \$HOME/expensify-sniper && /usr/bin/python3 hunt.py >> \$HOME/expensify-sniper/hunt.log 2>&1
-*/10 * * * * cd \$HOME/expensify-sniper && /usr/bin/python3 hunt.py --watch >> \$HOME/expensify-sniper/watch.log 2>&1
+LOCK=/tmp/expensify-sniper.lock
+0 */3 * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$LOCK /usr/bin/python3 hunt.py >> \$HOME/expensify-sniper/hunt.log 2>&1
+*/10 * * * * cd \$HOME/expensify-sniper && /usr/bin/flock -n \$LOCK /usr/bin/python3 hunt.py --watch >> \$HOME/expensify-sniper/watch.log 2>&1
 CRON
              crontab /tmp/ct.\$\$ && rm -f /tmp/ct.\$\$"
 
