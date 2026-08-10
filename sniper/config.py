@@ -56,6 +56,20 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # The board lives in ONE private gist so the operator has a stable bookmark.
 # Create it once with `python3 hunt.py --init-gist` and paste the id here.
 BOUNTY_GIST_ID = os.environ.get("BOUNTY_GIST_ID", "").strip()
+
+# Writing a gist needs the `gist` scope; reading public bounties needs none at
+# all. Measured 2026-08-10: GITHUB_TOKEN here is a classic PAT with an EMPTY
+# scope list, which is exactly right for the rest of this tool -- it can read
+# every public issue and can do nothing else, so a leak costs nothing. Creating
+# or updating a gist with it returns 404 (GitHub reports a missing scope as
+# not-found, not as forbidden, which reads as "your gist is gone").
+#
+# So the gist credential is separate rather than upgrading the read token's
+# scopes. Least privilege: one narrow token that can write one gist, and a read
+# token that stays powerless. Falls back to GITHUB_TOKEN so a single
+# sufficiently-scoped token also works.
+BOUNTY_GIST_TOKEN = (os.environ.get("BOUNTY_GIST_TOKEN", "").strip()
+                     or GITHUB_TOKEN)
 BOARD_PATH = Path(os.environ.get("BOARD_PATH", ROOT / "bounties.md"))
 # How many amountless candidates the board lists. 934 once the 446 'open linked
 # PR' rows are revived, so this is a page-size guard that DOES bite -- the

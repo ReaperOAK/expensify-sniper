@@ -314,3 +314,46 @@ def test_create_gist_makes_it_private(monkeypatch):
     assert payload["public"] is False
     assert gist_id == "newid"
     assert url == "https://gist.github.com/newid"
+
+
+def test_gist_calls_carry_the_gist_credential_not_the_read_one(monkeypatch):
+    """The read token is deliberately powerless; only gist writes get a scope.
+
+    Measured 2026-08-10 against the live API: GITHUB_TOKEN is a classic PAT with
+    an EMPTY scope list. That is correct for everything else this tool does --
+    it can read every public issue and nothing more, so a leak costs nothing --
+    but POST /gists answers 404 with it. GitHub reports a missing scope as
+    not-found rather than forbidden, so an under-scoped token is indistinguishable
+    from a deleted gist unless you already know to look.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_TOKEN", "gist-scoped", raising=False)
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "read-only", raising=False)
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+
+    post = _FakePost()
+    board.publish("# board", post=post)
+    _, _, headers = post.calls[0]
+    assert headers["Authorization"] == "Bearer gist-scoped"
+
+    post = _FakePost(body={"id": "n", "html_url": "https://gist.github.com/n"})
+    board.create_gist("# board", post=post)
+    _, _, headers = post.calls[0]
+    assert headers["Authorization"] == "Bearer gist-scoped"
+
+
+def test_the_gist_token_falls_back_to_the_read_token(monkeypatch):
+    """One sufficiently-scoped token must still work; two is an option, not a rule."""
+    import importlib
+
+    from sniper import config
+
+    monkeypatch.delenv("BOUNTY_GIST_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "only-one-token")
+    reloaded = importlib.reload(config)
+    try:
+        assert reloaded.BOUNTY_GIST_TOKEN == "only-one-token"
+    finally:
+        monkeypatch.setenv("GITHUB_TOKEN", "test-token-not-a-real-credential")
+        importlib.reload(config)

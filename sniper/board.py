@@ -212,6 +212,22 @@ def has_changed(previous: dict | None, current: dict, *, pct: float) -> bool:
     return abs(current["count"] - before) / before * 100.0 > pct
 
 
+def _gist_headers() -> dict[str, str]:
+    """github_api's headers, but carrying the gist credential.
+
+    Reading public bounties needs no scope at all, and GITHUB_TOKEN is
+    deliberately a scopeless classic PAT so that losing it costs nothing.
+    Writing a gist needs the `gist` scope, so it gets its own token rather than
+    widening the read one -- BOUNTY_GIST_TOKEN, falling back to GITHUB_TOKEN.
+
+    Measured 2026-08-10: with the scopeless token, POST /gists answers 404, not
+    403. GitHub reports a missing scope as not-found, so an under-scoped
+    credential looks exactly like a deleted gist. If publishing ever starts
+    failing with 404, check the scope before believing the gist is gone.
+    """
+    return github_api._headers({"Authorization": f"Bearer {config.BOUNTY_GIST_TOKEN}"})
+
+
 def create_gist(text: str, *, post=None) -> tuple[str, str]:
     """Create the private gist this board lives in. Returns (id, url).
 
@@ -223,14 +239,14 @@ def create_gist(text: str, *, post=None) -> tuple[str, str]:
     function already carries the User-Agent GitHub's API expects, and a header
     change (an API-version bump, an auth scheme change) applied to one copy and
     not the other is exactly the kind of drift a shared helper exists to
-    prevent.
+    prevent. Only the credential differs -- see _gist_headers().
     """
     poster = requests.post if post is None else post
     resp = poster(GIST_API, json={
         "description": "expensify-sniper bounty board",
         "public": False,
         "files": {GIST_FILENAME: {"content": text}},
-    }, headers=github_api._headers(), timeout=30)
+    }, headers=_gist_headers(), timeout=30)
     resp.raise_for_status()
     payload = resp.json()
     return payload["id"], payload["html_url"]
@@ -248,6 +264,6 @@ def publish(text: str, *, post=None) -> str | None:
     patcher = requests.patch if post is None else post
     resp = patcher(f"{GIST_API}/{config.BOUNTY_GIST_ID}",
                    json={"files": {GIST_FILENAME: {"content": text}}},
-                   headers=github_api._headers(), timeout=30)
+                   headers=_gist_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()["html_url"]
