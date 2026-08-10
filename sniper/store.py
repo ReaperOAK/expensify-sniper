@@ -726,3 +726,23 @@ def algora_repos(conn: sqlite3.Connection) -> set[str]:
         if any(str(name).strip() == payers_module.ALGORA_LABEL for name in labels):
             found.add(row["repo"])
     return found
+
+
+def apply_comment_ceiling(conn: sqlite3.Connection, ceiling: int) -> int:
+    """Reject stored candidates already past the comment ceiling. Rows changed.
+
+    filters.free_reject decides this for candidates a source hands over THIS
+    sweep. A months-old bounty may never be rediscovered, so without this the
+    ceiling would apply to new inventory only and the 36 live rows over it on
+    2026-08-10 would have stayed on the board forever. Same reason
+    apply_dismissals and apply_payout_rejections exist.
+
+    The reason string is built to match free_reject's exactly, so the board's
+    reject table groups both paths under one row rather than showing the same
+    rule twice under two spellings.
+    """
+    cur = conn.execute(
+        "UPDATE candidates SET rejected = comments || ' comments -- too contested' "
+        "WHERE rejected IS NULL AND comments > ?", (ceiling,))
+    conn.commit()
+    return cur.rowcount

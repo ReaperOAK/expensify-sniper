@@ -331,3 +331,29 @@ def test_rejection_examples_ignore_live_candidates(tmp_path):
     conn = store.connect(tmp_path / "s.sqlite")
     store.upsert_candidate(conn, _candidate(number=1), now=1.0)
     assert store.rejection_examples(conn, 3) == {}
+
+
+def test_the_comment_ceiling_reaches_rows_already_stored(tmp_path):
+    """A filter that only judges what it rediscovers is barely a filter.
+
+    Measured 2026-08-10: 36 live candidates carried more than 100 comments when
+    the ceiling shipped. free_reject only sees candidates a source hands it this
+    sweep, and a months-old bounty may never be rediscovered -- the same reason
+    apply_dismissals and apply_payout_rejections exist.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, replace(_candidate(number=1), comments=2006), now=1.0)
+    store.upsert_candidate(conn, replace(_candidate(number=2), comments=100), now=1.0)
+    store.upsert_candidate(conn, replace(_candidate(number=3), comments=0), now=1.0)
+    store.upsert_candidate(conn, replace(_candidate(number=4), comments=500),
+                           rejected="fork", now=1.0)
+
+    changed = store.apply_comment_ceiling(conn, 100)
+
+    assert changed == 1
+    rows = {r["number"]: r["rejected"] for r in
+            conn.execute("SELECT number, rejected FROM candidates")}
+    assert rows[1] == "2006 comments -- too contested"
+    assert rows[2] is None          # exactly at the ceiling is kept
+    assert rows[3] is None
+    assert rows[4] == "fork"        # an existing verdict is not overwritten

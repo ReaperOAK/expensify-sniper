@@ -161,6 +161,14 @@ def run(
     # alternative -- staying rejected under a question nobody asks any more,
     # which for a months-old bounty is forever. Costs one UPDATE and is a no-op
     # once the table is drained.
+    # Retroactive, for the reason apply_dismissals is: free_reject only judges
+    # what a source hands over this sweep, and a months-old bounty may never be
+    # rediscovered. 36 live rows were already past the ceiling when it shipped.
+    contested = store.apply_comment_ceiling(conn, config.COMMENT_CEILING)
+    if contested:
+        warnings.append(f"{contested} candidates dropped as too contested "
+                        f"(over {config.COMMENT_CEILING} comments)")
+
     revived = store.clear_rejections(conn, "open linked PR")
     if revived:
         warnings.append(f"{revived} candidates re-judged: an open PR is no longer "
