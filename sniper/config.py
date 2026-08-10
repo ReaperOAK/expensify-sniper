@@ -206,6 +206,25 @@ COMMENT_CEILING = int(os.environ.get("COMMENT_CEILING", "100"))
 # market has already looked at and declined.
 STALE_AFTER_DAYS = int(os.environ.get("STALE_AFTER_DAYS", "7"))
 
+# Stars a repo needs before its bounties are worth ranking.
+#
+# A team stars its own repo, so a bounty-advertising repo that nobody has
+# starred has no team. Measured 2026-08-10 on the live board: of 86 priced live
+# candidates, 9 sat under 25 stars and every one was junk --
+# Vikingr2023/awesome-agent-bounties claiming $3,000 on 3 stars,
+# theselfish/SlopStation13 (0 stars, "Tung Tung Tung Sahur antagonist"),
+# demetriodiazdeleon-pixel/morriganprueba ("prueba" is Spanish for "test"), a
+# 0-star traefik fork.
+#
+# The number is not a guess. That distribution has a clean hole in it -- 9 under
+# 25, ZERO between 25 and 99, 3 in the hundreds, 74 above a thousand -- so
+# anywhere in the gap gives the same answer and 25 sits inside it. If this ever
+# needs re-tuning, re-measure the gap rather than nudging the number.
+#
+# Decided in repo_reject, not free_reject: the search payload carries no
+# repository object, so stars only exist after the enrichment call.
+MIN_STARS = int(os.environ.get("MIN_STARS", "25"))
+
 # How far back the label watch will page when it has not yet recognised an
 # event. One page is 100 events; measured 2026-08-10 that covered 27 minutes on
 # Expensify/App and 2h52m the day before -- a 6x swing, against a 10-minute

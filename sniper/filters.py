@@ -106,4 +106,9 @@ def repo_reject(cand: Candidate) -> str | None:
         return "fork"
     if cand.archived:
         return "archived repo"
+    # None is "the detail call returned no count", not "nobody starred it".
+    # Rejecting on absent data punishes a failed API call, which is the mistake
+    # this codebase names in its own docstrings.
+    if cand.stars is not None and cand.stars < config.MIN_STARS:
+        return f"{cand.stars} stars -- under {config.MIN_STARS}"
     return None

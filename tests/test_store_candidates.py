@@ -559,3 +559,30 @@ def test_the_retroactive_staleness_cutoff_matches_the_free_rule_exactly(tmp_path
     assert stored[1] is None                      # 7.9 days -> 7 whole days, kept
     assert stored[2] == filters.stale_reason(7)   # 8.0 days -> rejected
     assert stored[3] == filters.stale_reason(7)
+
+
+def test_the_star_floor_reaches_rows_already_stored(tmp_path):
+    """Same reason apply_comment_ceiling and apply_staleness exist: repo_reject
+    only judges what a source hands over this sweep, and 325 of 464 live rows
+    were already under the floor when it shipped.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    detail = {"fork": False, "archived": False, "pushed_at": "2026-08-01T00:00:00Z",
+              "language": "Python"}
+    store.upsert_candidate(conn, _candidate(number=1).with_repo_detail(
+        {**detail, "stargazers_count": 3}), now=1.0)
+    store.upsert_candidate(conn, _candidate(number=2).with_repo_detail(
+        {**detail, "stargazers_count": 25}), now=1.0)
+    store.upsert_candidate(conn, _candidate(number=3), now=1.0)   # never enriched
+    store.upsert_candidate(conn, _candidate(number=4).with_repo_detail(
+        {**detail, "stargazers_count": 0}), rejected="fork", now=1.0)
+
+    changed = store.apply_star_floor(conn, 25)
+
+    assert changed == 1
+    rows = {r["number"]: r["rejected"] for r in
+            conn.execute("SELECT number, rejected FROM candidates")}
+    assert rows[1] == "3 stars -- under 25"
+    assert rows[2] is None          # exactly at the floor is kept
+    assert rows[3] is None          # NULL stars means "not enriched", not "zero"
+    assert rows[4] == "fork"        # an existing verdict is not overwritten

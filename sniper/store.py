@@ -837,3 +837,24 @@ def apply_staleness(conn: sqlite3.Connection, days: int, *,
         (filters.stale_reason(days), cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")))
     conn.commit()
     return cur.rowcount
+
+
+def apply_star_floor(conn: sqlite3.Connection, minimum: int) -> int:
+    """Reject stored candidates whose repo is under the star floor. Rows changed.
+
+    filters.repo_reject decides this for candidates enriched THIS sweep. 325 of
+    464 live rows were already under the floor when it shipped, and a months-old
+    bounty may never be rediscovered -- the same reason apply_dismissals,
+    apply_comment_ceiling and apply_staleness exist.
+
+    `stars IS NOT NULL` is load-bearing: NULL means the repo-detail call never
+    returned a count, not that nobody starred it, and rejecting on absent data
+    punishes a failed API call. The reason string matches repo_reject's exactly
+    so both paths group as one row on the board.
+    """
+    cur = conn.execute(
+        "UPDATE candidates SET rejected = stars || ' stars -- under ' || ? "
+        "WHERE rejected IS NULL AND stars IS NOT NULL AND stars < ?",
+        (minimum, minimum))
+    conn.commit()
+    return cur.rowcount

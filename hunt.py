@@ -195,6 +195,11 @@ def run(
     # Retroactive, for the reason apply_dismissals is: free_reject only judges
     # what a source hands over this sweep, and a months-old bounty may never be
     # rediscovered. 36 live rows were already past the ceiling when it shipped.
+    unstarred = store.apply_star_floor(conn, config.MIN_STARS)
+    if unstarred:
+        warnings.append(f"{unstarred} candidates dropped: repo under "
+                        f"{config.MIN_STARS} stars")
+
     contested = store.apply_comment_ceiling(conn, config.COMMENT_CEILING)
     if contested:
         warnings.append(f"{contested} candidates dropped as too contested "

@@ -28,6 +28,13 @@ _FRESH = (dt.datetime.now(dt.timezone.utc)
           - dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _enriched(*, stars=900, fork=False, archived=False):
+    """A candidate that has been through repo-detail enrichment."""
+    return _cand().with_repo_detail(
+        {"fork": fork, "archived": archived, "stargazers_count": stars,
+         "pushed_at": _FRESH, "language": "Python"})
+
+
 def _cand(source="github-labels", **over):
     base = {
         "number": 7, "title": "t", "state": "open", "comments": 1,
@@ -112,8 +119,11 @@ def test_repo_reject_rejects_an_archived_repo():
 
 
 def test_repo_reject_keeps_a_healthy_repo():
+    # 900 stars, not the 12 this fixture used to carry. This test is about fork
+    # and archived; 12 became a rejection in its own right when the star floor
+    # landed, which would have made it fail for a reason it was never about.
     cand = _cand().with_repo_detail(
-        {"fork": False, "archived": False, "stargazers_count": 12,
+        {"fork": False, "archived": False, "stargazers_count": 900,
          "pushed_at": "2026-08-05T06:20:46Z", "language": "Solidity"})
     assert filters.repo_reject(cand) is None
 
@@ -244,3 +254,32 @@ def test_staleness_is_not_measured_on_creation_date():
     cand = _cand(created_at="2015-01-01T00:00:00Z",
                  updated_at="2026-08-09T12:00:00Z")
     assert filters.free_reject(cand, now=_NOW) is None
+
+
+def test_a_repo_nobody_has_starred_is_rejected():
+    """A team stars its own repo. Measured 2026-08-10 on the live board: of 86
+    priced live candidates, 9 sat under 25 stars and every one was junk --
+    Vikingr2023/awesome-agent-bounties claiming $3,000 on 3 stars,
+    theselfish/SlopStation13 (0 stars), demetriodiazdeleon-pixel/morriganprueba
+    ('prueba' is Spanish for 'test'), a 0-star traefik fork.
+
+    The threshold is not a guess. The star distribution of the priced survivors
+    has a clean hole in it -- 9 under 25, ZERO between 25 and 99, 3 in the
+    hundreds, 74 above a thousand -- so anywhere in that gap gives the same
+    answer, and 25 sits inside it.
+    """
+    from sniper import config
+
+    assert filters.repo_reject(_enriched(stars=0)) == "0 stars -- under 25"
+    assert filters.repo_reject(_enriched(stars=config.MIN_STARS - 1)) is not None
+    assert filters.repo_reject(_enriched(stars=config.MIN_STARS)) is None
+
+
+def test_an_unenriched_star_count_abstains_rather_than_rejecting():
+    """None means the detail call never returned a count, not that nobody
+    starred it. Rejecting on absent data punishes a failed API call.
+    """
+    import dataclasses
+
+    cand = dataclasses.replace(_enriched(stars=900), stars=None)
+    assert filters.repo_reject(cand) is None
