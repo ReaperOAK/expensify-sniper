@@ -505,11 +505,13 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
     with 201 open bounties and zero payouts until GitHub happened to touch each
     issue again.
 
-    `closed_for(repo, label) -> int | None` supplies the closed-bounty count and
-    is called LAZILY, only for repos that are over the threshold and off the
-    payer roster. That matters: it costs a search unit each, and asking about
-    every repo in the table would blow the 30/min pool on rows that were never
-    going to be rejected. None means unknown, and this abstains on it.
+    `closed_for(repo, label) -> payers.ClosedBounties | None` supplies the
+    closed-bounty evidence (total closed, and how many of those carry a linked
+    PR -- see payers.ClosedBounties) and is called LAZILY, only for repos that
+    are over the threshold and off the payer roster. That matters: it costs two
+    search units each, and asking about every repo in the table would blow the
+    30/min pool on rows that were never going to be rejected. None means
+    unknown, and this abstains on it.
 
     Uses only stored columns (`labels` is kept as JSON precisely so a judgement
     can be revisited), so the callback is the only cost.
@@ -522,7 +524,7 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
 
     counts = {row["repo"]: row["n"] for row in conn.execute(
         "SELECT repo, COUNT(*) AS n FROM candidates WHERE rejected IS NULL GROUP BY repo")}
-    closed_cache: dict[tuple[str, str], int | None] = {}
+    closed_cache: dict[tuple[str, str], payers_module.ClosedBounties | None] = {}
     changed = 0
     rows = conn.execute(
         "SELECT repo, number, labels FROM candidates WHERE rejected IS NULL").fetchall()

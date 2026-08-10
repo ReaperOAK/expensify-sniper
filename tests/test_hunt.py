@@ -381,7 +381,8 @@ def test_the_payout_filter_reaches_candidates_stored_before_it_existed(tmp_path)
     # amount label, since it's neither Algora's exact string nor "bounty").
     # The callback reports 0 ever closed -- a farm's shape.
     changed = store.apply_payout_rejections(
-        conn, {"someone/else"}, 10, lambda repo, label: 0)
+        conn, {"someone/else"}, 10,
+        lambda repo, label: payers_mod.ClosedBounties(0, 0))
     assert changed == 12
     assert store.live_candidates(conn, limit=50) == []
     row = conn.execute("SELECT rejected FROM candidates WHERE number = 0").fetchone()
@@ -405,12 +406,14 @@ def test_closed_for_is_asked_only_about_qualifying_repos_and_cached_by_label(tmp
     callback -- and its 12 candidates share one (repo, label) pair, so it must
     be asked about exactly once, not 12 times.
     """
+    from sniper import payers as payers_mod
+
     conn = store.connect(tmp_path / "t.sqlite")
     calls: list[tuple[str, str]] = []
 
-    def counting_closed_for(repo: str, label: str) -> int | None:
+    def counting_closed_for(repo: str, label: str) -> "payers_mod.ClosedBounties | None":
         calls.append((repo, label))
-        return 0
+        return payers_mod.ClosedBounties(0, 0)
 
     for n in range(12):  # over threshold(10), off the roster -- qualifies
         store.upsert_candidate(
@@ -447,7 +450,8 @@ def test_an_empty_roster_never_reaches_closed_for(tmp_path, fake_get, monkeypatc
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
         payers_mod, "ever_closed_with",
-        lambda conn, repo, label, **kw: calls.append((repo, label)) or 0)
+        lambda conn, repo, label, **kw: calls.append((repo, label))
+        or payers_mod.ClosedBounties(0, 0))
 
     conn = _conn(tmp_path, payers=())  # empty roster: the lookup "failed"
     # 12 candidates, one repo, over UNPAID_REPO_THRESHOLD(10), carrying a

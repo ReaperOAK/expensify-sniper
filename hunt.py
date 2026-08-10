@@ -183,9 +183,9 @@ def run(
     # exits. `None` here means "already asked, could not tell", which is a real
     # answer and is cached exactly like any other; store.apply_payout_rejections
     # has always done this internally, and stage 1 had no such memo at all.
-    closed_memo: dict[tuple[str, str], int | None] = {}
+    closed_memo: dict[tuple[str, str], payers.ClosedBounties | None] = {}
 
-    def closed_for(repo: str, label: str) -> int | None:
+    def closed_for(repo: str, label: str) -> payers.ClosedBounties | None:
         key = (repo, label)
         if key not in closed_memo:
             closed_memo[key] = payers.ever_closed_with(conn, repo, label, now=stamp)
@@ -216,7 +216,7 @@ def run(
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
     kept: list[Candidate] = []
     for cand in survivors:
-        # The guard matters: without it every candidate costs a search unit for
+        # The guard matters: without it every candidate costs search units for
         # an answer payout_reject would discard anyway. It is payers'
         # label_to_check rather than a copy of its conditions here, because two
         # copies of the same four-way gate is the bug already fixed once on this

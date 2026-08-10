@@ -197,6 +197,29 @@ PAYER_SEARCH_MAX_PAGES = int(os.environ.get("PAYER_SEARCH_MAX_PAGES", "6"))
 # paid one counts against it. A new project with two bounties is not a farm.
 UNPAID_REPO_THRESHOLD = int(os.environ.get("UNPAID_REPO_THRESHOLD", "10"))
 
+# Closing an issue is not paying it -- a farm can close its own issues just as
+# freely as a real programme does. Measured 2026-08-10 with `gh api
+# search/issues`, closed-with-label count vs. closed-AND-`linked:pr` count:
+#
+#   repo                                            closed  +linked:pr  ratio
+#   zhangjiayang6835-cyber/bounty-plaza (farm)          198          23    12%
+#   activepieces/activepieces (proven payer)            173         170    98%
+#   commaai/opendbc (own programme, no Algora label)      7           4    57%
+#
+# bounty-plaza's raw closed count (198) held three of the top five digest
+# slots under the old ">0 ever closed" rule alone. Sampling #12, #13 and #16
+# found them closed 2026-07-12T10:43:51Z / :55Z / :58Z -- seven seconds apart,
+# none assigned, one titled "[Bounty] [bounty][funding-pending]: complete the
+# first permi...": a bulk close, not payout history. A real programme closes
+# an issue BECAUSE work merged, so its closures carry linked PRs. 0.34 sits
+# comfortably below opendbc's 57% and well above the farm's 12%; activepieces'
+# 98% is nowhere near either edge.
+#
+# `-no:assignee` is silently ignored by GitHub's search API -- measured
+# 2026-08-10, it returned the identical 198 for the farm, whose issues have no
+# assignee -- so it is not part of either query. `linked:pr` does work.
+CLOSED_PR_RATIO_FLOOR = float(os.environ.get("CLOSED_PR_RATIO_FLOOR", "0.34"))
+
 # --- payer watch --------------------------------------------------------------
 # How many proven-payer repos to watch. Each costs one core request per sweep,
 # and nothing at all when the repo is unchanged (a 304 leaves the quota

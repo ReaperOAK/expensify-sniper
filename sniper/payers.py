@@ -27,8 +27,21 @@ string -- gating on that string was the earlier version of this rule, and it
 was blind to a farm running its own programme. Measured 2026-08-09,
 zhangjiayang6835-cyber/bounty-plaza held three of the top four digest slots
 with 526 open bounties behind a plain "Bounty" label and 0 ever closed; the
-label-gated rule never saw it because it wore no Algora label at all. That is
-the shape this module reports, and nothing more.
+label-gated rule never saw it because it wore no Algora label at all.
+
+Closing is not paying, though, and by 2026-08-10 the same farm had learned
+that: 527 open, but now 198 closed under its own "Bounty" label -- enough to
+sail past the ">0 ever closed" rule above and hold the top five digest slots
+again. Sampling #12, #13 and #16 found them closed 2026-07-12T10:43:51Z /
+:55Z / :58Z -- seven seconds apart, none assigned, one titled "[Bounty]
+[bounty][funding-pending]: complete the first permi...". A bulk close, not
+payout history: a repo can close its own issues as freely as it opens them. A
+real programme closes an issue BECAUSE work merged, so its closures carry
+linked pull requests. `ever_closed_with` now reports both counts, and
+`payout_reject` rejects on a low ratio the same way it rejects on zero --
+bounty-plaza's ratio is 23/198 (12%), against activepieces/activepieces'
+170/173 (98%) and commaai/opendbc's 4/7 (57%). See
+`config.CLOSED_PR_RATIO_FLOOR` for the measurement that set the line.
 """
 
 from __future__ import annotations
@@ -36,6 +49,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from dataclasses import dataclass
 
 from . import config, github_api, store
 from .models import parse_amount_label, repo_from_url
@@ -112,7 +126,7 @@ def payout_reject(
     labels: tuple[str, ...],
     open_bounties_here: int,
     payers: set[str],
-    closed_count: int | None,
+    closed: ClosedBounties | None,
 ) -> str | None:
     """Reason to drop a candidate on payout history. None = keep.
 
@@ -125,35 +139,53 @@ def payout_reject(
         silence is about something it actually claims to run;
       * it is advertising at least `config.UNPAID_REPO_THRESHOLD` open bounties,
         which is a farm's shape rather than a new project's;
-      * and it has never once CLOSED a bounty carrying that label.
+      * and either it has never once CLOSED a bounty carrying that label, OR it
+        has closed some but too few of them carry a linked pull request.
 
-    The last condition replaces the old requirement that the repo wear Algora's
-    exact `💎 Bounty` string. That gate existed for a real reason -- a repo with
-    no Algora label has no payout record to be absent -- but it meant any farm
-    using its own label was invisible. Measured 2026-08-09,
+    The "never closed" condition replaces the old requirement that the repo
+    wear Algora's exact `💎 Bounty` string. That gate existed for a real reason
+    -- a repo with no Algora label has no payout record to be absent -- but it
+    meant any farm using its own label was invisible. Measured 2026-08-09,
     zhangjiayang6835-cyber/bounty-plaza held three of the top four digest slots
     with 526 open bounties, 0 ever closed, 5 stars and a month of history, all
     behind a plain "Bounty" label.
 
-    `closed_count` of None means the question could not be answered, and this
+    The PR-ratio condition exists because ">0 ever closed" alone stopped being
+    enough: by 2026-08-10 that same farm had bulk-closed its way to 198 closed
+    issues under its own label, only 23 of them (12%) carrying any linked PR --
+    three sampled closures landed seven seconds apart, none assigned, one
+    titled "...[bounty][funding-pending]:...". A repo closes an issue BECAUSE
+    work merged if it is running a real programme, so its closures should carry
+    linked PRs: activepieces/activepieces is 170/173 (98%), commaai/opendbc --
+    no Algora label, its own programme -- is 4/7 (57%). Both clear
+    `config.CLOSED_PR_RATIO_FLOOR` (0.34) comfortably; the farm does not.
+
+    `closed` of None means the question could not be answered, and this
     abstains. A repo running its own programme, or a small repo with one or two
     genuine bounties, is never touched.
 
     The first four conditions live in `label_to_check`, not here, because every
     caller has to evaluate them BEFORE calling this -- they decide whether
-    spending a search unit on `closed_count` can possibly change the answer.
+    spending TWO search units on `closed` can possibly change the answer.
     Two copies of that reasoning is the shape of the bug fixed in 441d2ed, and
     the risk is asymmetric: a copy that drifts more PERMISSIVE only wastes
     quota, since this function re-validates, while one that drifts more
-    RESTRICTIVE passes closed_count=None where a real count was needed and
+    RESTRICTIVE passes closed=None where real evidence was needed and
     silently keeps a farm.
     """
     if label_to_check(repo, labels, open_bounties_here, payers) is None:
         return None
-    if closed_count is None or closed_count > 0:
+    if closed is None:
         return None
-    return (f"no payout history ({open_bounties_here} open bounties here, "
-            f"0 ever closed)")
+    if closed.total == 0:
+        return (f"no payout history ({open_bounties_here} open bounties here, "
+                f"0 ever closed)")
+    # total > 0 is checked above precisely so this division never sees a zero
+    # denominator -- a repo with 0 closed never reaches this line.
+    if (closed.with_pr / closed.total) < config.CLOSED_PR_RATIO_FLOOR:
+        return (f"no payout history ({closed.total} closed here, only "
+                f"{closed.with_pr} with any linked PR)")
+    return None
 
 
 def label_to_check(
@@ -169,7 +201,7 @@ def label_to_check(
 
       * the payer roster is empty, so the lookup FAILED and payout_reject's
         first check abstains unconditionally -- this one bit us, and asking
-        anyway spends a search unit per candidate on an answer already
+        anyway spends TWO search units per candidate on an answer already
         guaranteed to be discarded. Worse than wasted: once the 30/min pool is
         gone, reserve_or_wait blocks for up to BUDGET_WAIT_S, and the roster
         fetch usually fails from that same rate pressure;
@@ -227,6 +259,24 @@ def bounty_label_of(labels: tuple[str, ...]) -> str | None:
 CLOSED_CACHE_PREFIX = "closed-bounty"
 
 
+@dataclass(frozen=True)
+class ClosedBounties:
+    """How many `label`-carrying issues a repo has ever CLOSED, and how many of
+    those closures carry a linked pull request.
+
+    Two numbers, not one, because "ever closed" alone stopped being evidence of
+    payout the moment a farm started bulk-closing: measured 2026-08-10,
+    zhangjiayang6835-cyber/bounty-plaza reported 198 closed under its own
+    "Bounty" label, but only 23 (12%) with any linked PR -- three sampled
+    closures (#12, #13, #16) landed seven seconds apart, none assigned. See
+    `config.CLOSED_PR_RATIO_FLOOR` for the full measured table and the line it
+    sets between that and a real programme (activepieces 98%, opendbc 57%).
+    """
+
+    total: int
+    with_pr: int
+
+
 def ever_closed_with(
     conn: sqlite3.Connection,
     repo: str,
@@ -234,8 +284,8 @@ def ever_closed_with(
     *,
     now: float | None = None,
     sleep=time.sleep,
-) -> int | None:
-    """How many issues `repo` has ever CLOSED carrying `label`. None = unknown.
+) -> ClosedBounties | None:
+    """How `repo` has ever CLOSED issues carrying `label`. None = unknown.
 
     This is the evidence that replaces "is it wearing Algora's label". A repo
     advertising a pile of open bounties and never closing one is a farm whatever
@@ -246,15 +296,24 @@ def ever_closed_with(
     Closed rather than rewarded, deliberately. `💰 Rewarded` is Algora's marker
     and a repo running its own programme never sets it -- commaai/opendbc has
     closed seven bounties including a $4,000 port with no Algora label anywhere.
-    Closing a bounty is the weakest claim that still separates a working
-    programme from a wall of adverts.
 
-    Costs one search unit, cached for config.PAYER_CACHE_S. Returns None on any
-    failure, and the caller MUST abstain rather than read that as zero. A
-    failure is NOT written to the cache -- it is not an answer about the repo --
-    so every caller in a loop must memoise the None itself, or one throttle is
-    re-paid once per candidate. hunt.run and store.apply_payout_rejections both
-    do.
+    But closed alone was not enough either: by 2026-08-10 the same farm had
+    grown to 198 closed under its own label -- enough to survive the old
+    ">0 ever closed" rule -- with only 23 carrying any linked PR. Closing an
+    issue is free; closing it BECAUSE a pull request merged is not, so this
+    also asks `linked:pr` of the exact same query. `-no:assignee` was tried and
+    dropped: measured 2026-08-10 it returned the identical 198 for this farm,
+    whose issues have no assignee, because GitHub's search API silently ignores
+    it. `linked:pr` does discriminate.
+
+    Costs TWO search units -- one per query -- cached together under one key
+    for config.PAYER_CACHE_S. Returns None on any failure in EITHER query, and
+    the caller MUST abstain rather than read that as zero. A failure is NOT
+    written to the cache -- it is not an answer about the repo, and caching a
+    partial answer (total known, with_pr not) would silently read back as a
+    100%-unlinked repo -- so every caller in a loop must memoise the None
+    itself, or one throttle is re-paid once per candidate. hunt.run and
+    store.apply_payout_rejections both do.
     """
     stamp = time.time() if now is None else now
     key = f"{CLOSED_CACHE_PREFIX}:{repo}:{label}"
@@ -263,23 +322,29 @@ def ever_closed_with(
         try:
             payload = json.loads(body)
             if stamp - payload["fetched_at"] < config.PAYER_CACHE_S:
-                return payload["closed"]
+                return ClosedBounties(payload["closed"], payload["closed_with_pr"])
         except (ValueError, KeyError, TypeError):
             pass  # unreadable cache is just a miss
 
-    if not store.reserve_or_wait(conn, "search", 1):
+    # Reserved together, not one-then-one: there is no use for the first
+    # search's answer without the second, so a partial reservation would only
+    # let one request out before discovering the budget cannot cover the pair.
+    if not store.reserve_or_wait(conn, "search", 2):
         return None
-    # Pace this like a search PAGE, because to GitHub's burst guard that is
-    # exactly what it is. search_issues only pauses between pages and this asks
-    # for exactly one, so without this the calls go out back to back:
-    # apply_payout_rejections fires one per qualifying repo, and reviving the
-    # 446 'open linked PR' rows takes qualifying repos from 4 to 14. Measured
-    # 2026-08-08, TEN back-to-back requests tripped the secondary limit with 23
-    # of 30 primary units still unspent. Same pattern, new call site.
+
+    # Pace EACH request like a search PAGE, because to GitHub's burst guard
+    # that is exactly what it is. search_issues only pauses between pages of
+    # ONE query and this fires two separate one-page queries back to back, so
+    # without pacing both, the second one alone reproduces the burst pattern
+    # measured 2026-08-08: TEN back-to-back requests tripped the secondary
+    # limit with 23 of 30 primary units still unspent. apply_payout_rejections
+    # fires this once per qualifying repo, and reviving the 446 'open linked
+    # PR' rows takes qualifying repos from 4 to 14 -- the same pressure, twice
+    # per repo now instead of once.
     if config.SEARCH_PAGE_PAUSE_S:
         sleep(config.SEARCH_PAGE_PAUSE_S)
     try:
-        found = github_api.search_issues(
+        total_found = github_api.search_issues(
             f'repo:{repo} is:issue is:closed label:"{label}"',
             per_page=1, max_pages=1,
             # No retry ladder here, unlike discovery. The default is 3 attempts
@@ -292,6 +357,17 @@ def ever_closed_with(
     except Exception:  # noqa: BLE001 -- unknown, and the caller abstains on it
         return None
 
+    if config.SEARCH_PAGE_PAUSE_S:
+        sleep(config.SEARCH_PAGE_PAUSE_S)
+    try:
+        pr_found = github_api.search_issues(
+            f'repo:{repo} is:issue is:closed label:"{label}" linked:pr',
+            per_page=1, max_pages=1, retries=0)
+    except Exception:  # noqa: BLE001 -- same as above: unknown, caller abstains
+        return None
+
+    result = ClosedBounties(total_found.total_count, pr_found.total_count)
     store.set_cache(conn, key, None,
-                    json.dumps({"fetched_at": stamp, "closed": found.total_count}))
-    return found.total_count
+                    json.dumps({"fetched_at": stamp, "closed": result.total,
+                                "closed_with_pr": result.with_pr}))
+    return result
