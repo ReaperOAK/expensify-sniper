@@ -37,6 +37,33 @@ Anything real is claimed within hours. What a periodic search still finds is, by
 construction, what nobody wanted. This is why the 10-minute payer watch exists and why the
 3-hourly digest cannot win a real bounty on its own.
 
+## Closing a bounty is not paying for one, and a farm bulk-closes
+
+Measured 2026-08-10. `zhangjiayang6835-cyber/bounty-plaza` — created 2026-07-08, 5 stars,
+527 open issues, advertising "Add a shrimp-person species 🦐" at $200 — reports **198
+closed** issues carrying its own `Bounty` label. On the closed-count test alone it looks
+like a working programme, and it held the top five digest slots because of it.
+
+It is a bulk close. Issues #12, #13 and #16 were closed at `10:43:51Z`, `:55Z` and `:58Z`
+on 2026-07-12 — **seven seconds apart, none assigned** — and one is titled
+`[bounty][funding-pending]`. Closing costs a farm nothing.
+
+What separates them is whether the closure carried merged work:
+
+| repo | closed with the label | closed **and** `linked:pr` | ratio |
+|---|---:|---:|---:|
+| zhangjiayang6835-cyber/bounty-plaza | 198 | 23 | **12%** |
+| activepieces/activepieces | 173 | 170 | 98% |
+| commaai/opendbc | 7 | 4 | 57% |
+
+A real programme closes a bounty *because a pull request landed*. `payout_reject()` now
+asks for both numbers and rejects below a third, which keeps opendbc — seven closed
+bounties, no Algora label, its own programme — and drops the farm.
+
+**Trap:** GitHub's search API silently **ignores `-no:assignee`**. It returned the
+identical 198 for a repo whose closed issues carry no assignee at all. `linked:pr` works.
+Verify a qualifier does something before trusting a count built on it.
+
 ## Absence of an Algora label is not evidence of non-payment
 
 `commaai/opendbc` runs its own programme and carries no Algora label, so it shows 0
