@@ -1662,16 +1662,35 @@ def farm_penalty(cand, *, now: float | None = None) -> float:
     if cand.stars is None:
         return 1.0
 
+    if cand.stars >= FEW_STARS:
+        # A funded launch can be young with a big backlog of its own filed
+        # issues and still be nothing like bounty-plaza (5 stars). Stars are
+        # the signal that tells a farm from a generously young project, so
+        # without it the other two -- alone or together -- do not sink the
+        # score; "young, unstarred, huge backlog" is a conjunction, not a
+        # majority vote among three independent flags.
+        return 1.0
+
     age_days = (_now_utc(now) - parse_iso(cand.repo_created_at)).days
-    signals = sum((age_days < YOUNG_REPO_DAYS,
-                   cand.stars < FEW_STARS,
-                   cand.repo_open_issues > HUGE_BACKLOG))
+    # +1 for few_stars, already established by the early return above.
+    signals = 1 + sum((age_days < YOUNG_REPO_DAYS,
+                       cand.repo_open_issues > HUGE_BACKLOG))
     if signals == 3:
         return 0.25
     if signals == 2:
         return 0.6
     return 1.0
 ```
+
+> **Corrected 2026-08-10, after this plan shipped.** The version originally written
+> here scored the three signals as a majority vote, which contradicted this task's own
+> `test_a_young_well_starred_project_is_not_a_farm` — 4000 stars, 10 days old, 400 open
+> issues trips two of three signals, so the vote returned 0.6 where the test asserts 1.0.
+> The implementer surfaced the contradiction rather than picking a side. The operator
+> ruled that stars are a **gate**, not a vote: a repo the crowd has starred is never
+> treated as a farm, whatever its age or backlog. Accepted hole: a farm that buys 20
+> stars escapes the penalty. `payers.payout_reject` still rejects it on closed-bounty
+> evidence, and `DIGEST_MAX_PER_REPO` caps any repo at three digest slots.
 
 In `score()`, multiply it in:
 
@@ -1837,7 +1856,10 @@ def _row(**kwargs):
     return base
 
 
-_NOW = 1786363200.0  # 2026-08-09T12:00:00Z
+_NOW = 1786276800.0  # 2026-08-09T12:00:00Z  (corrected 2026-08-10: the literal
+                     # first written here was 1786363200.0, which is 2026-08-10,
+                     # one day off from its own comment and from the assertion
+                     # below that the footer carries 2026-08-09)
 
 
 def test_rankable_rows_are_listed_with_their_amounts():
