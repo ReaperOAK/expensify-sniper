@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import requests
 
-from . import config, github_api, notify
+from . import config, github_api
 from .models import _now_utc, parse_iso
 
 # 90, against notify's 70. A gist page is as wide as the reader's browser and
@@ -53,43 +53,100 @@ def _get(row, key):
         return None
 
 
-def _fmt_row(row, *, now: float | None) -> str:
-    """One board line. Mirrors notify.format_row, plus the competition marker."""
-    line = notify.format_row(row, now=now)
+def _escape_cell(text: str) -> str:
+    """Neutralise the two characters that would corrupt a markdown table row.
+
+    An issue title is untrusted text pulled straight from GitHub. A literal
+    '|' shifts every cell after it one column to the right for that one row;
+    a raw newline ends the row early and starts a new (broken) one. Both are
+    legal in a GitHub issue title and neither showed up in the fixtures that
+    built the old bullet-list renderer, because a bullet line never had a
+    column to shift.
+    """
+    return text.replace("|", "\\|").replace("\n", " ").replace("\r", "")
+
+
+def _fmt_stars(stars: int) -> str:
+    """1340 -> '1.3k★'; 87 -> '87★'. Compact, the way GitHub itself shows it."""
+    if stars >= 1000:
+        return f"{stars / 1000:.1f}k★"
+    return f"{stars}★"
+
+
+def _notes_cell(row) -> str:
+    """Stars, comment count, open-PR competition -- the context a bare $ lacks.
+
+    All three are optional and independently absent: a fresh repo has no
+    stars, a fresh issue has no comments, and most issues have no competing
+    PR at all. `_get` is needed for stars and open_pr_count specifically
+    because both are genuinely nullable columns (and the dict fixtures in the
+    test suite often omit them entirely rather than setting them to None);
+    comments is NOT NULL in the schema and always present in the fixtures, so
+    it's read directly.
+    """
+    bits = []
+    stars = _get(row, "stars")
+    if stars:
+        bits.append(_fmt_stars(stars))
+    if row["comments"]:
+        bits.append(f"{row['comments']}💬")
     count = _get(row, "open_pr_count")
     if count:
-        line += f" · ⚠ {count} PRs"
-    return line
+        bits.append(f"⚠{count} PRs")
+    return " · ".join(bits)
+
+
+def _priced_row(row, *, now: float | None) -> str:
+    """One row of the 'Worth a look' table: amount, issue + title, age, lang, notes."""
+    amount = row["amount_usd"]
+    amount_cell = f"**${amount:,}**" if amount is not None else "$?"
+    title = _escape_cell(row["title"])
+    if len(title) > TITLE_CHARS:
+        title = title[: TITLE_CHARS - 1] + "…"
+    issue_cell = f"[{row['repo']}#{row['number']}]({row['url']})<br>{title}"
+    age = (_now_utc(now) - parse_iso(row["created_at"])).days
+    lang = row["language"] or "—"
+    return f"| {amount_cell} | {issue_cell} | {age}d | {lang} | {_notes_cell(row)} |"
 
 
 def _unrankable_line(row, *, now: float | None) -> str:
-    title = row["title"]
+    """One bullet inside a repo's <details> block, not a table row -- there is
+    no column to protect here, so only the newline that would break the
+    bullet list itself needs neutralising."""
+    title = row["title"].replace("\n", " ").replace("\r", "")
     if len(title) > TITLE_CHARS:
         title = title[: TITLE_CHARS - 1] + "…"
     age = (_now_utc(now) - parse_iso(row["created_at"])).days
     return f"- [#{row['number']}]({row['url']}) {title} — {row['comments']}💬 · {age}d"
 
 
-def _section_heading(shown: int, total: int, *, name: str, suffix: str) -> str:
-    """`## Rankable — 48 with a readable amount`, or `showing 25 of 48` when cut.
+def _showing_caption(shown: int, total: int) -> str:
+    """`_showing 25 of 48_` -- printed even when shown == total.
 
-    `total` is passed in rather than measured from the rows because the rows
-    ARE a page: this heading used to read len(rankable), which is DIGEST_TOP_N,
-    so it announced 25 of an inventory of 48 as though 25 were all there was --
-    and said nothing about having truncated. The board exists to replace a
-    hand-written SQL query; a headline number that is really a page size is the
-    one thing it must not print.
+    The old heading stayed silent about the count when nothing was cut, on
+    the theory that saying "showing" implied a cut had happened. That made
+    the silence itself meaningful, which is fragile: silence proves nothing
+    was cut only if every code path that COULD cut also remembers to speak
+    when it doesn't. Saying the shown/total pair unconditionally does the same
+    job by construction -- the reader never has to trust an absence, only read
+    two numbers that are always both there.
     """
-    if shown < total:
-        return f"## {name} — showing {shown} of {total} {suffix}"
-    return f"## {name} — {total} {suffix}"
+    return f"_showing {shown} of {total}_"
 
 
 def render(rankable, unrankable, rejection_counts, *, now: float | None,
            warnings, totals: dict[str, int],
            rankable_total: int, unrankable_total: int,
            rejection_examples=None) -> str:
-    """The whole board. Warnings first, then priced, then unpriced, then rejects.
+    """The whole board: title, one-line summary, warnings, priced, unpriced, rejects.
+
+    Rewritten 2026-08-10 from a page of undifferentiated bullets -- ~930 live
+    unpriced rows alone, thousands of lines total on real data -- into a page
+    scannable in ten seconds: a table for the priced rows (gists render GFM
+    tables), and every unpriced repo collapsed into a <details> block so
+    "everything, always" no longer means "scroll forever". No information that
+    was on the page before is gone; it is regrouped and, for the unpriced
+    section, hidden behind one click per repo rather than printed flat.
 
     `rankable_total` and `unrankable_total` are the counts from the DATABASE,
     not from the rows handed over -- those are pages, and a page size printed as
@@ -97,10 +154,28 @@ def render(rankable, unrankable, rejection_counts, *, now: float | None,
     They are required, with no default, so a new call site has to answer the
     question rather than silently inherit len(rows).
 
+    `totals` is decoration layered on top of numbers this function can already
+    derive on its own (`live` from rankable_total + unrankable_total, `rejected`
+    from summing rejection_counts, which is the full reason table, not a page).
+    When a key is present it wins -- production computes both from the same
+    one-transaction query, so trusting it is free -- but its absence changes no
+    number on the page, which is what lets every dict-fixture test above pass
+    `totals={}` without the summary line going wrong.
+
     `rejection_examples` is decoration and may be omitted: its absence changes
     no number on the page, only how quickly a wrong filter is recognisable.
     """
+    rejected_total = sum(count for _, count in rejection_counts)
+    live_total = totals.get("live", rankable_total + unrankable_total)
+    rejected_shown = totals.get("rejected", rejected_total)
+
     parts: list[str] = ["# Bounty board", ""]
+
+    swept = _now_utc(now).strftime("%Y-%m-%d %H:%M UTC")
+    parts.append(f"**{live_total:,} live** · {rankable_total:,} priced · "
+                 f"{unrankable_total:,} unpriced · {rejected_shown:,} rejected · "
+                 f"swept {swept}")
+    parts.append("")
 
     for warning in warnings:
         parts.append(f"> ⚠ {warning}")
@@ -114,33 +189,42 @@ def render(rankable, unrankable, rejection_counts, *, now: float | None,
         parts.append("")
 
     if rankable:
-        parts.append(_section_heading(len(rankable), rankable_total,
-                                      name="Rankable",
-                                      suffix="with a readable amount"))
+        parts.append("## Worth a look")
         parts.append("")
-        parts.extend(_fmt_row(row, now=now) for row in rankable)
+        parts.append("| amount | issue | age | lang | notes |")
+        parts.append("| -----: | ----- | --: | ---- | ----- |")
+        parts.extend(_priced_row(row, now=now) for row in rankable)
+        parts.append("")
+        parts.append(_showing_caption(len(rankable), rankable_total))
         parts.append("")
 
     if unrankable:
-        parts.append(_section_heading(len(unrankable), unrankable_total,
-                                      name="No readable amount",
-                                      suffix="live, unranked"))
+        parts.append(f"## Unpriced — {unrankable_total} live, no amount readable "
+                     "from labels, title or body")
         parts.append("")
-        parts.append("_No price in the labels, title or body, so expected value "
-                     "cannot be computed and the digest will never show them. "
-                     "Grouped by repo, most recently discovered first._")
+        parts.append("_Not rankable, so the digest will never show them. Grouped "
+                     "by repo, most recently found first._")
         parts.append("")
         by_repo: dict[str, list] = {}
         for row in unrankable:
             by_repo.setdefault(row["repo"], []).append(row)
         for repo, rows in by_repo.items():
-            parts.append(f"### {repo}")
+            # <details> is the single biggest win in this rewrite: it turns a
+            # repo with 185 unpriced issues from 185 lines of flat scroll into
+            # one clickable line, with nothing hidden -- only collapsed.
+            noun = "issue" if len(rows) == 1 else "issues"
+            parts.append(f"<details><summary><b>{repo}</b> — {len(rows)} {noun}</summary>")
+            parts.append("")
             parts.extend(_unrankable_line(row, now=now) for row in rows)
             parts.append("")
+            parts.append("</details>")
+            parts.append("")
+        parts.append(_showing_caption(len(unrankable), unrankable_total))
+        parts.append("")
 
     if rejection_counts:
         examples = rejection_examples or {}
-        parts.append("## Rejected")
+        parts.append(f"## Rejected — {rejected_total}")
         parts.append("")
         parts.append("_Why candidates were dropped. A reason that grows larger "
                      "than the kept pile is a filter to go and read._")
@@ -153,15 +237,11 @@ def render(rankable, unrankable, rejection_counts, *, now: float | None,
         parts.append("| count | reason | examples |")
         parts.append("| ----: | ------ | -------- |")
         for reason, count in rejection_counts:
-            shown = " ".join(f"[{row['repo']}#{row['number']}]({row['url']})"
-                             for row in examples.get(reason, ()))
-            parts.append(f"| {count} | {reason} | {shown} |")
+            shown = " · ".join(f"[{row['repo']}#{row['number']}]({row['url']})"
+                               for row in examples.get(reason, ()))
+            parts.append(f"| {count} | {_escape_cell(reason)} | {shown} |")
         parts.append("")
 
-    swept = _now_utc(now).strftime("%Y-%m-%d %H:%M UTC")
-    summary = " · ".join(f"{key} {value}" for key, value in totals.items())
-    parts.append("---")
-    parts.append(f"_Swept {swept}{' · ' + summary if summary else ''}_")
     return "\n".join(parts)
 
 

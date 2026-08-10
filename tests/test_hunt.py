@@ -737,8 +737,8 @@ def test_the_board_counts_the_inventory_rather_than_the_page_it_prints(
          now=NOW, dry_run=True)
 
     board_text = config.BOARD_PATH.read_text(encoding="utf-8")
-    assert "showing 2 of 5 with a readable amount" in board_text
-    assert "live 5" in board_text
+    assert "_showing 2 of 5_" in board_text
+    assert "5 live" in board_text
 
 
 def test_the_board_shows_example_issues_for_each_reject_reason(tmp_path, fake_get):

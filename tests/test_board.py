@@ -49,11 +49,11 @@ def test_unrankable_rows_get_their_own_section_grouped_by_repo():
             _row(repo="b/two", number=3, amount_usd=None)]
     text = board.render([], rows, [], now=_NOW, warnings=[], totals={},
                         rankable_total=0, unrankable_total=3)
-    assert "No readable amount" in text
+    assert "Unpriced" in text
     assert text.count("a/one") >= 1
     assert "#1" in text and "#2" in text and "#3" in text
-    # grouped: the repo heading appears once, not once per issue
-    assert text.count("### a/one") == 1
+    # grouped: the repo's <details> summary appears once, not once per issue
+    assert text.count("<b>a/one</b>") == 1
 
 
 def test_rejections_are_listed_by_reason_largest_first():
@@ -78,10 +78,15 @@ def test_an_empty_board_says_so_rather_than_rendering_nothing():
     assert "nothing" in text.lower()
 
 
-def test_the_footer_carries_the_sweep_time_and_totals():
-    text = board.render([], [], [], now=_NOW, warnings=[],
-                        totals={"live": 536, "held_back": 529, "rejected": 970},
-                        rankable_total=0, unrankable_total=0)
+def test_the_summary_line_carries_the_sweep_time_and_the_four_totals():
+    """Replaces the old bottom footer: the one-line summary under the title now
+    has to answer "what is the state of this thing" without scrolling, so the
+    sweep time and the totals it used to carry at the bottom now live at the
+    top instead -- same information, new location.
+    """
+    text = board.render([], [], [("fork", 970)], now=_NOW, warnings=[],
+                        totals={}, rankable_total=536, unrankable_total=529,
+                        rejection_examples={})
     assert "2026-08-09" in text
     assert "536" in text and "529" in text and "970" in text
 
@@ -152,24 +157,31 @@ def test_render_agrees_with_the_real_sqlite3_row_not_only_the_dict_fixtures(tmp_
     # #2's open_pr_count is NULL -- the marker must not appear for it, so the
     # only "PRs" in the whole page is #1's.
     assert text.count("PRs") == 1
-    assert "### acme/widgets" in text and "[#3](" in text
+    assert "<b>acme/widgets</b>" in text and "[#3](" in text
     assert "| 1 | fork |" in text
 
 
 def test_a_section_heading_counts_the_inventory_not_the_page():
-    # 25 rows on the page, 48 priced live rows in the database. The heading
-    # used to read len(rows) and announce the page size as the world.
+    # 25 rows on the page, 48 priced live rows in the database. The caption
+    # below the table used to be the heading itself, and used to read
+    # len(rows) and announce the page size as the world.
     text = board.render([_row(number=n) for n in range(25)], [], [],
                         now=_NOW, warnings=[], totals={},
                         rankable_total=48, unrankable_total=0)
-    assert "showing 25 of 48 with a readable amount" in text
+    assert "_showing 25 of 48_" in text
 
 
-def test_an_untruncated_section_does_not_say_showing():
+def test_an_untruncated_section_still_shows_its_count_honestly():
+    """The old heading went silent about the count when nothing was cut, so
+    that saying "showing" meant a cut had happened. That made correctness
+    depend on every code path remembering to stay silent. The new caption
+    prints shown/total unconditionally instead -- 1 of 1 is not a lie, and
+    the reader never has to trust an absence to know nothing was cut.
+    """
     text = board.render([_row()], [], [], now=_NOW, warnings=[], totals={},
                         rankable_total=1, unrankable_total=0)
-    assert "## Rankable — 1 with a readable amount" in text
-    assert "showing" not in text
+    assert "## Worth a look" in text
+    assert "_showing 1 of 1_" in text
 
 
 def test_the_unrankable_section_says_when_it_truncates():
@@ -178,7 +190,8 @@ def test_the_unrankable_section_says_when_it_truncates():
     rows = [_row(number=n, amount_usd=None) for n in range(600)]
     text = board.render([], rows, [], now=_NOW, warnings=[], totals={},
                         rankable_total=0, unrankable_total=934)
-    assert "showing 600 of 934 live, unranked" in text
+    assert "## Unpriced — 934 live, no amount readable" in text
+    assert "_showing 600 of 934_" in text
 
 
 def test_rejected_reasons_carry_example_issues_not_only_a_count():
