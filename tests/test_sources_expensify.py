@@ -172,3 +172,48 @@ def test_a_malformed_issue_payload_warns_without_discarding_the_others(tmp_path,
     assert [c.number for c in result.candidates] == [2]
     assert any("unusable" in w for w in result.warnings)
     assert store.event_seen(conn, 1) is False
+
+
+def test_the_watermark_is_written_even_when_no_help_wanted_event_appears(
+        tmp_path, fake_get):
+    """The watermark used to be read off the FILTERED list, so a poll that saw
+    no Help Wanted label wrote nothing -- since_event_id stayed None forever and
+    the deep-paging block was skipped entirely. That is the state the tracker
+    was actually deployed in: measured 2026-08-10, the newest Help Wanted label
+    event on Expensify/App was three days old.
+    """
+    _no_standing(fake_get)
+    conn = _conn(tmp_path)
+    fake_get.queue(200, [_event(500, 1, label="Reviewing")], {"ETag": 'W/"a"'})
+    result = ExpensifySource().discover(conn)
+    assert result.candidates == []
+    assert store.get_cache(conn, ExpensifySource.WATERMARK_KEY)[1] == "500"
+
+
+def test_the_watermark_advances_past_events_that_did_not_match(tmp_path, fake_get):
+    """Advancing only on a match meant that after ONE matching label the poll
+    re-paged the full EVENT_MAX_PAGES on every single sweep, forever -- five
+    core calls every ten minutes to re-read pages it had already read.
+    """
+    _no_standing(fake_get)
+    conn = _conn(tmp_path)
+    fake_get.queue(200, [_event(900, 1, label="Reviewing"), _event(10, 96348)],
+                   {"ETag": 'W/"a"'})
+    fake_get.queue(200, _issue(96348))
+    result = ExpensifySource().discover(conn)
+    assert [c.number for c in result.candidates] == [96348]
+    assert store.get_cache(conn, ExpensifySource.WATERMARK_KEY)[1] == "900"
+
+
+def test_the_stored_watermark_is_replayed_as_since_event_id(tmp_path, fake_get):
+    """Stored on one sweep, spent on the next -- otherwise deep paging has
+    nothing to stop at and the cap is the only thing bounding it.
+    """
+    _no_standing(fake_get)
+    conn = _conn(tmp_path)
+    store.set_cache(conn, ExpensifySource.WATERMARK_KEY, None, "700")
+    # One short page: the paging loop needs a FULL page to continue, so this
+    # asserts the watermark reaches poll_label_events, not that it pages.
+    fake_get.queue(200, [_event(800, 1, label="Reviewing")], {"ETag": 'W/"a"'})
+    ExpensifySource().discover(conn)
+    assert store.get_cache(conn, ExpensifySource.WATERMARK_KEY)[1] == "800"

@@ -117,8 +117,8 @@ def poll_label_events(
     etag: str | None,
     matches: Callable[[str], bool],
     since_event_id: int | None = None,
-) -> tuple[list[dict[str, Any]], str | None, bool]:
-    """Return (label events whose label `matches`, newest-first, new etag, changed).
+) -> tuple[list[dict[str, Any]], str | None, bool, int | None]:
+    """Return (matching label events, new etag, changed, newest id ON THE PAGE).
 
     Polls /issues/events rather than /issues because a label lands on an issue
     that already exists, so `created` ordering never surfaces it.
@@ -130,10 +130,21 @@ def poll_label_events(
 
     One page of 100 events covered only a SINGLE DAY on go-gitea/gitea. Poll
     faster than a repo's event velocity or labels will roll off the page unseen.
+
+    The fourth value is the watermark, and it is returned from HERE rather than
+    recomputed by the caller because this is the only function that sees the
+    unfiltered payload. A caller taking `max(event_id)` over the RETURNED events
+    is taking it over the tiny minority that matched -- which never advances on
+    a poll with no match, and never gets written at all before the first one.
+    Both halves of that were live: since_event_id stayed None so the paging
+    block below was skipped entirely, and after one match the watermark froze
+    there so every later poll re-read the full cap. None means the page said
+    nothing (empty, or a 304); it is deliberately not 0, which is a real id
+    that every event would compare greater than.
     """
     resp = _get(f"/repos/{repo}/issues/events", params={"per_page": 100}, etag=etag)
     if resp.status_code == 304:
-        return [], etag, False
+        return [], etag, False, None
     resp.raise_for_status()
 
     # Page BACKWARDS past the first 100 until `seen` recognises something, so a
@@ -151,6 +162,13 @@ def poll_label_events(
     # the honest stopping point. On the first run there is no watermark, which
     # is what the page cap is for.
     payload = list(resp.json())
+    # Off the whole page, before any filtering, and off page ONE's contents --
+    # which is where the newest id is, since the feed is newest-first. Taken
+    # after the paging loop it would be identical (max is max), so it is taken
+    # here to sit next to the payload it describes.
+    ids = [int(e["id"]) for e in payload if e.get("id") is not None]
+    newest_event_id = max(ids) if ids else None
+
     if since_event_id is not None:
         page = 1
         while (page < config.EVENT_MAX_PAGES
@@ -186,12 +204,12 @@ def poll_label_events(
                 "labels": [label["name"] for label in issue.get("labels", [])],
             }
         )
-    return events, resp.headers.get("ETag"), True
+    return events, resp.headers.get("ETag"), True, newest_event_id
 
 
 def poll_help_wanted_events(
     repo: str, etag: str | None, since_event_id: int | None = None,
-) -> tuple[list[dict[str, Any]], str | None, bool]:
+) -> tuple[list[dict[str, Any]], str | None, bool, int | None]:
     """Expensify's Help Wanted watch. Unchanged contract; now one case of many."""
     return poll_label_events(repo, etag, lambda name: name == config.HELP_WANTED,
                              since_event_id=since_event_id)

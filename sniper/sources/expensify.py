@@ -43,9 +43,9 @@ class ExpensifySource:
             return result
 
         etag, _ = store.get_cache(conn, self.CACHE_KEY)
+        _, watermark = store.get_cache(conn, self.WATERMARK_KEY)
         try:
-            _, watermark = store.get_cache(conn, self.WATERMARK_KEY)
-            events, new_etag, changed = github_api.poll_help_wanted_events(
+            events, new_etag, changed, newest = github_api.poll_help_wanted_events(
                 self.repo, etag,
                 since_event_id=int(watermark) if watermark else None)
         except github_api.RateLimited as exc:
@@ -58,8 +58,12 @@ class ExpensifySource:
         if not changed:
             return result
         store.set_cache(conn, self.CACHE_KEY, new_etag, "")
-        if events:
-            newest = max(int(e["event_id"]) for e in events)
+        # `newest` is the newest id on the PAGE, computed inside the poll where
+        # the unfiltered payload lives. Recomputing it here off `events` -- the
+        # `labeled` + Help Wanted + non-PR minority -- is what left the
+        # watermark unwritten on every poll with no match, so since_event_id
+        # stayed None and the deep paging it exists to drive never ran once.
+        if newest is not None:
             store.set_cache(conn, self.WATERMARK_KEY, None, str(newest))
 
         for event in events:

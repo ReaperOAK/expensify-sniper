@@ -90,7 +90,13 @@ class PayerWatchSource:
             key = CACHE_PREFIX + repo
             etag, _ = store.get_cache(conn, key)
             try:
-                events, new_etag, changed = github_api.poll_label_events(
+                # No watermark here, deliberately: passing since_event_id is
+                # what enables deep paging, and this loop runs across up to
+                # WATCH_MAX_REPOS (60) repos per sweep. One page each is what
+                # makes watching them affordable. The fourth value is
+                # discarded rather than stored, so nothing here can ever start
+                # paging by accident.
+                events, new_etag, changed, _ = github_api.poll_label_events(
                     repo, etag, looks_like_a_bounty_label)
             except github_api.RateLimited as exc:
                 result.warnings.append(f"watch {repo} rate limited: {exc}")
