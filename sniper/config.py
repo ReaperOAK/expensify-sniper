@@ -174,6 +174,23 @@ PAID_LABELS = {
 # reject -- it sorts last, because expected value cannot be computed without one.
 AMOUNT_FLOOR_USD = int(os.environ.get("AMOUNT_FLOOR_USD", "50"))
 
+# Past this many comments an issue is dropped, not merely sunk.
+#
+# `comments` is the competition proxy in score(), as 1/(1 + comments + 2*prs),
+# and that is right for the ordinary range. Past a point it stops being a proxy
+# and becomes a verdict: measured 2026-08-10 on the live board,
+# claude-builders-bounty advertised $50-$200 bounties carrying 2006, 1559,
+# 1354, 1343 and 1041 comments each on a 13-star repo. The scoring term sank
+# them to the bottom but never removed them, so they still occupied the board
+# and the operator still had to read past them.
+#
+# The cost of this line is real and worth stating: at 100 it also drops
+# microg/GmsCore#2843 -- $1,340, 14,173 stars, 148 comments -- which was the
+# best genuine candidate on the board the day this shipped. Comments alone
+# cannot tell a busy real project from a churning farm. Raise this to 200 to
+# keep it; that still drops all five claude-builders issues.
+COMMENT_CEILING = int(os.environ.get("COMMENT_CEILING", "100"))
+
 # Expensify Help Wanted issues pay a flat rate; there is no $-label to parse.
 EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
 

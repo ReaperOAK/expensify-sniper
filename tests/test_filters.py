@@ -164,3 +164,33 @@ def test_the_expensify_exemption_is_only_about_assignment():
     assert filters.free_reject(
         _cand("expensify", assignee={"login": "x"},
               labels=[{"name": "$780"}, {"name": "💰 Rewarded"}])) == "already rewarded"
+
+
+def test_a_heavily_discussed_issue_is_rejected():
+    """Comments are the competition proxy, and past a point they stop being a
+    proxy and become a verdict.
+
+    Measured 2026-08-10 on the live board: claude-builders-bounty was
+    advertising \$50-\$200 bounties carrying 2006, 1559, 1354, 1343 and 1041
+    comments each, on a 13-star repo. Nothing with that much traffic is
+    unclaimed for a good reason, and the score's 1/(1+comments) term merely
+    sank them -- it never removed them, so they occupied the board.
+    """
+    assert filters.free_reject(_cand(comments=101)) == "101 comments -- too contested"
+    assert filters.free_reject(_cand(comments=2006)) == "2006 comments -- too contested"
+
+
+def test_the_comment_ceiling_is_inclusive_of_the_limit_itself():
+    """At exactly the ceiling the issue is kept. The reason string counts
+    upward from the first rejected value, so an off-by-one here would silently
+    move the line the operator configured.
+    """
+    from sniper import config
+
+    assert filters.free_reject(_cand(comments=config.COMMENT_CEILING)) is None
+    assert filters.free_reject(_cand(comments=config.COMMENT_CEILING + 1)) is not None
+
+
+def test_a_quiet_issue_is_untouched_by_the_ceiling():
+    assert filters.free_reject(_cand(comments=0)) is None
+    assert filters.free_reject(_cand(comments=99)) is None

@@ -59,6 +59,12 @@ def free_reject(
         return "multiple amount labels"
     # A missing amount is not a reject: it sorts last, because expected value
     # cannot be computed without one.
+    # Comments are the competition proxy everywhere else; past the ceiling they
+    # are a verdict. See config.COMMENT_CEILING for the measurement, and for
+    # what this costs -- it is not free, and the comment says which real
+    # candidate it drops.
+    if cand.comments > config.COMMENT_CEILING:
+        return f"{cand.comments} comments -- too contested"
     if cand.amount_usd is not None and cand.amount_usd < minimum:
         return f"below ${minimum} floor"
     return None
