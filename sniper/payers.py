@@ -61,6 +61,23 @@ CACHE_KEY = "known-payer-repos"
 REWARDED_LABEL = "💰 Rewarded"
 ALGORA_LABEL = "💎 Bounty"
 
+# How every reason payout_reject returns begins, and the ONLY thing tying those
+# reasons to store.bounty_inventory(), which counts payout-rejected rows back
+# into a repo's advertised inventory with a SQL LIKE.
+#
+# They used to be a tuple of hand-copied literals in store.py, matched against
+# f-strings built here -- linked by nothing but the fact that someone had typed
+# the same words twice. The failure mode of a reword is not an error: those rows
+# stop being counted, the repo's inventory falls under UNPAID_REPO_THRESHOLD,
+# the rule abstains, and the survivors look exactly like a repo that was never
+# suspicious. That is the self-erosion bounty_inventory was written to fix,
+# restored silently. Building the reasons FROM these names is what makes the
+# coupling structural: there is now one string, used twice, not two strings
+# expected to agree.
+NO_PAYOUT_HISTORY = "no payout history"
+NEVER_PAID_THROUGH_ALGORA = "never paid through Algora"
+PAYOUT_REJECT_PREFIXES = (NO_PAYOUT_HISTORY, NEVER_PAID_THROUGH_ALGORA)
+
 
 def known_payers(
     conn: sqlite3.Connection,
@@ -186,7 +203,7 @@ def payout_reject(
     # 100%, sailing past the ratio. UnsafeLabs/Bounty-Hunters had 9 live, one
     # under the threshold, and 0 rewarded. Neither was reachable before this.
     if evidence.check_rewarded and rewarded == 0:
-        return (f"never paid through Algora (wears {ALGORA_LABEL}, "
+        return (f"{NEVER_PAID_THROUGH_ALGORA} (wears {ALGORA_LABEL}, "
                 f"0 issues ever marked {REWARDED_LABEL})")
 
     if evidence.closed_label is None:
@@ -194,7 +211,7 @@ def payout_reject(
     if closed is None:
         return None
     if closed.total == 0:
-        return (f"no payout history ({open_bounties_here} open bounties here, "
+        return (f"{NO_PAYOUT_HISTORY} ({open_bounties_here} open bounties here, "
                 f"0 ever closed)")
     # A ratio needs a sample. BELOW the minimum this ABSTAINS rather than
     # rejects, and the direction is the whole point: commaai/opendbc is a
@@ -205,7 +222,7 @@ def payout_reject(
     # total > 0 is checked above precisely so this division never sees a zero
     # denominator -- a repo with 0 closed never reaches this line.
     if (closed.with_pr / closed.total) < config.CLOSED_PR_RATIO_FLOOR:
-        return (f"no payout history ({closed.total} closed here, only "
+        return (f"{NO_PAYOUT_HISTORY} ({closed.total} closed here, only "
                 f"{closed.with_pr} with any linked PR)")
     return None
 

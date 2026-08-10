@@ -715,11 +715,6 @@ def rejection_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "WHERE rejected IS NOT NULL GROUP BY rejected ORDER BY n DESC, rejected")]
 
 
-# Reasons this module's own payout rules emit. A repo's advertised inventory has
-# to count these back in -- see bounty_inventory().
-PAYOUT_REJECT_PREFIXES = ("no payout history", "never paid through Algora")
-
-
 def bounty_inventory(conn: sqlite3.Connection) -> dict[str, int]:
     """How many bounties each repo is ADVERTISING, per repo.
 
@@ -738,9 +733,19 @@ def bounty_inventory(conn: sqlite3.Connection) -> dict[str, int]:
     Rejections from other rules (closed, forks, below-floor) are deliberately
     NOT counted back: those say the candidate was never a bounty worth ranking,
     while a payout rejection says the repo does not pay for the ones it has.
+
+    The prefixes are imported from `payers` rather than copied here, and the
+    reasons over there are BUILT from them. A local copy is what this was, and
+    a reword on either side would have made this query silently stop counting
+    those rows -- dropping the repo back under UNPAID_REPO_THRESHOLD and
+    switching the rule off, which is precisely the erosion described above.
     """
-    like = " OR ".join(["rejected LIKE ?"] * len(PAYOUT_REJECT_PREFIXES))
-    params = tuple(f"{prefix}%" for prefix in PAYOUT_REJECT_PREFIXES)
+    # Imported here, not at module scope: payers imports store.
+    from . import payers as payers_module
+
+    prefixes = payers_module.PAYOUT_REJECT_PREFIXES
+    like = " OR ".join(["rejected LIKE ?"] * len(prefixes))
+    params = tuple(f"{prefix}%" for prefix in prefixes)
     return {row["repo"]: row["n"] for row in conn.execute(
         f"SELECT repo, COUNT(*) AS n FROM candidates "
         f"WHERE rejected IS NULL OR {like} GROUP BY repo", params)}

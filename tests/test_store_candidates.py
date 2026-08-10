@@ -410,3 +410,74 @@ def test_the_check_stamp_survives_an_upsert_that_did_not_check(tmp_path):
                            now=1100.0)
     row = conn.execute("SELECT pr_checked_at FROM candidates").fetchone()
     assert row["pr_checked_at"] == 1000.0
+
+
+# --- what the payout rules count, and what they must not erase ---------------
+
+
+def test_a_payout_rejected_row_still_counts_toward_the_repos_inventory(tmp_path):
+    """UNPAID_REPO_THRESHOLD asks "is this repo advertising a pile of bounties".
+
+    That is a fact about the REPO, not about how many of its issues survived our
+    filters -- and counting only live rows let the rule erode the very condition
+    it fires on. Measured 2026-08-10: SecureBananaLabs/bug-bounty fell from 31
+    live to 3 in one sweep as the Algora rule rejected the rest, and 3 is under
+    the threshold of 10, so the NEXT sweep abstained and the survivors became
+    untouchable. A filter that destroys its own trigger stops firing, and what
+    is left looks exactly like a repo that was never suspicious.
+    """
+    from sniper import payers
+
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), now=1.0)
+    store.upsert_candidate(conn, _candidate(number=2), now=1.0,
+                           rejected=f"{payers.NO_PAYOUT_HISTORY} (31 open bounties "
+                                    f"here, 0 ever closed)")
+    # Rejections from OTHER rules are deliberately not counted back: they say the
+    # candidate was never a bounty worth ranking, not that the repo does not pay.
+    store.upsert_candidate(conn, _candidate(number=3), now=1.0, rejected="fork")
+
+    assert store.bounty_inventory(conn) == {"acme/widgets": 2}
+
+
+def test_bounty_inventory_counts_every_reason_payout_reject_can_actually_emit(
+        tmp_path):
+    """The prefixes and the reasons are in different modules and matched with
+    SQL LIKE. This drives the REAL reasons through the REAL query, so a reword
+    fails here rather than silently dropping the repo under the threshold.
+    """
+    from tests.test_payers import _every_payout_reject_reason
+
+    reasons = _every_payout_reject_reason()
+    conn = store.connect(tmp_path / "s.sqlite")
+    for number, reason in enumerate(reasons, start=1):
+        store.upsert_candidate(conn, _candidate(number=number), now=1.0,
+                               rejected=reason)
+
+    assert store.bounty_inventory(conn) == {"acme/widgets": len(reasons)}
+
+
+def test_a_repo_is_flagged_algora_for_all_its_rows_when_any_one_wears_the_label(
+        tmp_path):
+    """One repo, one Algora ledger -- so the question cannot be decided by which
+    label a particular issue happens to carry.
+
+    Measured 2026-08-10: 28 of SecureBananaLabs/bug-bounty's candidates carried
+    `💎 Bounty` and were rejected on a zero rewarded count, while three siblings
+    tagged only ["bug", "good first issue", "bounty", "$1.2k"] sailed through
+    the same sweep. One repo, two verdicts.
+    """
+    from sniper import payers
+
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(
+        conn, replace(_candidate(number=1), labels=(payers.ALGORA_LABEL,)), now=1.0)
+    store.upsert_candidate(
+        conn, replace(_candidate(number=2),
+                      labels=("bug", "good first issue", "bounty", "$1.2k")),
+        now=1.0)
+    store.upsert_candidate(
+        conn, replace(_candidate(number=3, repo="other/repo"), labels=("bug",)),
+        now=1.0)
+
+    assert store.algora_repos(conn) == {"acme/widgets"}

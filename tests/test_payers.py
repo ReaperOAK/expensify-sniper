@@ -727,3 +727,76 @@ def test_rewarded_count_a_cache_hit_pays_no_pause(fake_get, tmp_path, monkeypatc
     payers.rewarded_count(conn, "a/b", now=100.0, sleep=slept.append)
     payers.rewarded_count(conn, "a/b", now=200.0, sleep=slept.append)
     assert slept == [3.0]  # the second call answered from cache, paid nothing
+
+
+# --- the reasons, and what depends on their exact spelling -------------------
+#
+# store.bounty_inventory() matches these strings with SQL LIKE. Nothing else
+# links the two, and the cost of a drift is silent and self-erasing: rows stop
+# being counted, the repo's advertised inventory falls under
+# UNPAID_REPO_THRESHOLD, the rule stops firing, and what is left looks exactly
+# like a repo that was never suspicious. That is the self-erosion bug
+# bounty_inventory was written to fix, restored with no error and no test.
+
+
+def _every_payout_reject_reason() -> list[str]:
+    """Drive payout_reject through each of its three rejecting branches.
+
+    Enumerated rather than spot-checked: two of three passing is the shape of
+    this bug, not a defence against it.
+    """
+    never_paid = payers.payout_reject(
+        "farm/repo", (payers.ALGORA_LABEL,), 1, {"proven/payer"}, rewarded=0)
+    never_closed = payers.payout_reject(
+        "farm/repo", ("bounty",), config.UNPAID_REPO_THRESHOLD + 2,
+        {"proven/payer"}, closed=ClosedBounties(0, 0))
+    bulk_closed = payers.payout_reject(
+        "farm/repo", ("bounty",), config.UNPAID_REPO_THRESHOLD + 2,
+        {"proven/payer"}, closed=ClosedBounties(198, 23))
+    reasons = [never_paid, never_closed, bulk_closed]
+    assert all(r is not None for r in reasons), reasons  # each branch really fired
+    return reasons
+
+
+def test_every_reason_payout_reject_can_return_is_matched_by_the_prefix_set():
+    for reason in _every_payout_reject_reason():
+        assert reason.startswith(payers.PAYOUT_REJECT_PREFIXES), reason
+
+
+def test_no_payout_reject_branch_can_escape_the_prefix_set():
+    """The behavioural test above only sees branches it knows how to reach.
+
+    This one reads the function itself, so a FOURTH reason added later -- or an
+    existing one reworded -- fails here rather than quietly falling out of
+    bounty_inventory's LIKE and taking the repo's advertised count with it.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(payers))
+    fn = next(node for node in ast.walk(tree)
+              if isinstance(node, ast.FunctionDef) and node.name == "payout_reject")
+
+    heads: list[str] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and value.value is None:
+            continue  # `return None` -- an abstain, not a reason
+        if isinstance(value, ast.Constant):
+            heads.append(value.value)
+            continue
+        assert isinstance(value, ast.JoinedStr), ast.dump(value)
+        first = value.values[0]
+        if isinstance(first, ast.Constant):
+            heads.append(first.value)
+        else:
+            # Built from a shared constant, which is the point of having one.
+            assert isinstance(first, ast.FormattedValue), ast.dump(first)
+            assert isinstance(first.value, ast.Name), ast.dump(first.value)
+            heads.append(getattr(payers, first.value.id))
+
+    assert len(heads) == 3, heads  # three rejecting branches, all accounted for
+    for head in heads:
+        assert head.startswith(payers.PAYOUT_REJECT_PREFIXES), head
