@@ -522,8 +522,10 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
     if not payers:
         return 0  # roster unavailable: abstain, exactly as payout_reject does
 
-    counts = {row["repo"]: row["n"] for row in conn.execute(
-        "SELECT repo, COUNT(*) AS n FROM candidates WHERE rejected IS NULL GROUP BY repo")}
+    # See bounty_inventory(): counting only live rows let this rule erode the
+    # very condition it fires on, one sweep at a time.
+    counts = bounty_inventory(conn)
+    algora = algora_repos(conn)
     closed_cache: dict[tuple[str, str], payers_module.ClosedBounties | None] = {}
     changed = 0
     rows = conn.execute(
@@ -541,7 +543,7 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
         # UnsafeLabs/Bounty-Hunters sat at 9 live rows, one under the threshold,
         # so a stored row was skipped before anything could judge it.
         evidence = payers_module.evidence_to_check(
-            repo, labels, counts.get(repo, 0), payers)
+            repo, labels, counts.get(repo, 0), payers, algora_repo=repo in algora)
         if evidence.closed_label is None and not evidence.check_rewarded:
             continue
         closed = None
@@ -554,7 +556,7 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
                     if evidence.check_rewarded and rewarded_for else None)
         reason = payers_module.payout_reject(
             repo, labels, counts.get(repo, 0), payers,
-            closed=closed, rewarded=rewarded)
+            closed=closed, rewarded=rewarded, algora_repo=repo in algora)
         if reason is None:
             continue
         conn.execute(
@@ -666,3 +668,61 @@ def rejection_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
     return [(row["rejected"], row["n"]) for row in conn.execute(
         "SELECT rejected, COUNT(*) AS n FROM candidates "
         "WHERE rejected IS NOT NULL GROUP BY rejected ORDER BY n DESC, rejected")]
+
+
+# Reasons this module's own payout rules emit. A repo's advertised inventory has
+# to count these back in -- see bounty_inventory().
+PAYOUT_REJECT_PREFIXES = ("no payout history", "never paid through Algora")
+
+
+def bounty_inventory(conn: sqlite3.Connection) -> dict[str, int]:
+    """How many bounties each repo is ADVERTISING, per repo.
+
+    Counts live candidates PLUS the ones the payout rules themselves rejected,
+    and the difference is the whole point. `UNPAID_REPO_THRESHOLD` asks "is this
+    repo advertising a pile of bounties", which is a fact about the repo, not
+    about how many of its issues survived our filters.
+
+    Counting only live rows made the rule erode its own trigger. Measured
+    2026-08-10: SecureBananaLabs/bug-bounty went from 31 live to 3 in one sweep
+    as the Algora rule rejected the rest -- and 3 is under the threshold of 10,
+    so on the NEXT sweep the gate abstained and the survivors were untouchable.
+    A filter that destroys the condition it fires on stops firing, and what is
+    left behind looks exactly like a repo that was never suspicious.
+
+    Rejections from other rules (closed, forks, below-floor) are deliberately
+    NOT counted back: those say the candidate was never a bounty worth ranking,
+    while a payout rejection says the repo does not pay for the ones it has.
+    """
+    like = " OR ".join(["rejected LIKE ?"] * len(PAYOUT_REJECT_PREFIXES))
+    params = tuple(f"{prefix}%" for prefix in PAYOUT_REJECT_PREFIXES)
+    return {row["repo"]: row["n"] for row in conn.execute(
+        f"SELECT repo, COUNT(*) AS n FROM candidates "
+        f"WHERE rejected IS NULL OR {like} GROUP BY repo", params)}
+
+
+def algora_repos(conn: sqlite3.Connection) -> set[str]:
+    """Repos where ANY stored candidate wears Algora's own bounty label.
+
+    The rewarded-ledger rule asks whether a REPO has ever been paid through
+    Algora, so it must be keyed on the repo, not on the labels of whichever
+    issue happens to be in hand. Measured 2026-08-10: 28 of
+    SecureBananaLabs/bug-bounty's candidates carried `💎 Bounty` and were
+    rejected on a zero rewarded count, while three siblings carrying only
+    `["bug", "good first issue", "bounty", "$1.2k"]` sailed through the same
+    sweep -- one repo, one ledger, two verdicts, decided by which label a
+    particular issue happened to be tagged with.
+    """
+    from . import payers as payers_module
+
+    found: set[str] = set()
+    for row in conn.execute("SELECT repo, labels FROM candidates"):
+        if row["repo"] in found:
+            continue
+        try:
+            labels = json.loads(row["labels"])
+        except (ValueError, TypeError):
+            continue
+        if any(str(name).strip() == payers_module.ALGORA_LABEL for name in labels):
+            found.add(row["repo"])
+    return found

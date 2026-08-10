@@ -221,9 +221,19 @@ def run(
             survivors.append(cand.with_conservative_amount() if trusted else cand)
 
 
+    # The repo's ADVERTISED inventory, from the database, not just this sweep's
+    # survivors -- and counting back the rows the payout rules themselves
+    # rejected. Counting only live rows let the rule erode its own trigger:
+    # measured 2026-08-10, SecureBananaLabs/bug-bounty fell 31 -> 3 live in one
+    # sweep as the Algora rule rejected the rest, and 3 is under the threshold,
+    # so the next sweep abstained and the survivors became untouchable.
+    inventory = store.bounty_inventory(conn)
+    algora = store.algora_repos(conn)
     open_here: dict[str, int] = {}
     for cand in survivors:
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
+    for repo, n in inventory.items():
+        open_here[repo] = max(open_here.get(repo, 0), n)
     kept: list[Candidate] = []
     for cand in survivors:
         # The guard matters: without it every candidate costs search units for
@@ -235,14 +245,15 @@ def run(
         # farm. closed_for is memoised per (repo, label) for the whole run,
         # failures included, so a repo holding 296 candidates costs one call and
         # one throttle rather than 296.
-        evidence = payers.evidence_to_check(cand.repo, cand.labels,
-                                            open_here[cand.repo], payer_repos)
+        evidence = payers.evidence_to_check(
+            cand.repo, cand.labels, open_here[cand.repo], payer_repos,
+            algora_repo=cand.repo in algora)
         closed = (closed_for(cand.repo, evidence.closed_label)
                   if evidence.closed_label else None)
         rewarded = rewarded_for(cand.repo) if evidence.check_rewarded else None
         reason = payers.payout_reject(
             cand.repo, cand.labels, open_here[cand.repo], payer_repos,
-            closed=closed, rewarded=rewarded)
+            closed=closed, rewarded=rewarded, algora_repo=cand.repo in algora)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:

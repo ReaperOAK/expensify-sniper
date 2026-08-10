@@ -128,6 +128,7 @@ def payout_reject(
     payers: set[str],
     closed: ClosedBounties | None = None,
     rewarded: int | None = None,
+    algora_repo: bool = False,
 ) -> str | None:
     """Reason to drop a candidate on payout history. None = keep.
 
@@ -174,7 +175,8 @@ def payout_reject(
     RESTRICTIVE passes closed=None where real evidence was needed and
     silently keeps a farm.
     """
-    evidence = evidence_to_check(repo, labels, open_bounties_here, payers)
+    evidence = evidence_to_check(repo, labels, open_bounties_here, payers,
+                                 algora_repo=algora_repo)
 
     # Algora's own ledger first, and independently of the open count. This repo
     # wears Algora's label, so a payout would have been stamped `💰 Rewarded`;
@@ -238,6 +240,7 @@ def evidence_to_check(
     labels: tuple[str, ...],
     open_bounties_here: int,
     payers: set[str],
+    algora_repo: bool = False,
 ) -> Evidence:
     """What is worth buying before judging this repo. See Evidence.
 
@@ -267,8 +270,15 @@ def evidence_to_check(
     # it must never be read as evidence. Absence of the label is absence of a
     # record to be silent about, and that asymmetry is what makes this rule safe
     # enough to skip the open-count threshold.
-    check_rewarded = (repo not in payers
-                      and any(label.strip() == ALGORA_LABEL for label in labels))
+    # `algora_repo` overrides the candidate's own labels when the caller knows
+    # the REPO wears Algora's label somewhere. The question is about the repo's
+    # ledger, so one issue's tagging must not decide it: measured 2026-08-10, 28
+    # of SecureBananaLabs/bug-bounty's candidates carried the label and were
+    # rejected on a zero rewarded count while three siblings tagged only
+    # ["bug", "good first issue", "bounty", "$1.2k"] survived the same sweep.
+    wears_algora = (algora_repo
+                    or any(label.strip() == ALGORA_LABEL for label in labels))
+    check_rewarded = repo not in payers and wears_algora
 
     if not payers:
         # Roster unavailable: the ratio path abstains rather than rejecting the
