@@ -191,6 +191,21 @@ AMOUNT_FLOOR_USD = int(os.environ.get("AMOUNT_FLOOR_USD", "50"))
 # keep it; that still drops all five claude-builders issues.
 COMMENT_CEILING = int(os.environ.get("COMMENT_CEILING", "100"))
 
+# Days of silence after which a bounty is treated as not feasible.
+#
+# Measured on LAST ACTIVITY, never on creation date, and the difference is not
+# a detail. Measured 2026-08-10 against the live board: of 14 priced live
+# candidates, ZERO were created in the previous seven days and 10 had activity
+# in it. Bounty labels land on issues that already exist -- microG's WearOS
+# issue was filed in March 2025 and became a bounty much later -- so created_at
+# is the age of the ISSUE, not of the offer. A creation cutoff would have
+# emptied the board of everything rankable while looking like a sensible rule.
+#
+# What silence means here: the market clears fast. A real bounty is claimed
+# within hours, so an offer nobody has even commented on for a week is one the
+# market has already looked at and declined.
+STALE_AFTER_DAYS = int(os.environ.get("STALE_AFTER_DAYS", "7"))
+
 # Expensify Help Wanted issues pay a flat rate; there is no $-label to parse.
 EXPENSIFY_BOUNTY_USD = int(os.environ.get("EXPENSIFY_BOUNTY_USD", "250"))
 

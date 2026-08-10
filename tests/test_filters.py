@@ -9,6 +9,8 @@ Both return a REASON string rather than a bool, because a candidate that
 vanished silently is indistinguishable from one that was never found.
 """
 
+import datetime as dt
+
 import pytest
 
 from sniper import filters
@@ -16,10 +18,20 @@ from sniper.models import Candidate
 from tests.conftest import load_fixture
 
 
+_NOW = 1786363200.0  # 2026-08-10T12:00:00Z
+
+# Relative, not a fixed date. free_reject now rejects on silence, so a hardcoded
+# updated_at becomes stale as wall-clock advances and every unrelated test in
+# this file starts failing on a rule it was never about -- a time bomb with a
+# fuse the length of STALE_AFTER_DAYS.
+_FRESH = (dt.datetime.now(dt.timezone.utc)
+          - dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _cand(source="github-labels", **over):
     base = {
         "number": 7, "title": "t", "state": "open", "comments": 1,
-        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-08-01T00:00:00Z",
+        "created_at": "2026-01-01T00:00:00Z", "updated_at": _FRESH,
         "html_url": "u", "repository_url": "https://api.github.com/repos/acme/widgets",
         "assignee": None, "labels": [{"name": "$780"}],
     }
@@ -194,3 +206,26 @@ def test_the_comment_ceiling_is_inclusive_of_the_limit_itself():
 def test_a_quiet_issue_is_untouched_by_the_ceiling():
     assert filters.free_reject(_cand(comments=0)) is None
     assert filters.free_reject(_cand(comments=99)) is None
+
+
+def test_a_bounty_nobody_has_touched_in_a_week_is_rejected():
+    """Staleness is measured on last ACTIVITY, never on creation date.
+
+    Measured 2026-08-10 against the live board: of 14 priced live candidates,
+    ZERO were created in the past seven days, but 10 had activity in it. Bounty
+    labels land on issues that already exist -- microG's WearOS issue was filed
+    in March 2025 and only became a bounty later -- so created_at is the age of
+    the ISSUE, not of the offer, and a creation cutoff would have emptied the
+    board of everything rankable.
+    """
+    assert filters.free_reject(_cand(updated_at="2026-01-01T00:00:00Z"),
+                               now=_NOW) == "no activity in 221d"
+    assert filters.free_reject(_cand(updated_at="2026-08-09T00:00:00Z"),
+                               now=_NOW) is None
+
+
+def test_staleness_is_not_measured_on_creation_date():
+    """A decade-old issue that got its bounty label yesterday is a FRESH bounty."""
+    cand = _cand(created_at="2015-01-01T00:00:00Z",
+                 updated_at="2026-08-09T12:00:00Z")
+    assert filters.free_reject(cand, now=_NOW) is None

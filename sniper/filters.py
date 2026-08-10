@@ -14,12 +14,13 @@ out" instead of leaving a hole.
 """
 
 from . import config
-from .models import Candidate
+from .models import Candidate, _now_utc, parse_iso
 
 
 def free_reject(
     cand: Candidate,
     *,
+    now: float | None = None,
     paid_labels: set[str] | None = None,
     floor: int | None = None,
     trusted: bool = False,
@@ -65,6 +66,11 @@ def free_reject(
     # candidate it drops.
     if cand.comments > config.COMMENT_CEILING:
         return f"{cand.comments} comments -- too contested"
+    # Silence, measured on last activity. NOT on created_at -- see
+    # config.STALE_AFTER_DAYS for why that would have emptied the board.
+    idle = (_now_utc(now) - parse_iso(cand.updated_at)).days
+    if idle > config.STALE_AFTER_DAYS:
+        return f"no activity in {idle}d"
     if cand.amount_usd is not None and cand.amount_usd < minimum:
         return f"below ${minimum} floor"
     return None

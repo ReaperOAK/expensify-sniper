@@ -222,7 +222,7 @@ def run(
                 rejected=f"dismissed by operator{': ' + note if note else ''}")
             continue
         trusted = cand.repo in payer_repos
-        reason = filters.free_reject(cand, trusted=trusted)
+        reason = filters.free_reject(cand, trusted=trusted, now=stamp)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:
