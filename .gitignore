@@ -20,6 +20,9 @@ evidence/
 verify-runs/
 bt/
 .impeccable/
+# the bounty board, rewritten every sweep by hunt.py -- generated output, like
+# sniper.sqlite, not something to commit
+bounties.md
 
 # --- agent scratch -------------------------------------------------------------
 .superpowers/

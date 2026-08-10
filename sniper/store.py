@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     language      TEXT,
     stars         INTEGER,
     score         REAL,
+    open_pr_count INTEGER,
     created_at    TEXT    NOT NULL,
     updated_at    TEXT    NOT NULL,
     first_seen_at REAL    NOT NULL,
@@ -85,12 +86,47 @@ CREATE TABLE IF NOT EXISTS rate_budget (
 """
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
+# existing database on whatever shape it was created with, so every later column
+# has to be added explicitly. Keep this list append-only and keep the type
+# declarations identical to SCHEMA's, so a migrated database and a fresh one are
+# indistinguishable.
+ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "candidates": {"open_pr_count": "INTEGER"},
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    # hunt.py's cron fires every 3 hours and the Expensify watch sweep every 10
+    # minutes, independently, and both call connect() against the same file --
+    # upsert_candidate()'s own docstring calls that "the normal case, not a
+    # corner one" after measuring 8 of 10 racing writers collide on a bare
+    # check-then-act. `have` is exactly that shape: on first deploy, while the
+    # database is still on the old schema, two callers can both read `column
+    # not in have` before either has run its ALTER. The loser's ALTER TABLE
+    # then raises "duplicate column name" -- which means a peer already added
+    # the column, the outcome this function wanted, not a failure. Any OTHER
+    # OperationalError (a genuinely broken ALTER) still propagates.
+    for table, wanted in ADDED_COLUMNS.items():
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, declaration in wanted.items():
+            if column in have:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
+    conn.commit()
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
     db_path = Path(path or config.DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -205,13 +241,13 @@ def upsert_candidate(
         """
         INSERT OR IGNORE INTO candidates
             (source, repo, number, title, url, state, amount_usd, comments, labels,
-             language, stars, score, created_at, updated_at, first_seen_at,
-             last_seen_at, rejected)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             language, stars, score, open_pr_count, created_at, updated_at,
+             first_seen_at, last_seen_at, rejected)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (source, repo, number, cand.title, cand.url, cand.state, cand.amount_usd,
          cand.comments, labels, cand.language, cand.stars, cand.score,
-         cand.created_at, cand.updated_at, stamp, stamp, rejected),
+         cand.open_pr_count, cand.created_at, cand.updated_at, stamp, stamp, rejected),
     )
     is_new = cur.rowcount > 0
     if not is_new:
@@ -221,13 +257,13 @@ def upsert_candidate(
             """
             UPDATE candidates SET
                 title = ?, url = ?, state = ?, amount_usd = ?, comments = ?,
-                labels = ?, language = ?, stars = ?, score = ?, updated_at = ?,
-                last_seen_at = ?, rejected = ?
+                labels = ?, language = ?, stars = ?, score = ?, open_pr_count = ?,
+                updated_at = ?, last_seen_at = ?, rejected = ?
             WHERE source = ? AND repo = ? AND number = ?
             """,
             (cand.title, cand.url, cand.state, cand.amount_usd, cand.comments,
-             labels, cand.language, cand.stars, cand.score, cand.updated_at,
-             stamp, rejected, source, repo, number),
+             labels, cand.language, cand.stars, cand.score, cand.open_pr_count,
+             cand.updated_at, stamp, rejected, source, repo, number),
         )
     conn.commit()
     return is_new
@@ -460,8 +496,8 @@ def apply_dismissals(conn: sqlite3.Connection) -> int:
 
 
 def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
-                            threshold: int, algora_label: str) -> int:
-    """Re-judge STORED candidates against the payout roster. Returns rows changed.
+                            threshold: int, closed_for) -> int:
+    """Re-judge STORED candidates against payout history. Returns rows changed.
 
     Filters that arrive later must reach the rows already in the table, for the
     same reason dismissals do. When the payout filter shipped, every candidate
@@ -469,14 +505,24 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
     with 201 open bounties and zero payouts until GitHub happened to touch each
     issue again.
 
+    `closed_for(repo, label) -> int | None` supplies the closed-bounty count and
+    is called LAZILY, only for repos that are over the threshold and off the
+    payer roster. That matters: it costs a search unit each, and asking about
+    every repo in the table would blow the 30/min pool on rows that were never
+    going to be rejected. None means unknown, and this abstains on it.
+
     Uses only stored columns (`labels` is kept as JSON precisely so a judgement
-    can be revisited), so this costs no API call.
+    can be revisited), so the callback is the only cost.
     """
+    # Imported here, not at module scope: payers imports store.
+    from . import payers as payers_module
+
     if not payers:
         return 0  # roster unavailable: abstain, exactly as payout_reject does
 
     counts = {row["repo"]: row["n"] for row in conn.execute(
         "SELECT repo, COUNT(*) AS n FROM candidates WHERE rejected IS NULL GROUP BY repo")}
+    closed_cache: dict[tuple[str, str], int | None] = {}
     changed = 0
     rows = conn.execute(
         "SELECT repo, number, labels FROM candidates WHERE rejected IS NULL").fetchall()
@@ -485,15 +531,124 @@ def apply_payout_rejections(conn: sqlite3.Connection, payers: set[str],
         if repo in payers or counts.get(repo, 0) < threshold:
             continue
         try:
-            labels = json.loads(row["labels"])
+            labels = tuple(str(name) for name in json.loads(row["labels"]))
         except (ValueError, TypeError):
             continue
-        if not any(str(name).strip() == algora_label for name in labels):
+        label = payers_module.bounty_label_of(labels)
+        if label is None:
+            continue
+        if (repo, label) not in closed_cache:
+            closed_cache[(repo, label)] = closed_for(repo, label)
+        reason = payers_module.payout_reject(
+            repo, labels, counts[repo], payers, closed_cache[(repo, label)])
+        if reason is None:
             continue
         conn.execute(
             "UPDATE candidates SET rejected = ? WHERE repo = ? AND number = ?",
-            (f"no payout history ({counts[repo]} open Algora bounties here, "
-             f"0 ever rewarded)", repo, row["number"]))
+            (reason, repo, row["number"]))
         changed += 1
     conn.commit()
     return changed
+
+
+def clear_rejections(conn: sqlite3.Connection, reason: str) -> int:
+    """Un-reject stored candidates that were dropped for `reason`. Rows changed.
+
+    A filter that changes its mind has to reach the rows it already judged. When
+    the open-linked-PR rule was replaced, 562 stored candidates were sitting
+    rejected under the old question -- and because a candidate is only re-judged
+    when GitHub happens to touch it again, a months-old bounty could have stayed
+    wrongly rejected forever. Clearing the reason makes them LIVE again; it does
+    not re-judge them, because judgement happens only over what a source
+    rediscovers. That is the intended trade: live-but-unjudged is visible on the
+    board and sorts last in the digest (score IS NULL), while rejected-under-a-
+    dead-question is invisible until GitHub happens to touch the issue.
+
+    Matches the reason EXACTLY. Reasons that interpolate a value (a repo's open
+    count, a claimant's login) are deliberately not clearable this way: a prefix
+    match would be a blunt instrument aimed at a table this is meant to correct.
+    """
+    cur = conn.execute(
+        "UPDATE candidates SET rejected = NULL WHERE rejected = ?", (reason,))
+    conn.commit()
+    return cur.rowcount
+
+
+def held_back_candidates(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Live candidates with no readable amount, newest first.
+
+    These are the rows `live_candidates(require_amount=True)` excludes -- 529 of
+    them on 2026-08-09. They are excluded from the DIGEST for a good reason: they
+    cannot be ranked by expected value, and once the rankable ones ran out they
+    padded it with 700-day-old issues titled "test" and "tttt". But excluded from
+    the digest is not the same as invisible, and until the board existed there
+    was no way to look at them at all.
+
+    Ordered by first_seen_at, our own clock, because there is no amount to sort
+    on and GitHub's created_at is meaningless for a label applied years later.
+    """
+    return conn.execute(
+        "SELECT * FROM candidates WHERE rejected IS NULL AND amount_usd IS NULL "
+        "ORDER BY first_seen_at DESC LIMIT ?", (limit,)).fetchall()
+
+
+def live_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """How many live candidates there ACTUALLY are: total, priced, unpriced.
+
+    Every other reader here is paged -- live_candidates and
+    held_back_candidates both take a limit, because nobody wants 982 rows in a
+    Discord message. Counting the rows a page happens to contain then reports
+    the page size as the inventory: the board's heading said 25 when there were
+    48 priced live rows, and hunt's footer said `live 30` (a sum of two capped
+    lists, double-counting anything in both) while 982 rows were live.
+
+    "How many are there" and "how many did I show you" are different questions,
+    and a board built to replace a hand-written SQL query has to answer the
+    first one. One query, three honest numbers. SUM over an empty table is NULL
+    in SQLite, hence the coercion.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS live, "
+        "       SUM(amount_usd IS NOT NULL) AS rankable, "
+        "       SUM(amount_usd IS NULL) AS unranked "
+        "FROM candidates WHERE rejected IS NULL").fetchone()
+    return {"live": row["live"] or 0,
+            "rankable": row["rankable"] or 0,
+            "unranked": row["unranked"] or 0}
+
+
+def rejection_examples(
+    conn: sqlite3.Connection, per_reason: int = 3
+) -> dict[str, list[sqlite3.Row]]:
+    """Up to `per_reason` example issues for each reject reason, newest first.
+
+    A count says a filter is BIG. An example says it is WRONG, and that is the
+    half that does the catching: 'open linked PR' at 562 only became obviously
+    a bug once someone opened three of them and found ordinary bounties with a
+    drive-by PR from a bot. Newest first by our own clock, because the recent
+    ones are the ones an operator can still check against live GitHub.
+
+    Capped in Python rather than SQL, exactly as live_candidates does it: a
+    window function would need a SQLite version floor this project has not set.
+    """
+    examples: dict[str, list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        "SELECT rejected, repo, number, url FROM candidates "
+        "WHERE rejected IS NOT NULL ORDER BY first_seen_at DESC"
+    ):
+        rows = examples.setdefault(row["rejected"], [])
+        if len(rows) < per_reason:
+            rows.append(row)
+    return examples
+
+
+def rejection_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Every reject reason and how many candidates carry it, largest first.
+
+    This is how a wrong filter becomes visible. 'open linked PR' sat at 562 --
+    larger than everything the tracker kept -- for as long as nobody ran this
+    query by hand.
+    """
+    return [(row["rejected"], row["n"]) for row in conn.execute(
+        "SELECT rejected, COUNT(*) AS n FROM candidates "
+        "WHERE rejected IS NOT NULL GROUP BY rejected ORDER BY n DESC, rejected")]

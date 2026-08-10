@@ -53,6 +53,27 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+# The board lives in ONE private gist so the operator has a stable bookmark.
+# Create it once with `python3 hunt.py --init-gist` and paste the id here.
+BOUNTY_GIST_ID = os.environ.get("BOUNTY_GIST_ID", "").strip()
+BOARD_PATH = Path(os.environ.get("BOARD_PATH", ROOT / "bounties.md"))
+# How many amountless candidates the board lists. 934 once the 446 'open linked
+# PR' rows are revived, so this is a page-size guard that DOES bite -- the
+# section heading says "showing 600 of 934" when it does, and the signature the
+# change detector stores carries the true count rather than the page length.
+BOARD_UNRANKABLE_N = int(os.environ.get("BOARD_UNRANKABLE_N", "600"))
+# The board's own rankable page size, deliberately not DIGEST_TOP_N (25). The
+# digest is a shopping list and 25 is a reader's attention budget; the board is
+# the inventory, and there were 48 priced live rows post-revive. Borrowing the
+# digest's number printed "Rankable — 25" over an inventory of 48.
+BOARD_RANKABLE_N = int(os.environ.get("BOARD_RANKABLE_N", "200"))
+# How many example issues each reject reason carries on the board. A count says
+# a filter is big; an example says it is wrong, which is the half that caught
+# 'open linked PR = 562'.
+BOARD_REJECT_EXAMPLES = int(os.environ.get("BOARD_REJECT_EXAMPLES", "3"))
+# Percentage move in the unrankable count that is worth a Discord link.
+BOARD_CHANGE_PCT = float(os.environ.get("BOARD_CHANGE_PCT", "5"))
+
 # --- repo / runtime ----------------------------------------------------------
 REPO = "Expensify/App"
 APP_REPO_PATH = Path(os.environ.get("APP_REPO_PATH", Path.home() / "Documents" / "App"))
@@ -227,6 +248,30 @@ HUNT_ENABLED_SOURCES = [
     for name in os.environ.get("HUNT_SOURCES", "github-labels,expensify").split(",")
     if name.strip()
 ]
+
+# Sources where an assignee tells us nothing about whether the work is taken.
+#
+# Expensify assigns an internal engineer the moment a job is posted, and a
+# Contributor+ when one volunteers. Verified 2026-08-09: #97949 was open and
+# accepting proposals, labelled External/Daily/Help Wanted, assigned to
+# stitesExpensify. The blanket assignee reject therefore dropped 100% of
+# Expensify candidates at stage 1 -- the whole $250 channel, silently.
+#
+# Whether such a job has actually been awarded is answered in stage 3 instead:
+# once a C+ picks a proposal, its author is assigned AND opens the PR, which is
+# exactly what github_api.linked_pr_state calls a claim.
+# Lowercased, and matched against a lowercased source name, exactly as
+# PAID_LABELS is three sections above. Without it `ASSIGNEE_NOT_A_CLAIM=Expensify`
+# in .env -- the obvious spelling, since that is how the project is written --
+# exempts nothing at all, the blanket assignee reject drops 100% of Expensify
+# candidates at stage 1 again, and the $250 channel goes dark for the second
+# time with no error anywhere. Silent-no-match is the failure this whole setting
+# exists to undo.
+ASSIGNEE_NOT_A_CLAIM = frozenset(
+    name.strip().lower()
+    for name in os.environ.get("ASSIGNEE_NOT_A_CLAIM", "expensify").split(",")
+    if name.strip()
+)
 
 
 def is_proposal(body: str | None) -> bool:

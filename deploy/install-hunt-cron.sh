@@ -81,6 +81,13 @@ print('  imports ok; sources:', ','.join(config.HUNT_ENABLED_SOURCES))
 print('  db ok; candidates already stored:', store.candidate_count(conn))
 print('  delivery:', 'discord' if config.DISCORD_WEBHOOK
       else ('telegram' if config.TELEGRAM_BOT_TOKEN else 'NONE CONFIGURED'))
+# The board is a second delivery path and fails the same way: publish() returns
+# None for an unset id rather than raising, so a box deployed without it pushes
+# a digest that never carries a board link and never says why. Unset is the
+# state a fresh box is IN -- nothing here writes BOUNTY_GIST_ID -- so the deploy
+# has to say so out loud, exactly as it does for the webhook above.
+print('  board gist:', config.BOUNTY_GIST_ID
+      or 'NOT CONFIGURED (run: python3 hunt.py --init-gist, then add it to .env)')
 hunt.build_sources(config.HUNT_ENABLED_SOURCES)
 print('  sources build ok')
 PY"

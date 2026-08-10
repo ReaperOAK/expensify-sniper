@@ -42,8 +42,8 @@ def _run(conn, *, sources, now=NOW, dry_run=True, notify_when_empty=True):
 
 
 def _cand(number, *, labels=None, assignee=None, state="open", comments=0,
-          repo="acme/widgets"):
-    return Candidate.from_search_item("github-labels", {
+          repo="acme/widgets", source="github-labels"):
+    return Candidate.from_search_item(source, {
         "number": number, "title": f"issue {number}", "state": state,
         "comments": comments, "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-08-01T00:00:00Z",
@@ -125,15 +125,63 @@ def test_a_fork_is_rejected_at_the_repo_stage_and_costs_no_timeline_call(tmp_pat
     assert not any("timeline" in u for u, _ in fake_get.calls)
 
 
-def test_an_open_linked_pr_rejects_the_candidate(tmp_path, fake_get):
+def _open_pr_by(login: str) -> dict:
+    return {"event": "cross-referenced",
+            "source": {"issue": {"pull_request": {"url": "u"}, "state": "open",
+                                 "user": {"login": login}}}}
+
+
+def test_an_open_pr_from_a_stranger_keeps_the_candidate(tmp_path, fake_get):
+    # This is the change. Measured 2026-08-09, this rule had rejected 562
+    # candidates -- more than the 536 it kept -- and most of those PRs were
+    # opened by agents that auto-raise on any bounty label.
     conn = _conn(tmp_path)
     fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
-    fake_get.queue(200, [{"event": "cross-referenced",
-                          "source": {"issue": {"pull_request": {"url": "x"},
-                                               "state": "open"}}}])
+    fake_get.queue(200, [_open_pr_by("randobot")])
     _run(conn, sources=[FakeSource("s", [_cand(1)])], dry_run=True)
-    assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] == \
-        "open linked PR"
+    row = conn.execute("SELECT rejected, open_pr_count FROM candidates").fetchone()
+    assert row["rejected"] is None
+    assert row["open_pr_count"] == 1
+
+
+def test_open_prs_are_counted_not_just_detected(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("a"), _open_pr_by("b"), _open_pr_by("c")])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], dry_run=True)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 3
+
+
+def test_a_contested_candidate_scores_below_an_uncontested_one(tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("randobot")])
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1), _cand(2)])], dry_run=True)
+    scores = {r["number"]: r["score"]
+              for r in conn.execute("SELECT number, score FROM candidates")}
+    assert scores[1] < scores[2]
+
+
+def test_stale_open_linked_pr_rejections_are_cleared_at_the_start_of_a_run(
+        tmp_path, fake_get):
+    conn = _conn(tmp_path)
+    store.upsert_candidate(conn, _cand(99), rejected="open linked PR", now=NOW)
+    _run(conn, sources=[FakeSource("s", [])], dry_run=True)
+    row = conn.execute(
+        "SELECT rejected FROM candidates WHERE number = 99").fetchone()
+    assert row["rejected"] is None
+
+
+def test_clearing_stale_rejections_is_announced_rather_than_silent(
+        tmp_path, fake_get):
+    # A silent revival looks identical to newly discovered inventory, which
+    # would make a filter change unattributable the next time one is made.
+    conn = _conn(tmp_path)
+    store.upsert_candidate(conn, _cand(99), rejected="open linked PR", now=NOW)
+    text = _run(conn, sources=[FakeSource("s", [])], dry_run=True)
+    assert "re-judged" in text
 
 
 def test_survivors_are_scored_and_persisted(tmp_path, fake_get):
@@ -329,20 +377,126 @@ def test_the_payout_filter_reaches_candidates_stored_before_it_existed(tmp_path)
         store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
     assert len(store.live_candidates(conn, limit=50)) == 12
 
+    # _cand carries a $780 label, which bounty_label_of falls back to (an
+    # amount label, since it's neither Algora's exact string nor "bounty").
+    # The callback reports 0 ever closed -- a farm's shape.
     changed = store.apply_payout_rejections(
-        conn, {"someone/else"}, 10, "$780")  # _cand carries a $780 label
+        conn, {"someone/else"}, 10, lambda repo, label: 0)
     assert changed == 12
     assert store.live_candidates(conn, limit=50) == []
     row = conn.execute("SELECT rejected FROM candidates WHERE number = 0").fetchone()
-    assert "0 ever rewarded" in row["rejected"]
+    assert "0 ever closed" in row["rejected"]
 
 
 def test_reconciliation_abstains_when_the_roster_is_unavailable(tmp_path):
     conn = store.connect(tmp_path / "t.sqlite")
     for n in range(12):
         store.upsert_candidate(conn, _cand(n).with_score(100.0), now=1.0)
-    assert store.apply_payout_rejections(conn, set(), 10, "$780") == 0
+    assert store.apply_payout_rejections(conn, set(), 10, lambda repo, label: 0) == 0
     assert len(store.live_candidates(conn, limit=50)) == 12
+
+
+def test_closed_for_is_asked_only_about_qualifying_repos_and_cached_by_label(tmp_path):
+    """The callback costs a search unit each, so it must not be asked idly.
+
+    Three repos are stored: one over threshold and off the roster (the only
+    shape `payout_reject` can ever act on), one below threshold, and one on the
+    roster despite being over threshold. Only the first should ever reach the
+    callback -- and its 12 candidates share one (repo, label) pair, so it must
+    be asked about exactly once, not 12 times.
+    """
+    conn = store.connect(tmp_path / "t.sqlite")
+    calls: list[tuple[str, str]] = []
+
+    def counting_closed_for(repo: str, label: str) -> int | None:
+        calls.append((repo, label))
+        return 0
+
+    for n in range(12):  # over threshold(10), off the roster -- qualifies
+        store.upsert_candidate(
+            conn, _cand(n, repo="farm/repo").with_score(100.0), now=1.0)
+    for n in range(3):  # below threshold -- must never be asked about
+        store.upsert_candidate(
+            conn, _cand(n, repo="small/repo").with_score(100.0), now=1.0)
+    for n in range(12):  # over threshold but on the roster -- never asked either
+        store.upsert_candidate(
+            conn, _cand(n, repo="acme/widgets").with_score(100.0), now=1.0)
+
+    changed = store.apply_payout_rejections(
+        conn, {"acme/widgets"}, 10, counting_closed_for)
+
+    assert changed == 12  # only farm/repo's candidates were rejected
+    assert calls == [("farm/repo", "$780")]  # asked about once, not 12 times
+
+
+def test_an_empty_roster_never_reaches_closed_for(tmp_path, fake_get, monkeypatch):
+    """An empty payer_repos means known_payers COULD NOT LOOK, not that nobody
+    pays -- payout_reject's very first check abstains on that unconditionally.
+
+    The stage-1 guard has to check the roster BEFORE calling closed_for, not
+    just "off the roster" (which is vacuously true for every repo when the
+    roster is empty). Missing that check spent a search unit on every
+    qualifying candidate for an answer already guaranteed to be discarded --
+    and worse than merely wasted, because once the 30/min pool is spent,
+    reserve_or_wait blocks for up to config.BUDGET_WAIT_S waiting for the next
+    window, and the roster fetch usually fails from that same rate pressure.
+    So a run could stall for minutes buying answers nobody was going to use.
+    """
+    from sniper import payers as payers_mod
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        payers_mod, "ever_closed_with",
+        lambda conn, repo, label, **kw: calls.append((repo, label)) or 0)
+
+    conn = _conn(tmp_path, payers=())  # empty roster: the lookup "failed"
+    # 12 candidates, one repo, over UNPAID_REPO_THRESHOLD(10), carrying a
+    # bounty-ish label ($780 matches via bounty_label_of's amount fallback) --
+    # exactly the shape that WOULD reach closed_for if the roster were populated.
+    source = FakeSource("s", [_cand(n) for n in range(12)])
+    _run(conn, sources=[source], dry_run=True)
+
+    assert calls == []
+
+
+def test_a_failing_closed_for_is_asked_once_per_repo_and_label_not_once_per_candidate(
+        tmp_path, fake_get, monkeypatch):
+    """A FAILED payout check must be remembered, exactly as a successful one is.
+
+    ever_closed_with writes its cache only on success, so a throttled answer
+    leaves nothing behind and the next candidate asks again. Measured against
+    the live database: reviving the 446 'open linked PR' rows takes repos with
+    >=10 live candidates from 4 to 14, and one of those repos holds 296 rows.
+    Without a memo that remembers failures, stage 1 asks 296 times -- and each
+    ask, under a secondary throttle, is a 60+120+240s backoff ladder before it
+    raises. That is the 3-hourly sweep never finishing and the 10-minute watch
+    cron piling up behind it, with no digest to say why.
+
+    'I could not look' is an ANSWER here, not the absence of one, and it has to
+    be cached like any other. store.apply_payout_rejections already does this
+    with its own closed_cache; hunt's stage 1 relied on a DB cache the failure
+    path never writes.
+    """
+    from sniper import payers as payers_mod
+
+    calls: list[tuple[str, str]] = []
+
+    def always_fails(conn, repo, label, **kwargs):
+        calls.append((repo, label))
+        return None  # throttled: unknown, and every caller must abstain
+
+    monkeypatch.setattr(payers_mod, "ever_closed_with", always_fails)
+
+    conn = _conn(tmp_path, payers=("someone/else",))
+    # 12 candidates in one repo: over UNPAID_REPO_THRESHOLD(10), off the roster,
+    # each carrying the same $780 label -- one question, twelve askers.
+    source = FakeSource("s", [_cand(n, repo="farm/repo") for n in range(12)])
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    for _ in range(12):
+        fake_get.queue(200, [])
+    _run(conn, sources=[source], dry_run=True)
+
+    assert calls == [("farm/repo", "$780")]
 
 
 def test_a_quiet_watch_sweep_says_nothing(tmp_path, fake_get, monkeypatch, capsys):
@@ -385,6 +539,217 @@ def test_a_quiet_sweep_with_a_WARNING_still_speaks(tmp_path, fake_get, monkeypat
     assert "⚠" in sent[0]
 
 
+def test_the_board_is_written_published_and_linked_only_when_it_moves(
+    tmp_path, fake_get, monkeypatch
+):
+    """hunt.run()'s board wiring end to end: the file gets written, the gist
+    gets published every sweep, the board-signature cache round-trips through
+    store, and the digest carries a link only once has_changed() says the
+    unrankable set's move is worth it -- not on a sweep where it stayed the
+    same.
+
+    board.publish is replaced wholesale rather than given a post= fake,
+    mirroring how notify.send is replaced above: hunt.run() calls both as bare
+    module functions with no transport seam of its own, so replacing the
+    function is the seam a caller of run() actually has.
+    """
+    import json
+
+    from sniper import board, config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+    published = []
+    monkeypatch.setattr(
+        board, "publish",
+        lambda text: published.append(text) or "https://gist.github.com/abc123")
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    # First-ever board: has_changed(None, ...) is unconditionally True, so the
+    # very first sweep links regardless of what the unrankable set contains.
+    assert config.BOARD_PATH.exists()
+    board_text = config.BOARD_PATH.read_text(encoding="utf-8")
+    assert "# Bounty board" in board_text
+    assert published == [board_text]
+    assert "📋 board updated: https://gist.github.com/abc123" in text
+
+    # The signature cache round-tripped through store.
+    _, cached = store.get_cache(conn, "board-signature")
+    assert json.loads(cached) == {"count": 0, "repos": []}
+
+    # Second sweep, nothing new: the SAME (empty) unrankable set is not a
+    # change, so the board still gets published (every sweep, unconditionally)
+    # but the digest carries no link this time.
+    text2 = _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False)
+    assert len(published) == 2
+    assert "board updated" not in text2
+
+
+def test_a_board_publish_failure_reaches_the_digest_and_stderr(
+    tmp_path, fake_get, monkeypatch, capsys
+):
+    """A configured gist that fails to publish (revoked token, deleted gist,
+    timeout, 5xx) must not look like an ordinary quiet sweep.
+
+    The board block runs BEFORE notify.format_digest(), so its warning is
+    already in the list format_digest() renders into the delivered digest --
+    not appended afterward, where it would be recorded but never actually seen.
+    The stderr line fires too, regardless of whether an id was configured,
+    mirroring the digest-delivery failure handling further down in run().
+    """
+    from sniper import board, config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+
+    def boom(text):
+        raise RuntimeError("gist gone")
+
+    monkeypatch.setattr(board, "publish", boom)
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    assert "board publish failed: gist gone" in text
+    err = capsys.readouterr().err
+    assert "board was NOT published: publish raised" in err
+
+
+def test_a_failed_publish_does_not_advance_the_board_signature(
+    tmp_path, fake_get, monkeypatch
+):
+    """Advancing it anyway loses the change notification PERMANENTLY.
+
+    If the unrankable set moves on a sweep where publish() raises, the warning
+    reaches the digest but an advanced signature means the next SUCCESSFUL
+    sweep compares against the move it never announced, sees nothing, and sends
+    no link. The operator is then never told, on any future sweep.
+    """
+    from sniper import board, config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+    monkeypatch.setattr(board, "publish", lambda text: (_ for _ in ()).throw(
+        RuntimeError("gist gone")))
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    _, cached = store.get_cache(conn, "board-signature")
+    assert cached is None
+
+    # The next sweep publishes fine, and because nothing was recorded it still
+    # treats the board as never-seen and links it.
+    monkeypatch.setattr(board, "publish",
+                        lambda text: "https://gist.github.com/abc123")
+    text = _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False)
+    assert "board updated" in text
+
+
+def test_a_dry_run_does_not_burn_the_change_signal(tmp_path, fake_get, monkeypatch):
+    """--dry-run promises "print the digest, send nothing".
+
+    Advancing the signature would make it send nothing AND silently spend the
+    change the next real run was going to report.
+    """
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
+    _, cached = store.get_cache(conn, "board-signature")
+    assert cached is None
+
+
+def test_an_unset_gist_id_reaches_the_digest_not_only_stderr(
+    tmp_path, fake_get, monkeypatch, capsys
+):
+    """publish() returns None for an unset id rather than raising, so nothing
+    was appended to warnings -- which made "the gist was never configured" and
+    "the board did not move" the same silence in Discord. That is the exact
+    collision publish()'s own docstring says must never happen, and it is the
+    state the tracker ships in: unset on both hosts until --init-gist runs.
+    """
+    from sniper import config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "", raising=False)
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    assert "BOUNTY_GIST_ID unset" in text
+    assert "board was NOT published" in capsys.readouterr().err
+
+
+def test_an_unset_gist_id_is_not_by_itself_a_reason_to_break_the_silence(
+    tmp_path, fake_get, monkeypatch
+):
+    """It is a permanent configuration state, not news about this sweep.
+
+    Letting it force delivery would be 144 identical messages a day out of the
+    watch cron -- the failure the silence rule exists to prevent, arriving
+    through the warning channel instead of the digest one.
+    """
+    from sniper import config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "", raising=False)
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda text, **kw: sent.append(text) or "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+    sent.clear()
+
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False,
+         notify_when_empty=False)
+    assert sent == []
+
+
+def test_the_board_counts_the_inventory_rather_than_the_page_it_prints(
+    tmp_path, fake_get, monkeypatch
+):
+    """Both headline numbers used to be page sizes: the heading read
+    len(rankable) (DIGEST_TOP_N, 25) and the footer summed two capped lists
+    that overlap. Post-revive that is 25 against 48, and 30 against 982.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "BOARD_RANKABLE_N", 2, raising=False)
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    for _ in range(5):
+        fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(n) for n in range(5)])],
+         now=NOW, dry_run=True)
+
+    board_text = config.BOARD_PATH.read_text(encoding="utf-8")
+    assert "showing 2 of 5 with a readable amount" in board_text
+    assert "live 5" in board_text
+
+
+def test_the_board_shows_example_issues_for_each_reject_reason(tmp_path, fake_get):
+    """Design section D asks for up to three examples per reason. A count says
+    a filter is big; an example says it is wrong.
+    """
+    from sniper import config
+
+    conn = _conn(tmp_path, payers=("someone/else",))
+    _run(conn, sources=[FakeSource("s", [_cand(1, state="closed")])],
+         now=NOW, dry_run=True)
+    board_text = config.BOARD_PATH.read_text(encoding="utf-8")
+    assert "| 1 | closed | [acme/widgets#1](" in board_text
+
+
 def test_a_proven_payer_may_offer_tiered_amounts(tmp_path, fake_get):
     """go-gitea/gitea#1872 carries $250, $50 and $500 and is a real bounty.
 
@@ -412,3 +777,30 @@ def test_an_untrusted_repo_with_tiers_is_still_treated_as_spam(tmp_path, fake_ge
     row = conn.execute("SELECT rejected FROM candidates WHERE number=1").fetchone()
     assert row["rejected"] == "multiple amount labels"
     assert fake_get.calls == []
+
+
+def test_an_assigned_expensify_issue_reaches_stage_three(tmp_path, fake_get):
+    # The exemption is not a free pass -- it moves the question from "is anyone
+    # assigned" to "is an assignee also writing the PR", which is the sharper
+    # test. This candidate is assigned and survives, because nobody has a PR.
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [
+        _cand(1, source="expensify", assignee={"login": "stitesExpensify"})])],
+        dry_run=True)
+    assert conn.execute("SELECT rejected FROM candidates").fetchone()["rejected"] is None
+
+
+def test_an_assignee_who_opened_the_pr_is_a_claim(tmp_path, fake_get):
+    # Expensify's actual award: a C+ picks a proposal, its author is assigned,
+    # and that author opens the PR. That pair is the claim -- and it is the same
+    # pair on Algora, where the winner is whoever merges.
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [_open_pr_by("daledah")])
+    _run(conn, sources=[FakeSource("s", [
+        _cand(1, source="expensify", assignee={"login": "daledah"})])],
+        dry_run=True)
+    row = conn.execute("SELECT rejected FROM candidates").fetchone()
+    assert row["rejected"] == "claimed by assignee @daledah"

@@ -9,12 +9,24 @@ forever after, which is exactly why GitHub's created_at is displayed but never
 scored.
 """
 
+from dataclasses import replace
+
 from sniper import store
 from sniper.models import Candidate
 
 
 def _conn(tmp_path):
     return store.connect(tmp_path / "t.sqlite")
+
+
+def _candidate(*, number: int, source: str = "github-labels",
+               repo: str = "acme/widgets") -> Candidate:
+    return Candidate(
+        source=source, repo=repo, number=number, title="t",
+        url=f"https://github.com/{repo}/issues/{number}", state="open",
+        comments=0, labels=(), created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z", has_assignee=False,
+        amount_usd=100, amounts_seen=(100,))
 
 
 def _cand(number=7, *, updated="2026-08-01T00:00:00Z", source="github-labels"):
@@ -191,3 +203,131 @@ def test_unrankable_candidates_do_not_take_a_digest_slot(tmp_path):
     assert len(store.live_candidates(conn, limit=10)) == 2
     ranked = store.live_candidates(conn, limit=10, require_amount=True)
     assert [r["number"] for r in ranked] == [1]
+
+
+def test_open_pr_count_round_trips(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    cand = _candidate(number=1).with_linked_prs(3)
+    store.upsert_candidate(conn, cand, now=1.0)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 3
+
+
+def test_unchecked_candidate_stores_null_not_zero(tmp_path):
+    # "the timeline was never read" and "there are no PRs" must not collapse.
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), now=1.0)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] is None
+
+
+def test_open_pr_count_is_updated_on_a_later_sighting(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1).with_linked_prs(1), now=1.0)
+    store.upsert_candidate(conn, _candidate(number=1).with_linked_prs(4), now=2.0)
+    row = conn.execute("SELECT open_pr_count FROM candidates").fetchone()
+    assert row["open_pr_count"] == 4
+
+
+def test_clear_rejections_revives_only_the_named_reason(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), rejected="open linked PR", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=2), rejected="archived repo", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=3), now=1.0)
+
+    changed = store.clear_rejections(conn, "open linked PR")
+
+    assert changed == 1
+    live = {row["number"] for row in
+            conn.execute("SELECT number FROM candidates WHERE rejected IS NULL")}
+    assert live == {1, 3}
+
+
+def test_clear_rejections_returns_zero_when_nothing_matches(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), rejected="fork", now=1.0)
+    assert store.clear_rejections(conn, "open linked PR") == 0
+
+
+def test_held_back_candidates_returns_only_the_amountless_live_ones(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    priced = replace(_candidate(number=1), amount_usd=100)
+    unpriced = replace(_candidate(number=2), amount_usd=None)
+    rejected = replace(_candidate(number=3), amount_usd=None)
+    store.upsert_candidate(conn, priced, now=1.0)
+    store.upsert_candidate(conn, unpriced, now=2.0)
+    store.upsert_candidate(conn, rejected, rejected="fork", now=3.0)
+
+    rows = store.held_back_candidates(conn, 10)
+
+    assert [row["number"] for row in rows] == [2]
+
+
+def test_held_back_candidates_are_newest_first(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    for number, seen in ((1, 10.0), (2, 30.0), (3, 20.0)):
+        store.upsert_candidate(conn, replace(_candidate(number=number),
+                                             amount_usd=None), now=seen)
+    rows = store.held_back_candidates(conn, 10)
+    assert [row["number"] for row in rows] == [2, 3, 1]
+
+
+def test_rejection_counts_group_by_reason_largest_first(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), rejected="fork", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=2), rejected="archived repo", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=3), rejected="archived repo", now=1.0)
+    store.upsert_candidate(conn, _candidate(number=4), now=1.0)
+
+    assert store.rejection_counts(conn) == [("archived repo", 2), ("fork", 1)]
+
+
+def test_live_counts_are_the_whole_table_not_a_page(tmp_path):
+    """The board's headline numbers used to be page sizes.
+
+    live_candidates and held_back_candidates both take a limit, so counting
+    the rows they return reports how many were SHOWN. The board said
+    "Rankable — 25" over an inventory of 48, and the footer said "live 30"
+    while 982 rows were live.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    for number in range(4):
+        store.upsert_candidate(conn, _candidate(number=number), now=1.0)
+    for number in range(4, 9):
+        store.upsert_candidate(conn, replace(_candidate(number=number),
+                                             amount_usd=None), now=1.0)
+    store.upsert_candidate(conn, _candidate(number=99), rejected="fork", now=1.0)
+
+    assert store.live_counts(conn) == {"live": 9, "rankable": 4, "unranked": 5}
+
+
+def test_live_counts_on_an_empty_table_are_zero_not_none(tmp_path):
+    # SUM over no rows is NULL in SQLite, and a None here would render as
+    # "unranked None" in the board footer rather than as a count.
+    conn = store.connect(tmp_path / "s.sqlite")
+    assert store.live_counts(conn) == {"live": 0, "rankable": 0, "unranked": 0}
+
+
+def test_rejection_examples_are_capped_per_reason_and_newest_first(tmp_path):
+    """A count says a filter is big; an example says it is wrong.
+
+    'open linked PR' at 562 looked like a busy world until someone opened
+    three of them. Newest first by our own clock, because those are the ones
+    still checkable against live GitHub.
+    """
+    conn = store.connect(tmp_path / "s.sqlite")
+    for number, seen in ((1, 10.0), (2, 40.0), (3, 20.0), (4, 30.0)):
+        store.upsert_candidate(conn, _candidate(number=number),
+                               rejected="open linked PR", now=seen)
+    store.upsert_candidate(conn, _candidate(number=5), rejected="fork", now=1.0)
+
+    examples = store.rejection_examples(conn, 3)
+
+    assert [row["number"] for row in examples["open linked PR"]] == [2, 4, 3]
+    assert [row["number"] for row in examples["fork"]] == [5]
+
+
+def test_rejection_examples_ignore_live_candidates(tmp_path):
+    conn = store.connect(tmp_path / "s.sqlite")
+    store.upsert_candidate(conn, _candidate(number=1), now=1.0)
+    assert store.rejection_examples(conn, 3) == {}

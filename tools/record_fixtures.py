@@ -35,7 +35,7 @@ BOUNTY_QUERY = 'label:"💎 Bounty" state:open is:issue no:assignee -label:"💰
 # Each target is independent -- consumed by exactly one test of one function. In
 # particular repo_healthy and timeline_with_open_pr are NOT a matched pair and
 # deliberately name different repos: repo_healthy backs the get_repo() test,
-# timeline_with_open_pr backs the has_open_linked_pr() test, and no test uses both.
+# timeline_with_open_pr backs the linked_pr_state() test, and no test uses both.
 # Swapping one target never requires swapping another.
 TARGETS = [
     # name, path, params
@@ -49,11 +49,26 @@ TARGETS = [
     ("repo_healthy", "/repos/ClankerNation/OpenAgents", {}),
     ("repo_fork", "/repos/WillSmithTE/qdrant-qdrant", {}),
     ("repo_spam_farm", "/repos/SecureBananaLabs/bug-bounty", {}),
-    # Confirmed 2026-08-08 to carry 6 open pull-request cross-references. Cross-refs
-    # churn fast -- if the Step 6 check reports False, re-run the finder in Step 6's
-    # troubleshooting note and swap this target rather than weakening the assertion.
+    # 167 timeline events over two pages, carrying 29 OPEN pull-request
+    # cross-references (34 including closed ones), counted from the committed
+    # fixture itself. The earlier note here said 6, from a recording before
+    # linked_pr_state() read past page 1 -- it was measured against a single
+    # page and never re-measured, which is why a number in a comment has to name
+    # what produced it.
+    #
+    # linked_pr_state() reads the WHOLE timeline (no short-circuit), so both
+    # pages are recorded: with only page 1,
+    # test_real_recorded_timeline_counts_open_prs pages past the fixture and
+    # fails on an unqueued request rather than on a bad assertion.
+    #
+    # Cross-refs churn -- the PRs on one issue can all close within days. If
+    # that test starts failing, re-record against a fresh target and update the
+    # count above; never relax the assertion to match whatever the fixture now
+    # holds.
     ("timeline_with_open_pr", "/repos/arakoodev/EdgeChains/issues/279/timeline",
-     {"per_page": 100}),
+     {"per_page": 100, "page": 1}),
+    ("timeline_with_open_pr_page2", "/repos/arakoodev/EdgeChains/issues/279/timeline",
+     {"per_page": 100, "page": 2}),
     ("events_expensify", f"/repos/{config.REPO}/issues/events", {"per_page": 100}),
 ]
 

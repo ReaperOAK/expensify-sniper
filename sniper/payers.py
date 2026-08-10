@@ -17,9 +17,18 @@ Algora stamps `💰 Rewarded` on an issue when it releases the money, so one
 search returns a roster of repos known to pay. Absence from that roster is NOT
 evidence of non-payment on its own -- commaai/opendbc runs its own bounty
 programme, uses no Algora label, and has closed seven bounties including a
-$4,000 port. Absence only becomes damning when a repo is *using Algora's own
-label* on a pile of open bounties and has never rewarded one. That is the
-shape this module reports, and nothing more.
+$4,000 port.
+
+Absence only becomes damning when direct evidence backs it up: the repo is
+advertising a pile of open bounties under some label it claims marks a bounty,
+and has never once CLOSED an issue carrying that label. Checked directly via
+`ever_closed_with`, not gated on whether the repo happens to wear Algora's own
+string -- gating on that string was the earlier version of this rule, and it
+was blind to a farm running its own programme. Measured 2026-08-09,
+zhangjiayang6835-cyber/bounty-plaza held three of the top four digest slots
+with 526 open bounties behind a plain "Bounty" label and 0 ever closed; the
+label-gated rule never saw it because it wore no Algora label at all. That is
+the shape this module reports, and nothing more.
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ import sqlite3
 import time
 
 from . import config, github_api, store
-from .models import repo_from_url
+from .models import parse_amount_label, repo_from_url
 
 CACHE_KEY = "known-payer-repos"
 
@@ -103,27 +112,186 @@ def payout_reject(
     labels: tuple[str, ...],
     open_bounties_here: int,
     payers: set[str],
+    closed_count: int | None,
 ) -> str | None:
     """Reason to drop a candidate on payout history. None = keep.
 
-    Deliberately narrow. It fires only when all three hold:
+    Still deliberately narrow. It fires only when all of these hold:
 
-      * the repo is using Algora's own bounty label, so a payout would have been
-        stamped and its absence is meaningful;
-      * the repo has never appeared in the rewarded roster;
+      * the payer roster was actually fetched (an empty one means the lookup
+        failed, not that nobody pays);
+      * the repo has never appeared in that roster;
+      * the candidate carries some label marking it as a bounty, so the repo's
+        silence is about something it actually claims to run;
       * it is advertising at least `config.UNPAID_REPO_THRESHOLD` open bounties,
-        which is a farm's shape rather than a new project's.
+        which is a farm's shape rather than a new project's;
+      * and it has never once CLOSED a bounty carrying that label.
 
-    A repo running its own programme, or a small repo with one or two genuine
-    bounties, is never touched by this.
+    The last condition replaces the old requirement that the repo wear Algora's
+    exact `💎 Bounty` string. That gate existed for a real reason -- a repo with
+    no Algora label has no payout record to be absent -- but it meant any farm
+    using its own label was invisible. Measured 2026-08-09,
+    zhangjiayang6835-cyber/bounty-plaza held three of the top four digest slots
+    with 526 open bounties, 0 ever closed, 5 stars and a month of history, all
+    behind a plain "Bounty" label.
+
+    `closed_count` of None means the question could not be answered, and this
+    abstains. A repo running its own programme, or a small repo with one or two
+    genuine bounties, is never touched.
+
+    The first four conditions live in `label_to_check`, not here, because every
+    caller has to evaluate them BEFORE calling this -- they decide whether
+    spending a search unit on `closed_count` can possibly change the answer.
+    Two copies of that reasoning is the shape of the bug fixed in 441d2ed, and
+    the risk is asymmetric: a copy that drifts more PERMISSIVE only wastes
+    quota, since this function re-validates, while one that drifts more
+    RESTRICTIVE passes closed_count=None where a real count was needed and
+    silently keeps a farm.
+    """
+    if label_to_check(repo, labels, open_bounties_here, payers) is None:
+        return None
+    if closed_count is None or closed_count > 0:
+        return None
+    return (f"no payout history ({open_bounties_here} open bounties here, "
+            f"0 ever closed)")
+
+
+def label_to_check(
+    repo: str,
+    labels: tuple[str, ...],
+    open_bounties_here: int,
+    payers: set[str],
+) -> str | None:
+    """The label to ask `ever_closed_with` about, or None to spend nothing.
+
+    This is `payout_reject`'s gate, hoisted so a caller can ask it BEFORE
+    buying the evidence. None means the answer cannot change the verdict:
+
+      * the payer roster is empty, so the lookup FAILED and payout_reject's
+        first check abstains unconditionally -- this one bit us, and asking
+        anyway spends a search unit per candidate on an answer already
+        guaranteed to be discarded. Worse than wasted: once the 30/min pool is
+        gone, reserve_or_wait blocks for up to BUDGET_WAIT_S, and the roster
+        fetch usually fails from that same rate pressure;
+      * the repo is already a proven payer;
+      * nothing on the candidate marks it as a bounty, so the repo's silence
+        says nothing;
+      * the repo is under UNPAID_REPO_THRESHOLD open bounties, which is a new
+        project rather than a farm.
+
+    Returning the label rather than a bool means the caller never recomputes
+    bounty_label_of, so the two can never disagree about WHICH label was judged.
     """
     if not payers:
         return None  # roster unavailable: abstain rather than reject the world
     if repo in payers:
         return None
-    if not any(label.strip() == ALGORA_LABEL for label in labels):
-        return None  # not an Algora repo; its silence says nothing
+    label = bounty_label_of(labels)
+    if label is None:
+        return None  # nothing marks this as a bounty; its silence says nothing
     if open_bounties_here < config.UNPAID_REPO_THRESHOLD:
         return None
-    return (f"no payout history ({open_bounties_here} open Algora bounties here, "
-            f"0 ever rewarded)")
+    return label
+
+
+def bounty_label_of(labels: tuple[str, ...]) -> str | None:
+    """The label to test this repo's payout history against, or None to abstain.
+
+    Preference order is evidence order. Algora's own label is unambiguous.
+    Anything containing "bounty" is a self-declared bounty programme, which is
+    what bounty-plaza wears -- 526 open, 0 ever closed, invisible to a rule that
+    demanded Algora's exact string. An amount label is the weakest of the three
+    and is only reached when the other two are absent.
+
+    None means the candidate carries nothing marking it as a bounty at all, and
+    the caller must abstain: a repo's silence about a label it does not use says
+    nothing about whether it pays.
+
+    Every branch returns the STRIPPED label, not the raw one: the return value
+    flows straight into `ever_closed_with`'s query as `label:"{label}"`, where
+    incidental leading/trailing whitespace would silently fail to match a real
+    closed issue.
+    """
+    for label in labels:
+        if label.strip() == ALGORA_LABEL:
+            return label.strip()
+    for label in labels:
+        if "bounty" in label.lower():
+            return label.strip()
+    for label in labels:
+        if parse_amount_label(label) is not None:
+            return label.strip()
+    return None
+
+
+CLOSED_CACHE_PREFIX = "closed-bounty"
+
+
+def ever_closed_with(
+    conn: sqlite3.Connection,
+    repo: str,
+    label: str,
+    *,
+    now: float | None = None,
+    sleep=time.sleep,
+) -> int | None:
+    """How many issues `repo` has ever CLOSED carrying `label`. None = unknown.
+
+    This is the evidence that replaces "is it wearing Algora's label". A repo
+    advertising a pile of open bounties and never closing one is a farm whatever
+    label it uses: measured 2026-08-09, zhangjiayang6835-cyber/bounty-plaza had
+    526 open, 0 ever closed, 5 stars, and a month of history, while holding three
+    of the top four digest slots.
+
+    Closed rather than rewarded, deliberately. `💰 Rewarded` is Algora's marker
+    and a repo running its own programme never sets it -- commaai/opendbc has
+    closed seven bounties including a $4,000 port with no Algora label anywhere.
+    Closing a bounty is the weakest claim that still separates a working
+    programme from a wall of adverts.
+
+    Costs one search unit, cached for config.PAYER_CACHE_S. Returns None on any
+    failure, and the caller MUST abstain rather than read that as zero. A
+    failure is NOT written to the cache -- it is not an answer about the repo --
+    so every caller in a loop must memoise the None itself, or one throttle is
+    re-paid once per candidate. hunt.run and store.apply_payout_rejections both
+    do.
+    """
+    stamp = time.time() if now is None else now
+    key = f"{CLOSED_CACHE_PREFIX}:{repo}:{label}"
+    _, body = store.get_cache(conn, key)
+    if body:
+        try:
+            payload = json.loads(body)
+            if stamp - payload["fetched_at"] < config.PAYER_CACHE_S:
+                return payload["closed"]
+        except (ValueError, KeyError, TypeError):
+            pass  # unreadable cache is just a miss
+
+    if not store.reserve_or_wait(conn, "search", 1):
+        return None
+    # Pace this like a search PAGE, because to GitHub's burst guard that is
+    # exactly what it is. search_issues only pauses between pages and this asks
+    # for exactly one, so without this the calls go out back to back:
+    # apply_payout_rejections fires one per qualifying repo, and reviving the
+    # 446 'open linked PR' rows takes qualifying repos from 4 to 14. Measured
+    # 2026-08-08, TEN back-to-back requests tripped the secondary limit with 23
+    # of 30 primary units still unspent. Same pattern, new call site.
+    if config.SEARCH_PAGE_PAUSE_S:
+        sleep(config.SEARCH_PAGE_PAUSE_S)
+    try:
+        found = github_api.search_issues(
+            f'repo:{repo} is:issue is:closed label:"{label}"',
+            per_page=1, max_pages=1,
+            # No retry ladder here, unlike discovery. The default is 3 attempts
+            # at 60/120/240s, which exists because abandoning a DISCOVERY page
+            # cost 420 of 520 candidates -- a whole run's inventory. Abandoning
+            # a FARM CHECK costs one abstain on one repo, and the caller is
+            # built to abstain. Paying 420 seconds for that, per repo, with 14
+            # repos qualifying, is how a 3-hourly sweep stops finishing at all.
+            retries=0)
+    except Exception:  # noqa: BLE001 -- unknown, and the caller abstains on it
+        return None
+
+    store.set_cache(conn, key, None,
+                    json.dumps({"fetched_at": stamp, "closed": found.total_count}))
+    return found.total_count

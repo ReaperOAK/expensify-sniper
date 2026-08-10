@@ -224,3 +224,60 @@ def test_the_title_still_beats_the_body():
         title="[$900 bounty] fix it", labels=[{"name": "bounty"}],
         body="bounty of $100 maybe"))
     assert cand.amount_usd == 900
+
+
+def test_from_issue_records_assignee_logins():
+    payload = {"number": 1, "title": "t", "labels": [],
+               "assignees": [{"login": "alice"}, {"login": "Bob"}]}
+    cand = Candidate.from_issue("github-labels", "acme/widgets", payload)
+    assert cand.assignees == ("alice", "Bob")
+    assert cand.has_assignee is True
+
+
+def test_from_issue_records_the_legacy_single_assignee_field_too():
+    # GitHub still emits `assignee` alongside `assignees`; a payload carrying
+    # only the singular form must not produce an empty login list, or the
+    # claim test in linked_pr_state silently never fires.
+    payload = {"number": 1, "title": "t", "labels": [],
+               "assignee": {"login": "carol"}}
+    cand = Candidate.from_issue("github-labels", "acme/widgets", payload)
+    assert cand.assignees == ("carol",)
+
+
+def test_from_issue_deduplicates_assignees_preserving_order():
+    payload = {"number": 1, "title": "t", "labels": [],
+               "assignee": {"login": "carol"},
+               "assignees": [{"login": "carol"}, {"login": "dave"}]}
+    cand = Candidate.from_issue("github-labels", "acme/widgets", payload)
+    assert cand.assignees == ("carol", "dave")
+
+
+def test_unassigned_issue_has_no_logins_and_no_flag():
+    payload = {"number": 1, "title": "t", "labels": []}
+    cand = Candidate.from_issue("github-labels", "acme/widgets", payload)
+    assert cand.assignees == ()
+    assert cand.has_assignee is False
+
+
+def test_open_pr_count_starts_unknown_and_is_set_explicitly():
+    payload = {"number": 1, "title": "t", "labels": []}
+    cand = Candidate.from_issue("github-labels", "acme/widgets", payload)
+    assert cand.open_pr_count is None
+    assert cand.with_linked_prs(2).open_pr_count == 2
+    assert cand.with_linked_prs(0).open_pr_count == 0
+
+
+def test_repo_detail_captures_the_repos_own_age_and_backlog():
+    # Both arrive in the SAME payload the enrichment already fetches, so this
+    # costs nothing. repo_created_at is the REPOSITORY's birthday -- created_at
+    # on the Candidate is the issue's, and conflating them would rate a
+    # month-old farm as a decade-old project.
+    payload = {"fork": False, "archived": False, "stargazers_count": 5,
+               "pushed_at": "2026-08-09T00:00:00Z", "language": "Python",
+               "created_at": "2026-07-08T15:34:56Z", "open_issues": 526}
+    cand = Candidate.from_issue("github-labels", "farm/repo",
+                                {"number": 1, "title": "t", "labels": []})
+    enriched = cand.with_repo_detail(payload)
+    assert enriched.repo_created_at == "2026-07-08T15:34:56Z"
+    assert enriched.repo_open_issues == 526
+    assert enriched.created_at != enriched.repo_created_at

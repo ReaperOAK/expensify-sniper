@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import json
 import sqlite3
 import sys
 import time
@@ -28,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sniper import config, filters, github_api, notify, payers
+from sniper import board, config, filters, github_api, notify, payers
 from sniper import score as scoring, store  # noqa: E402
 from sniper.models import Candidate  # noqa: E402
 from sniper.sources.base import Source, SourceResult  # noqa: E402
@@ -149,13 +150,49 @@ def run(
     # they just read it in a digest, so it is already stored and already live.
     store.apply_dismissals(conn)
 
+    # The open-linked-PR rule was replaced by a claim test. Clearing the reason
+    # makes those rows LIVE again; it does not re-judge them. run() only judges
+    # what `discovered` contains this sweep, so a revived row meets the new rule
+    # only when a source rediscovers it -- the 563 open `💎 Bounty` issues fit in
+    # one query and will be, the 3825 `label:bounty` ones will not be wholesale.
+    # Acceptable, and measured: all 446 revived rows carry score IS NULL, so they
+    # sort last and cannot displace anything from the digest. What they do add is
+    # inventory noise on the board until rediscovery catches up, which beats the
+    # alternative -- staying rejected under a question nobody asks any more,
+    # which for a months-old bounty is forever. Costs one UPDATE and is a no-op
+    # once the table is drained.
+    revived = store.clear_rejections(conn, "open linked PR")
+    if revived:
+        warnings.append(f"{revived} candidates re-judged: an open PR is no longer "
+                        f"treated as a claim unless its author is assigned")
+
     # Payout history first: one cached search for the whole run, and stage 1 needs
     # it. Whether three $-labels mean a spam farm or a tiered bounty is not
     # decidable from the labels -- only from whether the repo has ever paid.
     payer_repos, payer_warnings = payers.known_payers(conn, now=stamp)
     warnings.extend(payer_warnings)
+
+    # Memoised for the WHOLE run, failures included. ever_closed_with caches a
+    # successful answer in the database but records nothing when it fails --
+    # correctly, since a throttle says nothing about the repo -- so without this
+    # every caller re-asks. That is not one wasted call: reviving the 446 'open
+    # linked PR' rows takes repos over UNPAID_REPO_THRESHOLD from 4 to 14, and
+    # the largest of them holds 296 candidates. Under a secondary throttle each
+    # ask is a wait-then-raise, so 296 uncached asks is a sweep that never ends
+    # -- and the 10-minute watch cron piles up behind a 3-hourly run that never
+    # exits. `None` here means "already asked, could not tell", which is a real
+    # answer and is cached exactly like any other; store.apply_payout_rejections
+    # has always done this internally, and stage 1 had no such memo at all.
+    closed_memo: dict[tuple[str, str], int | None] = {}
+
+    def closed_for(repo: str, label: str) -> int | None:
+        key = (repo, label)
+        if key not in closed_memo:
+            closed_memo[key] = payers.ever_closed_with(conn, repo, label, now=stamp)
+        return closed_memo[key]
+
     store.apply_payout_rejections(conn, payer_repos, config.UNPAID_REPO_THRESHOLD,
-                                  payers.ALGORA_LABEL)
+                                  closed_for)
 
     # Stage 1 -- free rejects. Search payload only; zero API calls.
     survivors: list[Candidate] = []
@@ -179,8 +216,20 @@ def run(
         open_here[cand.repo] = open_here.get(cand.repo, 0) + 1
     kept: list[Candidate] = []
     for cand in survivors:
+        # The guard matters: without it every candidate costs a search unit for
+        # an answer payout_reject would discard anyway. It is payers'
+        # label_to_check rather than a copy of its conditions here, because two
+        # copies of the same four-way gate is the bug already fixed once on this
+        # branch (441d2ed) -- and a copy that drifted more RESTRICTIVE would
+        # pass closed=None where a real count was needed and silently keep a
+        # farm. closed_for is memoised per (repo, label) for the whole run,
+        # failures included, so a repo holding 296 candidates costs one call and
+        # one throttle rather than 296.
+        label = payers.label_to_check(cand.repo, cand.labels,
+                                      open_here[cand.repo], payer_repos)
+        closed = closed_for(cand.repo, label) if label else None
         reason = payers.payout_reject(
-            cand.repo, cand.labels, open_here[cand.repo], payer_repos)
+            cand.repo, cand.labels, open_here[cand.repo], payer_repos, closed)
         if reason:
             store.upsert_candidate(conn, cand, rejected=reason, now=stamp)
         else:
@@ -206,13 +255,22 @@ def run(
         if config.CORE_CALL_PAUSE_S:
             time.sleep(config.CORE_CALL_PAUSE_S)
         try:
-            taken = github_api.has_open_linked_pr(cand.repo, cand.number)
+            linked = github_api.linked_pr_state(
+                cand.repo, cand.number, frozenset(cand.assignees))
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"timeline for {cand.repo}#{cand.number} failed: {exc}")
             continue
-        if taken:
-            store.upsert_candidate(conn, cand, rejected="open linked PR", now=stamp)
+        # An open PR by someone already assigned is the one shape that means the
+        # work has been handed out -- true on Expensify, where a C+ picks a
+        # proposal and then assigns its author, and on Algora, where the winner
+        # is whoever merges. Every other open PR is a rival, and rivals are
+        # scored rather than rejected.
+        if linked.claimant:
+            store.upsert_candidate(
+                conn, cand, rejected=f"claimed by assignee @{linked.claimant}",
+                now=stamp)
             continue
+        cand = cand.with_linked_prs(linked.open_count)
         try:
             scored = cand.with_score(scoring.score(cand, now=stamp))
         except Exception as exc:  # noqa: BLE001 -- score() raises by contract on an
@@ -238,12 +296,109 @@ def run(
                                               max_per_repo=config.DIGEST_MAX_PER_REPO,
                                               require_amount=True)
 
-    held_back = conn.execute(
-        "SELECT COUNT(*) FROM candidates WHERE rejected IS NULL AND amount_usd IS NULL"
-    ).fetchone()[0]
+    # The real inventory, counted rather than inferred from the pages above.
+    # new_rows and standing_rows are capped at 25 and 5 and overlap (a new
+    # top-scoring row appears in both), so their sum was neither the live count
+    # nor any other true number -- it read `live 30` while 982 rows were live.
+    counts = store.live_counts(conn)
+    held_back = counts["unranked"]
+
+    # The board: everything, always, at a stable url. Rendered, written and
+    # published BEFORE notify.format_digest(), not after -- a failure here (a
+    # full disk, a revoked token, a deleted gist) has to land as a ⚠ line in
+    # THIS sweep's digest, same as any other warning. Appending it to `text`
+    # after format_digest() already ran would mean the failure is recorded but
+    # never actually reaches anyone: "the board is current" and "I could not
+    # publish it" must never look the same, which is the exact collision this
+    # whole pipeline is built against, just relocated to a second delivery
+    # path. The board is also written before the "nothing to say"
+    # short-circuit further down, because it is the thing that must NOT go
+    # quiet -- it is where the 529 unrankable candidates and the reject
+    # reasons live, and both matter most on a sweep with no news.
+    unrankable = store.held_back_candidates(conn, config.BOARD_UNRANKABLE_N)
+    rejections = store.rejection_counts(conn)
+    board_text = board.render(
+        store.live_candidates(conn, config.BOARD_RANKABLE_N, require_amount=True),
+        unrankable,
+        rejections,
+        now=stamp, warnings=warnings,
+        totals={"live": counts["live"],
+                "unranked": held_back,
+                "rejected": sum(count for _, count in rejections)},
+        rankable_total=counts["rankable"],
+        unrankable_total=counts["unranked"],
+        rejection_examples=store.rejection_examples(
+            conn, config.BOARD_REJECT_EXAMPLES))
+    try:
+        config.BOARD_PATH.write_text(board_text, encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001
+        warnings.append(f"could not write {config.BOARD_PATH}: {exc}")
+
+    board_url = None
+    # Everything appended to `warnings` after this point is a PERMANENT
+    # configuration state rather than something that went wrong on this sweep,
+    # and the difference decides whether the digest is allowed to stay silent.
+    # A transient failure is news every time it happens; "the gist was never
+    # configured" is the same sentence every ten minutes forever, and forcing
+    # 144 deliveries a day out of it would train the reader to ignore the
+    # channel -- the very failure the silence rule downstream exists to prevent.
+    # It still renders in every digest that IS delivered, which is what makes
+    # "the board did not move" and "there is no board" distinguishable.
+    run_hit_trouble = bool(warnings)
+    if not dry_run:
+        try:
+            board_url = board.publish(board_text)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"board publish failed: {exc}")
+            run_hit_trouble = True
+        if board_url is None:
+            # Visible on stderr either way -- a human watching watch.log has to
+            # see this regardless of WHICH of the two ways publishing came back
+            # empty, mirroring the digest-delivery failure handling below: an
+            # unset id and a live exception both mean the board did not update,
+            # and "did not update" must never look like ordinary success.
+            if not config.BOUNTY_GIST_ID:
+                # And into the digest, because stderr is not where anyone is
+                # looking. publish() RETURNS None for an unset id rather than
+                # raising, so nothing above added a warning -- which left "the
+                # gist was never configured" and "the board did not move"
+                # producing the same silence in Discord, the exact collision
+                # publish()'s own docstring says must never happen. It is also
+                # the state the tracker ships in: the id is unset on both hosts
+                # until the operator runs --init-gist.
+                reason = "BOUNTY_GIST_ID unset (run `python3 hunt.py --init-gist` once)"
+                warnings.append(f"board not published -- {reason}")
+            else:
+                reason = "publish raised (see the ⚠ warning above)"
+            print(f"⚠ board was NOT published: {reason}", file=sys.stderr)
+
     text = notify.format_digest(new_rows, standing_rows, warnings,
                                 first_run=first_run, now=stamp,
                                 held_back=held_back)
+
+    # Link the board only when the unrankable set actually moved. Sending it
+    # every sweep is 144 links a day, which trains the reader to ignore the
+    # channel -- the exact failure the digest's own silence rule guards against.
+    current = board.signature(unrankable, counts["unranked"])
+    _, previous_body = store.get_cache(conn, "board-signature")
+    try:
+        previous = json.loads(previous_body) if previous_body else None
+    except ValueError:
+        previous = None
+    if board_url and board.has_changed(previous, current,
+                                       pct=config.BOARD_CHANGE_PCT):
+        text += f"\n\n📋 board updated: {board_url}"
+    # Only a sweep that actually published may advance the signature. Advancing
+    # it unconditionally LOSES a change notification permanently: if the
+    # unrankable set moves 40% on a sweep where publish() raised, the next
+    # successful sweep compares against the already-advanced signature, sees no
+    # move, and sends no link -- so the operator is never told about the 40%,
+    # ever. `--dry-run` is the same bug with a friendlier face: "print the
+    # digest, send nothing" must not silently burn the change signal the next
+    # real run was going to use.
+    if board_url is not None:
+        store.set_cache(conn, "board-signature", None, json.dumps(current))
+
     # A sweep that found nothing and hit no trouble is not news. The watch runs
     # every ten minutes: delivering "nothing new" each time is 144 messages a
     # day, which does not merely annoy -- it trains the reader to ignore the
@@ -254,7 +409,7 @@ def run(
     # against. Silence here means, and only means: I swept, and there was
     # nothing. watch.log records every sweep either way, so liveness is provable
     # without spending the reader's attention.
-    nothing_to_say = not new_rows and not warnings and not first_run
+    nothing_to_say = not new_rows and not run_hit_trouble and not first_run
     if nothing_to_say and not notify_when_empty:
         return text
 
@@ -296,7 +451,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sources", default=None,
                         help="comma-separated source names "
                              f"(default: {','.join(config.HUNT_ENABLED_SOURCES)})")
+    parser.add_argument("--init-gist", action="store_true",
+                        help="create the private gist the board lives in, once, "
+                             "and print the id to put in .env as BOUNTY_GIST_ID")
     args = parser.parse_args(argv)
+
+    if args.init_gist:
+        gist_id, url = board.create_gist("# Bounty board\n\n_not swept yet_\n")
+        print(f"created {url}\n\nadd this line to .env on BOTH hosts:\n"
+              f"BOUNTY_GIST_ID={gist_id}")
+        return 0
 
     conn = store.connect()
 
