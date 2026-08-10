@@ -558,8 +558,11 @@ def clear_rejections(conn: sqlite3.Connection, reason: str) -> int:
     the open-linked-PR rule was replaced, 562 stored candidates were sitting
     rejected under the old question -- and because a candidate is only re-judged
     when GitHub happens to touch it again, a months-old bounty could have stayed
-    wrongly rejected forever. Clearing the reason puts them back in front of the
-    new rule on the next sweep.
+    wrongly rejected forever. Clearing the reason makes them LIVE again; it does
+    not re-judge them, because judgement happens only over what a source
+    rediscovers. That is the intended trade: live-but-unjudged is visible on the
+    board and sorts last in the digest (score IS NULL), while rejected-under-a-
+    dead-question is invisible until GitHub happens to touch the issue.
 
     Matches the reason EXACTLY. Reasons that interpolate a value (a repo's open
     count, a claimant's login) are deliberately not clearable this way: a prefix
@@ -587,6 +590,56 @@ def held_back_candidates(conn: sqlite3.Connection, limit: int) -> list[sqlite3.R
     return conn.execute(
         "SELECT * FROM candidates WHERE rejected IS NULL AND amount_usd IS NULL "
         "ORDER BY first_seen_at DESC LIMIT ?", (limit,)).fetchall()
+
+
+def live_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """How many live candidates there ACTUALLY are: total, priced, unpriced.
+
+    Every other reader here is paged -- live_candidates and
+    held_back_candidates both take a limit, because nobody wants 982 rows in a
+    Discord message. Counting the rows a page happens to contain then reports
+    the page size as the inventory: the board's heading said 25 when there were
+    48 priced live rows, and hunt's footer said `live 30` (a sum of two capped
+    lists, double-counting anything in both) while 982 rows were live.
+
+    "How many are there" and "how many did I show you" are different questions,
+    and a board built to replace a hand-written SQL query has to answer the
+    first one. One query, three honest numbers. SUM over an empty table is NULL
+    in SQLite, hence the coercion.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS live, "
+        "       SUM(amount_usd IS NOT NULL) AS rankable, "
+        "       SUM(amount_usd IS NULL) AS unranked "
+        "FROM candidates WHERE rejected IS NULL").fetchone()
+    return {"live": row["live"] or 0,
+            "rankable": row["rankable"] or 0,
+            "unranked": row["unranked"] or 0}
+
+
+def rejection_examples(
+    conn: sqlite3.Connection, per_reason: int = 3
+) -> dict[str, list[sqlite3.Row]]:
+    """Up to `per_reason` example issues for each reject reason, newest first.
+
+    A count says a filter is BIG. An example says it is WRONG, and that is the
+    half that does the catching: 'open linked PR' at 562 only became obviously
+    a bug once someone opened three of them and found ordinary bounties with a
+    drive-by PR from a bot. Newest first by our own clock, because the recent
+    ones are the ones an operator can still check against live GitHub.
+
+    Capped in Python rather than SQL, exactly as live_candidates does it: a
+    window function would need a SQLite version floor this project has not set.
+    """
+    examples: dict[str, list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        "SELECT rejected, repo, number, url FROM candidates "
+        "WHERE rejected IS NOT NULL ORDER BY first_seen_at DESC"
+    ):
+        rows = examples.setdefault(row["rejected"], [])
+        if len(rows) < per_reason:
+            rows.append(row)
+    return examples
 
 
 def rejection_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:

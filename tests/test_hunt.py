@@ -621,6 +621,135 @@ def test_a_board_publish_failure_reaches_the_digest_and_stderr(
     assert "board was NOT published: publish raised" in err
 
 
+def test_a_failed_publish_does_not_advance_the_board_signature(
+    tmp_path, fake_get, monkeypatch
+):
+    """Advancing it anyway loses the change notification PERMANENTLY.
+
+    If the unrankable set moves on a sweep where publish() raises, the warning
+    reaches the digest but an advanced signature means the next SUCCESSFUL
+    sweep compares against the move it never announced, sees nothing, and sends
+    no link. The operator is then never told, on any future sweep.
+    """
+    from sniper import board, config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "abc123", raising=False)
+    monkeypatch.setattr(board, "publish", lambda text: (_ for _ in ()).throw(
+        RuntimeError("gist gone")))
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    _, cached = store.get_cache(conn, "board-signature")
+    assert cached is None
+
+    # The next sweep publishes fine, and because nothing was recorded it still
+    # treats the board as never-seen and links it.
+    monkeypatch.setattr(board, "publish",
+                        lambda text: "https://gist.github.com/abc123")
+    text = _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False)
+    assert "board updated" in text
+
+
+def test_a_dry_run_does_not_burn_the_change_signal(tmp_path, fake_get, monkeypatch):
+    """--dry-run promises "print the digest, send nothing".
+
+    Advancing the signature would make it send nothing AND silently spend the
+    change the next real run was going to report.
+    """
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=True)
+    _, cached = store.get_cache(conn, "board-signature")
+    assert cached is None
+
+
+def test_an_unset_gist_id_reaches_the_digest_not_only_stderr(
+    tmp_path, fake_get, monkeypatch, capsys
+):
+    """publish() returns None for an unset id rather than raising, so nothing
+    was appended to warnings -- which made "the gist was never configured" and
+    "the board did not move" the same silence in Discord. That is the exact
+    collision publish()'s own docstring says must never happen, and it is the
+    state the tracker ships in: unset on both hosts until --init-gist runs.
+    """
+    from sniper import config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "", raising=False)
+    monkeypatch.setattr(notify, "send", lambda text, **kw: "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    text = _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+
+    assert "BOUNTY_GIST_ID unset" in text
+    assert "board was NOT published" in capsys.readouterr().err
+
+
+def test_an_unset_gist_id_is_not_by_itself_a_reason_to_break_the_silence(
+    tmp_path, fake_get, monkeypatch
+):
+    """It is a permanent configuration state, not news about this sweep.
+
+    Letting it force delivery would be 144 identical messages a day out of the
+    watch cron -- the failure the silence rule exists to prevent, arriving
+    through the warning channel instead of the digest one.
+    """
+    from sniper import config, notify
+
+    monkeypatch.setattr(config, "BOUNTY_GIST_ID", "", raising=False)
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda text, **kw: sent.append(text) or "discord")
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(1)])], now=NOW, dry_run=False)
+    sent.clear()
+
+    _run(conn, sources=[FakeSource("s", [])], now=NOW + 600, dry_run=False,
+         notify_when_empty=False)
+    assert sent == []
+
+
+def test_the_board_counts_the_inventory_rather_than_the_page_it_prints(
+    tmp_path, fake_get, monkeypatch
+):
+    """Both headline numbers used to be page sizes: the heading read
+    len(rankable) (DIGEST_TOP_N, 25) and the footer summed two capped lists
+    that overlap. Post-revive that is 25 against 48, and 30 against 982.
+    """
+    from sniper import config
+
+    monkeypatch.setattr(config, "BOARD_RANKABLE_N", 2, raising=False)
+    conn = _conn(tmp_path)
+    fake_get.queue(200, HEALTHY, {"ETag": 'W/"r"'})
+    for _ in range(5):
+        fake_get.queue(200, [])
+    _run(conn, sources=[FakeSource("s", [_cand(n) for n in range(5)])],
+         now=NOW, dry_run=True)
+
+    board_text = config.BOARD_PATH.read_text(encoding="utf-8")
+    assert "showing 2 of 5 with a readable amount" in board_text
+    assert "live 5" in board_text
+
+
+def test_the_board_shows_example_issues_for_each_reject_reason(tmp_path, fake_get):
+    """Design section D asks for up to three examples per reason. A count says
+    a filter is big; an example says it is wrong.
+    """
+    from sniper import config
+
+    conn = _conn(tmp_path, payers=("someone/else",))
+    _run(conn, sources=[FakeSource("s", [_cand(1, state="closed")])],
+         now=NOW, dry_run=True)
+    board_text = config.BOARD_PATH.read_text(encoding="utf-8")
+    assert "| 1 | closed | [acme/widgets#1](" in board_text
+
+
 def test_a_proven_payer_may_offer_tiered_amounts(tmp_path, fake_get):
     """go-gitea/gitea#1872 carries $250, $50 and $500 and is a real bounty.
 

@@ -23,20 +23,23 @@ _NOW = 1786276800.0  # 2026-08-09T12:00:00Z
 
 def test_rankable_rows_are_listed_with_their_amounts():
     text = board.render([_row(amount_usd=250, number=7)], [], [],
-                        now=_NOW, warnings=[], totals={})
+                        now=_NOW, warnings=[], totals={},
+                        rankable_total=1, unrankable_total=0)
     assert "$250" in text
     assert "acme/widgets#7" in text
 
 
 def test_open_pr_count_is_shown_as_competition_not_hidden():
     text = board.render([_row(open_pr_count=2)], [], [],
-                        now=_NOW, warnings=[], totals={})
+                        now=_NOW, warnings=[], totals={},
+                        rankable_total=1, unrankable_total=0)
     assert "2 PRs" in text
 
 
 def test_no_pr_marker_when_there_are_none():
     text = board.render([_row(open_pr_count=0)], [], [],
-                        now=_NOW, warnings=[], totals={})
+                        now=_NOW, warnings=[], totals={},
+                        rankable_total=1, unrankable_total=0)
     assert "PRs" not in text
 
 
@@ -44,7 +47,8 @@ def test_unrankable_rows_get_their_own_section_grouped_by_repo():
     rows = [_row(repo="a/one", number=1, amount_usd=None),
             _row(repo="a/one", number=2, amount_usd=None),
             _row(repo="b/two", number=3, amount_usd=None)]
-    text = board.render([], rows, [], now=_NOW, warnings=[], totals={})
+    text = board.render([], rows, [], now=_NOW, warnings=[], totals={},
+                        rankable_total=0, unrankable_total=3)
     assert "No readable amount" in text
     assert text.count("a/one") >= 1
     assert "#1" in text and "#2" in text and "#3" in text
@@ -54,26 +58,30 @@ def test_unrankable_rows_get_their_own_section_grouped_by_repo():
 
 def test_rejections_are_listed_by_reason_largest_first():
     text = board.render([], [], [("open linked PR", 562), ("fork", 4)],
-                        now=_NOW, warnings=[], totals={})
+                        now=_NOW, warnings=[], totals={},
+                        rankable_total=0, unrankable_total=0)
     assert text.index("open linked PR") < text.index("fork")
     assert "562" in text
 
 
 def test_warnings_render_above_everything():
     text = board.render([_row()], [], [], now=_NOW,
-                        warnings=["payout history is partial"], totals={})
+                        warnings=["payout history is partial"], totals={},
+                        rankable_total=1, unrankable_total=0)
     assert text.index("payout history is partial") < text.index("acme/widgets")
 
 
 def test_an_empty_board_says_so_rather_than_rendering_nothing():
     # A blank page and "the sweep found nothing" must not look identical.
-    text = board.render([], [], [], now=_NOW, warnings=[], totals={})
+    text = board.render([], [], [], now=_NOW, warnings=[], totals={},
+                        rankable_total=0, unrankable_total=0)
     assert "nothing" in text.lower()
 
 
 def test_the_footer_carries_the_sweep_time_and_totals():
     text = board.render([], [], [], now=_NOW, warnings=[],
-                        totals={"live": 536, "held_back": 529, "rejected": 970})
+                        totals={"live": 536, "held_back": 529, "rejected": 970},
+                        rankable_total=0, unrankable_total=0)
     assert "2026-08-09" in text
     assert "536" in text and "529" in text and "970" in text
 
@@ -108,9 +116,17 @@ def test_render_agrees_with_the_real_sqlite3_row_not_only_the_dict_fixtures(tmp_
 
     Writes through store.upsert_candidate, reads back through the three real
     query functions, and feeds those rows -- untouched -- straight into
-    render(). One rankable row carries open_pr_count; a second does not, so
-    both branches of the _get() lookup that renders (or omits) the "PRs"
-    marker run against an actual sqlite3.Row, not a dict standing in for one.
+    render(). One rankable row carries open_pr_count; a second has it NULL, so
+    both branches of _fmt_row's `if count:` run against an actual sqlite3.Row,
+    not a dict standing in for one.
+
+    What this does NOT reach is _get()'s except arm, and nothing can: a
+    sqlite3.Row from `SELECT *` always carries every column in SCHEMA, and
+    _migrate() guarantees open_pr_count is one of them even on a database
+    created before it existed. So for both row types actually in production the
+    IndexError/KeyError path is unreachable -- it is a guard against a future
+    caller passing a partial dict, not a branch with live coverage. Deleting it
+    on that basis would be wrong for the same reason: the seam is the point.
     """
     conn = store.connect(tmp_path / "s.sqlite")
     store.upsert_candidate(
@@ -128,7 +144,8 @@ def test_render_agrees_with_the_real_sqlite3_row_not_only_the_dict_fixtures(tmp_
     assert all(type(row).__name__ == "Row" for row in rankable + held_back)
 
     text = board.render(rankable, held_back, rejections,
-                        now=_NOW, warnings=[], totals={})
+                        now=_NOW, warnings=[], totals={},
+                        rankable_total=2, unrankable_total=1)
 
     assert "acme/widgets#1" in text and "$250" in text and "2 PRs" in text
     assert "acme/widgets#2" in text and "$300" in text
@@ -137,6 +154,53 @@ def test_render_agrees_with_the_real_sqlite3_row_not_only_the_dict_fixtures(tmp_
     assert text.count("PRs") == 1
     assert "### acme/widgets" in text and "[#3](" in text
     assert "| 1 | fork |" in text
+
+
+def test_a_section_heading_counts_the_inventory_not_the_page():
+    # 25 rows on the page, 48 priced live rows in the database. The heading
+    # used to read len(rows) and announce the page size as the world.
+    text = board.render([_row(number=n) for n in range(25)], [], [],
+                        now=_NOW, warnings=[], totals={},
+                        rankable_total=48, unrankable_total=0)
+    assert "showing 25 of 48 with a readable amount" in text
+
+
+def test_an_untruncated_section_does_not_say_showing():
+    text = board.render([_row()], [], [], now=_NOW, warnings=[], totals={},
+                        rankable_total=1, unrankable_total=0)
+    assert "## Rankable — 1 with a readable amount" in text
+    assert "showing" not in text
+
+
+def test_the_unrankable_section_says_when_it_truncates():
+    # 934 unrankable post-revive against a 600-row page: this one really does
+    # cut, and a page presented as an inventory is what the board exists to fix.
+    rows = [_row(number=n, amount_usd=None) for n in range(600)]
+    text = board.render([], rows, [], now=_NOW, warnings=[], totals={},
+                        rankable_total=0, unrankable_total=934)
+    assert "showing 600 of 934 live, unranked" in text
+
+
+def test_rejected_reasons_carry_example_issues_not_only_a_count():
+    """A count says a filter is BIG. An example says it is WRONG, and the
+    example is the half that catches the next 'open linked PR = 562'.
+    """
+    examples = {"open linked PR": [
+        {"repo": "a/one", "number": 5, "url": "https://github.com/a/one/issues/5"},
+        {"repo": "b/two", "number": 6, "url": "https://github.com/b/two/issues/6"},
+    ]}
+    text = board.render([], [], [("open linked PR", 562)], now=_NOW, warnings=[],
+                        totals={}, rankable_total=0, unrankable_total=0,
+                        rejection_examples=examples)
+    assert "[a/one#5](https://github.com/a/one/issues/5)" in text
+    assert "[b/two#6](https://github.com/b/two/issues/6)" in text
+
+
+def test_a_reason_with_no_examples_still_renders_its_row():
+    text = board.render([], [], [("fork", 4)], now=_NOW, warnings=[], totals={},
+                        rankable_total=0, unrankable_total=0,
+                        rejection_examples={})
+    assert "| 4 | fork |" in text
 
 
 def test_a_first_ever_board_counts_as_changed():
@@ -181,7 +245,18 @@ def test_a_set_emptying_out_is_always_worth_a_message():
 def test_signature_records_the_count_and_the_repos():
     rows = [_row(repo="b/two", amount_usd=None), _row(repo="a/one", amount_usd=None),
             _row(repo="b/two", amount_usd=None)]
-    assert board.signature(rows) == {"count": 3, "repos": ["a/one", "b/two"]}
+    assert board.signature(rows, 3) == {"count": 3, "repos": ["a/one", "b/two"]}
+
+
+def test_the_signature_count_is_the_inventory_not_the_truncated_page():
+    """Otherwise change detection saturates and dies on the first sweep.
+
+    The page caps at BOARD_UNRANKABLE_N (600) and the real set is 934, so a
+    count taken from the page pins at 600 forever -- has_changed's percentage
+    arm never fires again and only the new-repo arm still works.
+    """
+    page = [_row(repo="a/one", amount_usd=None) for _ in range(600)]
+    assert board.signature(page, 934)["count"] == 934
 
 
 class _FakePost:

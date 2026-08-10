@@ -57,9 +57,20 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # Create it once with `python3 hunt.py --init-gist` and paste the id here.
 BOUNTY_GIST_ID = os.environ.get("BOUNTY_GIST_ID", "").strip()
 BOARD_PATH = Path(os.environ.get("BOARD_PATH", ROOT / "bounties.md"))
-# How many amountless candidates the board lists. 529 on 2026-08-09, so this is
-# a page-size guard rather than a filter; the footer says when it truncates.
+# How many amountless candidates the board lists. 934 once the 446 'open linked
+# PR' rows are revived, so this is a page-size guard that DOES bite -- the
+# section heading says "showing 600 of 934" when it does, and the signature the
+# change detector stores carries the true count rather than the page length.
 BOARD_UNRANKABLE_N = int(os.environ.get("BOARD_UNRANKABLE_N", "600"))
+# The board's own rankable page size, deliberately not DIGEST_TOP_N (25). The
+# digest is a shopping list and 25 is a reader's attention budget; the board is
+# the inventory, and there were 48 priced live rows post-revive. Borrowing the
+# digest's number printed "Rankable — 25" over an inventory of 48.
+BOARD_RANKABLE_N = int(os.environ.get("BOARD_RANKABLE_N", "200"))
+# How many example issues each reject reason carries on the board. A count says
+# a filter is big; an example says it is wrong, which is the half that caught
+# 'open linked PR = 562'.
+BOARD_REJECT_EXAMPLES = int(os.environ.get("BOARD_REJECT_EXAMPLES", "3"))
 # Percentage move in the unrankable count that is worth a Discord link.
 BOARD_CHANGE_PCT = float(os.environ.get("BOARD_CHANGE_PCT", "5"))
 

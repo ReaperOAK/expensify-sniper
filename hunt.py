@@ -150,10 +150,17 @@ def run(
     # they just read it in a digest, so it is already stored and already live.
     store.apply_dismissals(conn)
 
-    # The open-linked-PR rule was replaced by a claim test. Rows it rejected under
-    # the old question have to be put back in front of the new one, or they stay
-    # rejected until GitHub happens to touch them again -- which for a months-old
-    # bounty is never. Costs one UPDATE and is a no-op once the table is drained.
+    # The open-linked-PR rule was replaced by a claim test. Clearing the reason
+    # makes those rows LIVE again; it does not re-judge them. run() only judges
+    # what `discovered` contains this sweep, so a revived row meets the new rule
+    # only when a source rediscovers it -- the 563 open `💎 Bounty` issues fit in
+    # one query and will be, the 3825 `label:bounty` ones will not be wholesale.
+    # Acceptable, and measured: all 446 revived rows carry score IS NULL, so they
+    # sort last and cannot displace anything from the digest. What they do add is
+    # inventory noise on the board until rediscovery catches up, which beats the
+    # alternative -- staying rejected under a question nobody asks any more,
+    # which for a months-old bounty is forever. Costs one UPDATE and is a no-op
+    # once the table is drained.
     revived = store.clear_rejections(conn, "open linked PR")
     if revived:
         warnings.append(f"{revived} candidates re-judged: an open PR is no longer "
@@ -289,9 +296,12 @@ def run(
                                               max_per_repo=config.DIGEST_MAX_PER_REPO,
                                               require_amount=True)
 
-    held_back = conn.execute(
-        "SELECT COUNT(*) FROM candidates WHERE rejected IS NULL AND amount_usd IS NULL"
-    ).fetchone()[0]
+    # The real inventory, counted rather than inferred from the pages above.
+    # new_rows and standing_rows are capped at 25 and 5 and overlap (a new
+    # top-scoring row appears in both), so their sum was neither the live count
+    # nor any other true number -- it read `live 30` while 982 rows were live.
+    counts = store.live_counts(conn)
+    held_back = counts["unranked"]
 
     # The board: everything, always, at a stable url. Rendered, written and
     # published BEFORE notify.format_digest(), not after -- a failure here (a
@@ -308,33 +318,58 @@ def run(
     unrankable = store.held_back_candidates(conn, config.BOARD_UNRANKABLE_N)
     rejections = store.rejection_counts(conn)
     board_text = board.render(
-        store.live_candidates(conn, config.DIGEST_TOP_N, require_amount=True),
+        store.live_candidates(conn, config.BOARD_RANKABLE_N, require_amount=True),
         unrankable,
         rejections,
         now=stamp, warnings=warnings,
-        totals={"live": len(new_rows) + len(standing_rows),
+        totals={"live": counts["live"],
                 "unranked": held_back,
-                "rejected": sum(count for _, count in rejections)})
+                "rejected": sum(count for _, count in rejections)},
+        rankable_total=counts["rankable"],
+        unrankable_total=counts["unranked"],
+        rejection_examples=store.rejection_examples(
+            conn, config.BOARD_REJECT_EXAMPLES))
     try:
         config.BOARD_PATH.write_text(board_text, encoding="utf-8")
     except OSError as exc:  # noqa: BLE001
         warnings.append(f"could not write {config.BOARD_PATH}: {exc}")
 
     board_url = None
+    # Everything appended to `warnings` after this point is a PERMANENT
+    # configuration state rather than something that went wrong on this sweep,
+    # and the difference decides whether the digest is allowed to stay silent.
+    # A transient failure is news every time it happens; "the gist was never
+    # configured" is the same sentence every ten minutes forever, and forcing
+    # 144 deliveries a day out of it would train the reader to ignore the
+    # channel -- the very failure the silence rule downstream exists to prevent.
+    # It still renders in every digest that IS delivered, which is what makes
+    # "the board did not move" and "there is no board" distinguishable.
+    run_hit_trouble = bool(warnings)
     if not dry_run:
         try:
             board_url = board.publish(board_text)
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"board publish failed: {exc}")
+            run_hit_trouble = True
         if board_url is None:
             # Visible on stderr either way -- a human watching watch.log has to
             # see this regardless of WHICH of the two ways publishing came back
             # empty, mirroring the digest-delivery failure handling below: an
             # unset id and a live exception both mean the board did not update,
             # and "did not update" must never look like ordinary success.
-            reason = ("BOUNTY_GIST_ID unset (run `python3 hunt.py --init-gist` once)"
-                      if not config.BOUNTY_GIST_ID
-                      else "publish raised (see the ⚠ warning above)")
+            if not config.BOUNTY_GIST_ID:
+                # And into the digest, because stderr is not where anyone is
+                # looking. publish() RETURNS None for an unset id rather than
+                # raising, so nothing above added a warning -- which left "the
+                # gist was never configured" and "the board did not move"
+                # producing the same silence in Discord, the exact collision
+                # publish()'s own docstring says must never happen. It is also
+                # the state the tracker ships in: the id is unset on both hosts
+                # until the operator runs --init-gist.
+                reason = "BOUNTY_GIST_ID unset (run `python3 hunt.py --init-gist` once)"
+                warnings.append(f"board not published -- {reason}")
+            else:
+                reason = "publish raised (see the ⚠ warning above)"
             print(f"⚠ board was NOT published: {reason}", file=sys.stderr)
 
     text = notify.format_digest(new_rows, standing_rows, warnings,
@@ -344,7 +379,7 @@ def run(
     # Link the board only when the unrankable set actually moved. Sending it
     # every sweep is 144 links a day, which trains the reader to ignore the
     # channel -- the exact failure the digest's own silence rule guards against.
-    current = board.signature(unrankable)
+    current = board.signature(unrankable, counts["unranked"])
     _, previous_body = store.get_cache(conn, "board-signature")
     try:
         previous = json.loads(previous_body) if previous_body else None
@@ -353,7 +388,16 @@ def run(
     if board_url and board.has_changed(previous, current,
                                        pct=config.BOARD_CHANGE_PCT):
         text += f"\n\n📋 board updated: {board_url}"
-    store.set_cache(conn, "board-signature", None, json.dumps(current))
+    # Only a sweep that actually published may advance the signature. Advancing
+    # it unconditionally LOSES a change notification permanently: if the
+    # unrankable set moves 40% on a sweep where publish() raised, the next
+    # successful sweep compares against the already-advanced signature, sees no
+    # move, and sends no link -- so the operator is never told about the 40%,
+    # ever. `--dry-run` is the same bug with a friendlier face: "print the
+    # digest, send nothing" must not silently burn the change signal the next
+    # real run was going to use.
+    if board_url is not None:
+        store.set_cache(conn, "board-signature", None, json.dumps(current))
 
     # A sweep that found nothing and hit no trouble is not news. The watch runs
     # every ten minutes: delivering "nothing new" each time is 144 messages a
@@ -365,7 +409,7 @@ def run(
     # against. Silence here means, and only means: I swept, and there was
     # nothing. watch.log records every sweep either way, so liveness is provable
     # without spending the reader's attention.
-    nothing_to_say = not new_rows and not warnings and not first_run
+    nothing_to_say = not new_rows and not run_hit_trouble and not first_run
     if nothing_to_say and not notify_when_empty:
         return text
 

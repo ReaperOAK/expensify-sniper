@@ -31,6 +31,10 @@ import requests
 from . import config, github_api, notify
 from .models import _now_utc, parse_iso
 
+# 90, against notify's 70. A gist page is as wide as the reader's browser and
+# each row is a whole line of it, while a Discord embed field wraps inside a
+# narrow column -- so the board can afford the extra 20 characters that keep a
+# "[HOLD for payment] ..." prefix from eating the whole title.
 TITLE_CHARS = 90
 GIST_FILENAME = "bounties.md"
 GIST_API = "https://api.github.com/gists"
@@ -66,9 +70,36 @@ def _unrankable_line(row, *, now: float | None) -> str:
     return f"- [#{row['number']}]({row['url']}) {title} — {row['comments']}💬 · {age}d"
 
 
+def _section_heading(shown: int, total: int, *, name: str, suffix: str) -> str:
+    """`## Rankable — 48 with a readable amount`, or `showing 25 of 48` when cut.
+
+    `total` is passed in rather than measured from the rows because the rows
+    ARE a page: this heading used to read len(rankable), which is DIGEST_TOP_N,
+    so it announced 25 of an inventory of 48 as though 25 were all there was --
+    and said nothing about having truncated. The board exists to replace a
+    hand-written SQL query; a headline number that is really a page size is the
+    one thing it must not print.
+    """
+    if shown < total:
+        return f"## {name} — showing {shown} of {total} {suffix}"
+    return f"## {name} — {total} {suffix}"
+
+
 def render(rankable, unrankable, rejection_counts, *, now: float | None,
-           warnings, totals: dict[str, int]) -> str:
-    """The whole board. Warnings first, then priced, then unpriced, then rejects."""
+           warnings, totals: dict[str, int],
+           rankable_total: int, unrankable_total: int,
+           rejection_examples=None) -> str:
+    """The whole board. Warnings first, then priced, then unpriced, then rejects.
+
+    `rankable_total` and `unrankable_total` are the counts from the DATABASE,
+    not from the rows handed over -- those are pages, and a page size printed as
+    an inventory count is a lie the board is specifically built to stop telling.
+    They are required, with no default, so a new call site has to answer the
+    question rather than silently inherit len(rows).
+
+    `rejection_examples` is decoration and may be omitted: its absence changes
+    no number on the page, only how quickly a wrong filter is recognisable.
+    """
     parts: list[str] = ["# Bounty board", ""]
 
     for warning in warnings:
@@ -83,13 +114,17 @@ def render(rankable, unrankable, rejection_counts, *, now: float | None,
         parts.append("")
 
     if rankable:
-        parts.append(f"## Rankable — {len(rankable)} with a readable amount")
+        parts.append(_section_heading(len(rankable), rankable_total,
+                                      name="Rankable",
+                                      suffix="with a readable amount"))
         parts.append("")
         parts.extend(_fmt_row(row, now=now) for row in rankable)
         parts.append("")
 
     if unrankable:
-        parts.append(f"## No readable amount — {len(unrankable)} live, unranked")
+        parts.append(_section_heading(len(unrankable), unrankable_total,
+                                      name="No readable amount",
+                                      suffix="live, unranked"))
         parts.append("")
         parts.append("_No price in the labels, title or body, so expected value "
                      "cannot be computed and the digest will never show them. "
@@ -104,15 +139,23 @@ def render(rankable, unrankable, rejection_counts, *, now: float | None,
             parts.append("")
 
     if rejection_counts:
+        examples = rejection_examples or {}
         parts.append("## Rejected")
         parts.append("")
         parts.append("_Why candidates were dropped. A reason that grows larger "
                      "than the kept pile is a filter to go and read._")
         parts.append("")
-        parts.append("| count | reason |")
-        parts.append("| ----: | ------ |")
+        # The examples column is the half that catches a wrong filter. A count
+        # only says a reason is BIG -- 'open linked PR' sat at 562 and looked
+        # like a busy world until someone opened three of them and found
+        # ordinary bounties carrying a drive-by PR from a bot. Three links per
+        # reason turns "go and write a SQL query" into "go and click".
+        parts.append("| count | reason | examples |")
+        parts.append("| ----: | ------ | -------- |")
         for reason, count in rejection_counts:
-            parts.append(f"| {count} | {reason} |")
+            shown = " ".join(f"[{row['repo']}#{row['number']}]({row['url']})"
+                             for row in examples.get(reason, ()))
+            parts.append(f"| {count} | {reason} | {shown} |")
         parts.append("")
 
     swept = _now_utc(now).strftime("%Y-%m-%d %H:%M UTC")
@@ -122,10 +165,23 @@ def render(rankable, unrankable, rejection_counts, *, now: float | None,
     return "\n".join(parts)
 
 
-def signature(unrankable_rows) -> dict:
-    """A cheap fingerprint of the unrankable set: how many, and from where."""
+def signature(unrankable_rows, total: int) -> dict:
+    """A cheap fingerprint of the unrankable set: how many, and from where.
+
+    `total` is the count from the database, not len(rows), because the rows are
+    a page capped at config.BOARD_UNRANKABLE_N (600). The true unrankable set is
+    934 post-revive, so a count taken from the page pins at 600 on the first
+    sweep and never moves again -- has_changed's percentage arm would be dead
+    from day one, leaving only the new-repo arm working.
+
+    `repos` IS taken from the page, and that is sound for the arm that uses it:
+    the page is ordered by first_seen_at DESC, so a repo new to the set is at
+    the front of it and cannot be truncated away. A repo falling off the tail is
+    invisible here -- and that is exactly the case has_changed deliberately does
+    not link on, leaving it to the count.
+    """
     repos = sorted({row["repo"] for row in unrankable_rows})
-    return {"count": len(unrankable_rows), "repos": repos}
+    return {"count": total, "repos": repos}
 
 
 def has_changed(previous: dict | None, current: dict, *, pct: float) -> bool:
