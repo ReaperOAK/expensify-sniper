@@ -126,8 +126,38 @@ def open_issues(limit):
     return out[:limit]
 
 
-def rivals(num):
-    comments = gh(f"/repos/Expensify/App/issues/{num}/comments?per_page=100", paginate=True)
+# The ONE melvin message that means the job was awarded. It has two near-twins that are
+# routine noise, and mistaking either for an award silently discards winnable bounties:
+#
+#   "Job added to Upwork: <url>"                      fires when Help Wanted is applied
+#   "we don't have your contributor details yet ...    asks a PROPOSER for their details
+#    this is how we'll hire you"
+#   "You have been assigned to this job"               <-- the actual award
+#
+# Proof the second is noise: on #84496 that ping went to @genesis-ai-labs-star, while
+# @ReaperOAK was the one assigned and merged the fix (PR #85295). Filtering on the first
+# rejected 52 of 75 open issues as taken; on the second, 23. The true count was ZERO --
+# none of the 75 open Help Wanted issues had been awarded.
+AWARDED = re.compile(r"You have been assigned to this job", re.I)
+
+
+def issue_comments(num):
+    return gh(f"/repos/Expensify/App/issues/{num}/comments?per_page=100", paginate=True)
+
+
+def awarded_to(comments):
+    """The contributor this job was given to, or None while it is still open."""
+    for c in comments:
+        if c["user"]["login"] not in config.BOT_AUTHORS:
+            continue
+        if AWARDED.search(c.get("body") or ""):
+            m = re.search(r"@([A-Za-z0-9_-]+)", c.get("body") or "")
+            return m.group(1) if m else "someone"
+    return None
+
+
+def rivals(num, comments=None):
+    comments = issue_comments(num) if comments is None else comments
     return [c for c in comments if is_proposal(c.get("body"))
             and c["user"]["login"] not in config.BOT_AUTHORS
             and c["user"].get("type") != "Bot"]
@@ -167,7 +197,15 @@ def main():
                     print(f"  #{num} SKIP — judge: {verdict['blocker']}")
                     fh.write(json.dumps(rec) + "\n")
                     continue
-            rec["n_rivals"] = len(rivals(num))
+            # One comments fetch serves both the award check and the rival count.
+            comments = issue_comments(num)
+            winner = awarded_to(comments)
+            if winner:
+                rec.update({"blocked": True, "reason": f"already awarded to @{winner}"})
+                print(f"  #{num} SKIP — already awarded to @{winner}")
+                fh.write(json.dumps(rec) + "\n")
+                continue
+            rec["n_rivals"] = len(rivals(num, comments))
             kept.append(rec)
             fh.write(json.dumps(rec) + "\n")
             fh.flush()

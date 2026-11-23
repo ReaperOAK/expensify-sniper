@@ -77,6 +77,37 @@ verification.
 - **The refute stage runs on a reverted tree** so it judges the claim against shipping
   code rather than being persuaded by a diff that already assumes the claim.
 
+## Which Expensify issues are worth a verified proposal (measured 2026-08-12)
+
+Ran every open Help Wanted issue through the rejects. **75 open → 13 worth considering.**
+Rejected: `crowded=40` (>6 rivals), `platform=13` (iOS/Android/Hybrid only), `not-a-bug=9`.
+**`awarded=0` — none of the 75 had been given to anyone.**
+
+Best targets, fewest rivals first: **#87373** (2 rivals, open since Apr 08), **#94981**
+(3, Jun 30), #94559 (3), #86498 (4), #91006 (6), #92160 / #94728 / #97215 (5–6).
+Filter out `[HOLD]` titles and #96139/#96140 (duplicate `Onyx.connect()` refactors — no
+bug, so nothing to reproduce).
+
+### Two populations, and only one of them is ours
+
+Four issues hand-checked (#98107, #98001, #91581, #97949) all came back "skip", each for
+a different reason, and together they define the targeting rule:
+
+| population | win condition | our machinery |
+| --- | --- | --- |
+| obvious bugs / content tasks | be **first**; minutes matter | actively harmful — 30–60 min of latency |
+| hard, long-open, multi-file bugs | be **right** | this is where verification pays |
+
+#98107 ("Go back to home page" dead) is the cautionary one: a fallback-less
+`Navigation.goBack()` at `ValidateCodeModal.tsx:49-51`, which ten people independently
+found within three days. My analysis matched all ten — there was no differentiated
+insight available, and posting would have been a near-certain ProposalPolice duplicate.
+An issue open for four months with two proposals is the opposite bet and the one to take.
+
+#98001 shows the other end: no `Bug` label, so nothing is broken, so there is no
+reproduction and every stage of the loop is a no-op. Its "fix" was four supplied literals
+appended to `CONST.HOME.ANNOUNCEMENTS`. Hard-skip non-`Bug` issues.
+
 ## OPEN ITEMS for whoever picks this up next
 
 **1. `has_open_linked_pr()` is WRONG for Expensify, and it is silently costing bounties.**
